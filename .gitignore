@@ -1,0 +1,6 @@
+*.log
+*.exe
+*.compiled
+*.ppu
+*.o
+backup/
