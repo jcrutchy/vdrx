@@ -27,7 +27,6 @@
       <Unit>
         <Filename Value="vrdx_daemon.lpr"/>
         <IsPartOfProject Value="True"/>
-        <UnitName Value="vdrx_daemon"/>
       </Unit>
       <Unit>
         <Filename Value="vrdx_core.pas"/>
@@ -35,6 +34,18 @@
       </Unit>
       <Unit>
         <Filename Value="vrdx_irc.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vrdx_logger.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vrdx_config.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vrdx_admin.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
     </Units>

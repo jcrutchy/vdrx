@@ -1,0 +1,3578 @@
+﻿--- PROJECT STRUCTURE ---
+@{Path=.\daemon}
+@{Path=.\.gitignore}
+@{Path=.\readme.md}
+@{Path=.\snapshot_codebase.bat}
+@{Path=.\snapshot_codebase.ps1}
+@{Path=.\vrdx_daemon_snapshot.txt}
+@{Path=.\daemon\backup}
+@{Path=.\daemon\lib}
+@{Path=.\daemon\vrdx_admin.pas}
+@{Path=.\daemon\vrdx_bridge.pas}
+@{Path=.\daemon\vrdx_config.pas}
+@{Path=.\daemon\vrdx_core.pas}
+@{Path=.\daemon\vrdx_daemon.conf}
+@{Path=.\daemon\vrdx_daemon.exe}
+@{Path=.\daemon\vrdx_daemon.lpi}
+@{Path=.\daemon\vrdx_daemon.lpr}
+@{Path=.\daemon\vrdx_daemon.lps}
+@{Path=.\daemon\vrdx_http.pas}
+@{Path=.\daemon\vrdx_irc.pas}
+@{Path=.\daemon\vrdx_logger.pas}
+@{Path=.\daemon\vrdx_websocket.pas}
+@{Path=.\daemon\vrdx_whiteboard.pas}
+@{Path=.\daemon\WIRING.md}
+@{Path=.\daemon\backup\vrdx_admin.pas}
+@{Path=.\daemon\backup\vrdx_bridge.pas}
+@{Path=.\daemon\backup\vrdx_config.pas}
+@{Path=.\daemon\backup\vrdx_core.pas}
+@{Path=.\daemon\backup\vrdx_daemon.lpi}
+@{Path=.\daemon\backup\vrdx_daemon.lpr}
+@{Path=.\daemon\backup\vrdx_daemon.lps}
+@{Path=.\daemon\backup\vrdx_http.pas}
+@{Path=.\daemon\backup\vrdx_irc.pas}
+@{Path=.\daemon\backup\vrdx_logger.pas}
+@{Path=.\daemon\backup\vrdx_websocket.pas}
+@{Path=.\daemon\lib\x86_64-win64\vrdx_bridge.o}
+@{Path=.\daemon\lib\x86_64-win64\vrdx_bridge.ppu}
+@{Path=.\daemon\lib\x86_64-win64\vrdx_core.o}
+@{Path=.\daemon\lib\x86_64-win64\vrdx_core.ppu}
+@{Path=.\daemon\lib\x86_64-win64\vrdx_daemon.compiled}
+@{Path=.\daemon\lib\x86_64-win64\vrdx_daemon.o}
+@{Path=.\daemon\lib\x86_64-win64\vrdx_http.o}
+@{Path=.\daemon\lib\x86_64-win64\vrdx_http.ppu}
+@{Path=.\daemon\lib\x86_64-win64\vrdx_irc.o}
+@{Path=.\daemon\lib\x86_64-win64\vrdx_irc.ppu}
+@{Path=.\daemon\lib\x86_64-win64\vrdx_websocket.o}
+@{Path=.\daemon\lib\x86_64-win64\vrdx_websocket.ppu}
+@{Path=.\daemon\lib\x86_64-win64\vrdx_whiteboard.o}
+@{Path=.\daemon\lib\x86_64-win64\vrdx_whiteboard.ppu}
+
+--- FILE: .\daemon\vrdx_admin.pas ---
+unit vrdx_admin;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, vrdx_core;
+
+type
+
+  TVRDX_AdminExecutive = class(TVRDX_Executive)
+  private
+  public
+    procedure Execute; override;
+  end;
+
+implementation
+
+procedure TVRDX_AdminExecutive.Execute;
+var
+  Msg: TVRDX_Message;
+begin
+  while not Terminated do
+  begin
+    if FQueue.TryDequeue(Msg, 500) then
+    begin
+      if Msg.Topic = 'sys.reload' then
+      begin
+        FConfig.Reload;
+        // Broadcast confirmation
+        FQueue.Enqueue(TVRDX_Message.Create('log.info', 'Configuration reloaded successfully.'));
+      end;
+    end;
+  end;
+end;
+
+end.
+
+
+--- FILE: .\daemon\vrdx_bridge.pas ---
+unit vrdx_bridge;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, SyncObjs, Process, fpjson, vrdx_core;
+
+type
+
+  // External-process manager. One instance per external process. Descends from
+  // TVRDX_Executive directly - not a special base class, just an executive that does
+  // more work in its lifecycle hooks than most. Registry manages it exactly like any
+  // other executive (register/unregister/Initialize/Shutdown), with no special-casing.
+  TVRDX_BridgeExecutive = class(TVRDX_Executive)
+  private
+    FCommand: string;
+    FProcess: TProcess;
+    FProcessLock: TCriticalSection; // guards FProcess against Handle/restart races
+    FReaderThread: TThread;
+    FMonitorThread: TThread;
+    FRestartDelayMs: Integer;
+    FMaxRestartDelayMs: Integer;
+    FStopping: Boolean;
+    procedure StartProcess;
+    procedure StopProcess;
+    procedure ReaderLoop;
+    procedure MonitorLoop;
+  public
+    constructor Create(ABus: TVRDX_MessageQueue); override;
+    destructor Destroy; override;
+    property Command: string read FCommand write FCommand;
+    procedure Initialize; override;
+    procedure Shutdown; override;
+    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+  end;
+
+implementation
+
+{ TVRDX_BridgeExecutive }
+
+constructor TVRDX_BridgeExecutive.Create(ABus: TVRDX_MessageQueue);
+begin
+  inherited Create(ABus);
+  FProcessLock := TCriticalSection.Create;
+  FRestartDelayMs := 500;
+  FMaxRestartDelayMs := 30000;
+  FStopping := False;
+end;
+
+destructor TVRDX_BridgeExecutive.Destroy;
+begin
+  FProcessLock.Free;
+  inherited Destroy;
+end;
+
+procedure TVRDX_BridgeExecutive.StartProcess;
+begin
+  FProcessLock.Enter;
+  try
+    FProcess := TProcess.Create(nil);
+    FProcess.CommandLine := FCommand;
+    FProcess.Options := [poUsePipes, poStderrToOutPut];
+    FProcess.Execute;
+  finally
+    FProcessLock.Leave;
+  end;
+  FReaderThread := TVRDX_WorkerThread.Create(@ReaderLoop);
+  FReaderThread.FreeOnTerminate := False;
+  FReaderThread.Start;
+end;
+
+procedure TVRDX_BridgeExecutive.StopProcess;
+begin
+  FProcessLock.Enter;
+  try
+    if Assigned(FProcess) then
+    begin
+      try
+        if FProcess.Running then
+          FProcess.Terminate(0); // unblocks the reader thread's blocking read via EOF
+      except
+      end;
+      FProcess.Free;
+      FProcess := nil;
+    end;
+  finally
+    FProcessLock.Leave;
+  end;
+  if Assigned(FReaderThread) then
+  begin
+    FReaderThread.WaitFor;
+    FReaderThread.Free;
+    FReaderThread := nil;
+  end;
+end;
+
+// Blocking char-by-char read, buffered until newline. Deliberately not using
+// NumBytesAvailable - not reliably present across FPC versions; a plain blocking
+// Read is simpler and fully portable.
+procedure TVRDX_BridgeExecutive.ReaderLoop;
+var
+  Line, Buf: string;
+  Ch: Char;
+  Proc: TProcess;
+begin
+  Buf := '';
+  FProcessLock.Enter;
+  Proc := FProcess;
+  FProcessLock.Leave;
+  while (not FStopping) and Assigned(Proc) and Proc.Running do
+  begin
+    if Proc.Output.Read(Ch, 1) = 1 then
+    begin
+      if Ch = #10 then
+      begin
+        Line := Trim(Buf);
+        Buf := '';
+        if Line <> '' then
+          Bus.Publish(ID + '.out', Line, ID); // process output re-enters the bus, namespaced by this executive's ID
+      end
+      else if Ch <> #13 then
+        Buf := Buf + Ch;
+    end
+    else
+      Sleep(20);
+  end;
+end;
+
+procedure TVRDX_BridgeExecutive.MonitorLoop;
+var
+  NeedsRestart: Boolean;
+begin
+  while not FStopping do
+  begin
+    Sleep(1000);
+    if FStopping then
+      Break;
+    FProcessLock.Enter;
+    NeedsRestart := (not Assigned(FProcess)) or (not FProcess.Running);
+    FProcessLock.Leave;
+    if NeedsRestart and (not FStopping) then
+    begin
+      StopProcess;
+      Sleep(FRestartDelayMs);
+      if FRestartDelayMs < FMaxRestartDelayMs then
+        FRestartDelayMs := FRestartDelayMs * 2; // exponential backoff on a crash loop
+      if not FStopping then
+      begin
+        StartProcess;
+        FRestartDelayMs := 500; // reset after a clean (re)start
+      end;
+    end;
+  end;
+end;
+
+procedure TVRDX_BridgeExecutive.Initialize;
+begin
+  FStopping := False;
+  StartProcess;
+  FMonitorThread := TVRDX_WorkerThread.Create(@MonitorLoop);
+  FMonitorThread.FreeOnTerminate := False;
+  FMonitorThread.Start;
+end;
+
+procedure TVRDX_BridgeExecutive.Shutdown;
+begin
+  FStopping := True;
+  StopProcess;
+  if Assigned(FMonitorThread) then
+  begin
+    FMonitorThread.WaitFor;
+    FMonitorThread.Free;
+    FMonitorThread := nil;
+  end;
+end;
+
+procedure TVRDX_BridgeExecutive.HandlePacket(const AMsg: TVRDX_Message);
+var
+  Line: string;
+begin
+  FProcessLock.Enter;
+  try
+    if Assigned(FProcess) and FProcess.Running then
+    begin
+      Line := Format('{"topic":%s,"payload":%s,"source":%s}',
+        [StringToJSONString(AMsg.Topic), AMsg.Payload, StringToJSONString(AMsg.SourceID)])
+        + LineEnding;
+      FProcess.Input.Write(Line[1], Length(Line));
+    end;
+  finally
+    FProcessLock.Leave;
+  end;
+end;
+
+end.
+
+--- FILE: .\daemon\vrdx_config.pas ---
+unit vrdx_config;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, fpjson, jsonparser, SyncObjs;
+
+type
+  TVRDX_Config = class
+  private
+    FData: TJSONObject;
+    FLock: TCriticalSection;
+    FFilePath: string;
+  public
+    constructor Create(const AFilePath: string);
+    destructor Destroy; override;
+    function GetString(APath: string; ADefault: string): string;
+    function GetInteger(APath: string; ADefault: Integer): Integer;
+    procedure Reload;
+  end;
+
+implementation
+
+constructor TVRDX_Config.Create(const AFilePath: string);
+begin
+  FFilePath := AFilePath;
+  FLock := TCriticalSection.Create;
+  Reload;
+end;
+
+destructor TVRDX_Config.Destroy;
+begin
+  FData.Free;
+  FLock.Free;
+  inherited;
+end;
+
+function TVRDX_Config.GetString(APath: string; ADefault: string): string;
+begin
+  FLock.Enter;
+  try
+    if Assigned(FData) and (FData.FindPath(APath) <> nil) then
+      Result := FData.GetPath(APath).AsString
+    else
+      Result := ADefault;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TVRDX_Config.GetInteger(APath: string; ADefault: Integer): Integer;
+begin
+  FLock.Enter;
+  try
+    if Assigned(FData) and (FData.FindPath(APath) <> nil) then
+      Result := FData.GetPath(APath).AsInteger
+    else
+      Result := ADefault;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TVRDX_Config.Reload;
+var
+  JSONString: TStringList;
+begin
+  FLock.Enter;
+  try
+    if FileExists(FFilePath) then begin
+      JSONString := TStringList.Create;
+      try
+        JSONString.LoadFromFile(FFilePath);
+        if Assigned(FData) then FData.Free;
+        FData := TJSONObject(GetJSON(JSONString.Text));
+      finally
+        JSONString.Free;
+      end;
+    end;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+end.
+
+--- FILE: .\daemon\vrdx_core.pas ---
+unit vrdx_core;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes,
+  SysUtils,
+  SyncObjs,
+  DateUtils,
+  Generics.Collections;
+
+const
+  Infinite = UInt32(-1);
+
+type
+
+  TVRDX_Executive = class;
+
+  TVRDX_Message = record
+    Topic: string;
+    Payload: string;
+    SourceID: string;
+    Seq: Int64;
+    Timestamp: TDateTime;
+  end;
+
+  TVRDX_ExecList = specialize TList<TVRDX_Executive>;
+  TVRDX_ExecListDictionary = specialize TObjectDictionary<string, TVRDX_ExecList>;
+  TVRDX_ExecMasterMap = specialize TObjectDictionary<string, TVRDX_Executive>;
+  TVRDX_MessageList = specialize TList<TVRDX_Message>;
+
+  TVRDX_WorkerThread = class(TThread)
+  private
+    FExecuteMethod: TThreadMethod;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AExecuteMethod: TThreadMethod);
+  end;
+
+  TVRDX_MessageQueue = class
+  private
+    FList: TVRDX_MessageList;
+    FLock: TCriticalSection;
+    FSignal: TEvent;
+    FSeqCounter: Int64;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Publish(const ATopic, APayload, ASourceID: string);
+    function TryDequeue(out AMsg: TVRDX_Message; TimeoutMs: Cardinal = 500): Boolean;
+  end;
+
+  // Base for every executive - internal object, external-process Bridge, or socket
+  // listener. Holds a Bus reference so descendants can Publish from Initialize,
+  // reader threads, or HandlePacket alike. Initialize/Shutdown are virtual with an
+  // empty default so most executives (Logger, Whiteboard) can ignore them entirely;
+  // Bridge and the socket listeners override both to spawn/bind on startup and tear
+  // down cleanly on shutdown. No intermediate base class for "threaded" or "socket"
+  // executives yet - deliberately waiting for three concrete, near-identical
+  // examples before extracting one (see session notes).
+
+  { TVRDX_Executive }
+
+  TVRDX_Executive = class
+  private
+    FID: string;
+    FFilter: string;
+    FBus: TVRDX_MessageQueue;
+  public
+    constructor Create(ABus: TVRDX_MessageQueue); virtual;
+    property ID: string read FID write FID;
+    property Filter: string read FFilter write FFilter;
+    property Bus: TVRDX_MessageQueue read FBus;
+    procedure Initialize; virtual;
+    procedure Shutdown; virtual;
+    procedure HandlePacket(const AMsg: TVRDX_Message); virtual; abstract;
+    procedure ApplyConfig; virtual;
+  end;
+
+  // MasterMap (owning, ID -> Executive) is the single source of truth for lifecycle
+  // and memory management. LiteralSubs/WildcardSubs are reference-only routing
+  // indices - an executive lands in exactly one of the two, decided by whether its
+  // filter contains '*' or '>'.
+  TVRDX_Registry = class
+  private
+    FMasterMap: TVRDX_ExecMasterMap;
+    FLiteralSubs: TVRDX_ExecListDictionary;
+    FWildcardSubs: TVRDX_ExecList;
+    FLock: TCriticalSection;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Register(AExec: TVRDX_Executive; const AID, AFilter: string);
+    procedure Unregister(const AID: string);
+    function GetSubscribers(const ATopic: string): TVRDX_ExecList;
+    procedure InitializeAll;
+    procedure ShutdownAll;
+    procedure ApplyAllConfigs;
+  end;
+
+  { TVRDX_Kernel }
+
+  TVRDX_Kernel = class(TThread)
+  private
+    FQueue: TVRDX_MessageQueue;
+    FRegistry: TVRDX_Registry;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Terminate;
+  public
+    property Queue: TVRDX_MessageQueue read FQueue;
+    property Registry: TVRDX_Registry read FRegistry;
+  end;
+
+implementation
+
+function TopicMatches(const Filter, Topic: string): Boolean;
+var
+  fParts, tParts: TStringArray;
+  i: Integer;
+begin
+  fParts := Filter.Split(['.']);
+  tParts := Topic.Split(['.']);
+  for i := 0 to High(fParts) do
+  begin
+    if fParts[i] = '>' then
+      Exit(True);
+    if i > High(tParts) then
+      Exit(False);
+    if (fParts[i] <> '*') and (fParts[i] <> tParts[i]) then
+      Exit(False);
+  end;
+  Result := Length(fParts) = Length(tParts);
+end;
+
+{ TVRDX_WorkerThread }
+
+constructor TVRDX_WorkerThread.Create(AExecuteMethod: TThreadMethod);
+begin
+  inherited Create(True);
+  FExecuteMethod := AExecuteMethod;
+  FreeOnTerminate := False;
+end;
+
+procedure TVRDX_WorkerThread.Execute;
+begin
+  if Assigned(FExecuteMethod) then
+  begin
+    FExecuteMethod();
+  end;
+end;
+
+{ TVRDX_MessageQueue }
+
+constructor TVRDX_MessageQueue.Create;
+begin
+  FList := TVRDX_MessageList.Create;
+  FLock := TCriticalSection.Create;
+  FSignal := TEvent.Create(nil, False, False, '');
+end;
+
+destructor TVRDX_MessageQueue.Destroy;
+begin
+  FSignal.Free;
+  FLock.Free;
+  FList.Free;
+  inherited;
+end;
+
+procedure TVRDX_MessageQueue.Publish(const ATopic, APayload, ASourceID: string);
+var
+  Msg: TVRDX_Message;
+begin
+  FLock.Enter;
+  try
+    Inc(FSeqCounter);
+    Msg.Topic := ATopic;
+    Msg.Payload := APayload;
+    Msg.SourceID := ASourceID;
+    Msg.Seq := FSeqCounter;
+    Msg.Timestamp := Now;
+    FList.Add(Msg);
+  finally
+    FLock.Leave;
+  end;
+  FSignal.SetEvent;
+end;
+
+function TVRDX_MessageQueue.TryDequeue(out AMsg: TVRDX_Message; TimeoutMs: Cardinal): Boolean;
+begin
+  Result := False;
+  if FSignal.WaitFor(TimeoutMs) <> wrSignaled then
+    Exit;
+  FLock.Enter;
+  try
+    Result := FList.Count > 0;
+    if Result then
+    begin
+      AMsg := FList[0];
+      FList.Delete(0);
+      if FList.Count > 0 then
+        FSignal.SetEvent;
+    end;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+{ TVRDX_Executive }
+
+constructor TVRDX_Executive.Create(ABus: TVRDX_MessageQueue);
+begin
+  inherited Create;
+  FBus := ABus;
+end;
+
+procedure TVRDX_Executive.Initialize;
+begin
+end;
+
+procedure TVRDX_Executive.Shutdown;
+begin
+end;
+
+procedure TVRDX_Executive.ApplyConfig;
+begin
+end;
+
+{ TVRDX_Registry }
+
+constructor TVRDX_Registry.Create;
+begin
+  FLock := TCriticalSection.Create;
+  FMasterMap := TVRDX_ExecMasterMap.Create([doOwnsValues]);
+  FLiteralSubs := TVRDX_ExecListDictionary.Create([doOwnsValues]);
+  FWildcardSubs := TVRDX_ExecList.Create;
+end;
+
+destructor TVRDX_Registry.Destroy;
+begin
+  FWildcardSubs.Free;
+  FLiteralSubs.Free;
+  FMasterMap.Free; // owns and frees every registered executive
+  FLock.Free;
+  inherited;
+end;
+
+procedure TVRDX_Registry.Register(AExec: TVRDX_Executive; const AID, AFilter: string);
+var
+  List: TVRDX_ExecList;
+begin
+  FLock.Enter;
+  try
+    AExec.ID := AID;
+    AExec.Filter := AFilter;
+    FMasterMap.Add(AID, AExec);
+    if (Pos('*', AFilter) > 0) or (Pos('>', AFilter) > 0) then
+      FWildcardSubs.Add(AExec)
+    else
+    begin
+      if not FLiteralSubs.TryGetValue(AFilter, List) then
+      begin
+        List := TVRDX_ExecList.Create;
+        FLiteralSubs.Add(AFilter, List);
+      end;
+      List.Add(AExec);
+    end;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TVRDX_Registry.Unregister(const AID: string);
+var
+  Exec: TVRDX_Executive;
+  List: TVRDX_ExecList;
+begin
+  FLock.Enter;
+  try
+    if not FMasterMap.TryGetValue(AID, Exec) then
+      Exit;
+    FWildcardSubs.Remove(Exec);
+    for List in FLiteralSubs.Values do
+      List.Remove(Exec);
+    FMasterMap.Remove(AID); // owning map - this is what actually frees Exec
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TVRDX_Registry.GetSubscribers(const ATopic: string): TVRDX_ExecList;
+var
+  Exec: TVRDX_Executive;
+begin
+  FLock.Enter;
+  try
+    Result := TVRDX_ExecList.Create;
+    if FLiteralSubs.ContainsKey(ATopic) then
+      Result.AddRange(FLiteralSubs[ATopic]);
+    for Exec in FWildcardSubs do
+      if TopicMatches(Exec.Filter, ATopic) then
+        Result.Add(Exec);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TVRDX_Registry.InitializeAll;
+var
+  Snapshot: TVRDX_ExecList;
+  Exec: TVRDX_Executive;
+begin
+  Snapshot := TVRDX_ExecList.Create;
+  try
+    FLock.Enter;
+    try
+      Snapshot.AddRange(FMasterMap.Values);
+    finally
+      FLock.Leave;
+    end;
+    // Deliberately called outside FLock - Initialize can block for a while (binding
+    // a socket, spawning a process) and must not stall Register/Unregister/
+    // GetSubscribers while it runs.
+    for Exec in Snapshot do
+      Exec.Initialize;
+  finally
+    Snapshot.Free;
+  end;
+end;
+
+procedure TVRDX_Registry.ShutdownAll;
+var
+  Snapshot: TVRDX_ExecList;
+  Exec: TVRDX_Executive;
+begin
+  Snapshot := TVRDX_ExecList.Create;
+  try
+    FLock.Enter;
+    try
+      Snapshot.AddRange(FMasterMap.Values);
+    finally
+      FLock.Leave;
+    end;
+    for Exec in Snapshot do
+      Exec.Shutdown;
+  finally
+    Snapshot.Free;
+  end;
+end;
+
+procedure TVRDX_Registry.ApplyAllConfigs;
+var
+  Snapshot: TVRDX_ExecList;
+  Exec: TVRDX_Executive;
+begin
+  Snapshot := TVRDX_ExecList.Create;
+  try
+    FLock.Enter;
+    try
+      Snapshot.AddRange(FMasterMap.Values);
+    finally
+      FLock.Leave;
+    end;
+    for Exec in Snapshot do
+      Exec.ApplyConfig;
+  finally
+    Snapshot.Free;
+  end;
+end;
+
+{ TVRDX_Kernel }
+
+constructor TVRDX_Kernel.Create;
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FRegistry := TVRDX_Registry.Create;
+  FQueue := TVRDX_MessageQueue.Create;
+end;
+
+destructor TVRDX_Kernel.Destroy;
+begin
+  inherited;
+end;
+
+procedure TVRDX_Kernel.Execute;
+var
+  Msg: TVRDX_Message;
+  Subscribers: TVRDX_ExecList;
+  Exec: TVRDX_Executive;
+begin
+  FRegistry.InitializeAll;
+  while not Terminated do
+  begin
+    if FQueue.TryDequeue(Msg, 500) then
+    begin
+      if Msg.Topic = 'kernel.shutdown' then
+      begin
+        WriteLn('Dispatcher: Shutdown signal processed.');
+        Break;
+      end;
+      Subscribers := FRegistry.GetSubscribers(Msg.Topic);
+      try
+        for Exec in Subscribers do
+          Exec.HandlePacket(Msg);
+      finally
+        Subscribers.Free;
+      end;
+    end;
+  end;
+  FRegistry.ShutdownAll;
+  FQueue.Free;
+  FRegistry.Free;
+  WriteLn('Dispatcher: Exited loop cleanly.');
+end;
+
+procedure TVRDX_Kernel.Terminate;
+begin
+  inherited Terminate;
+  FQueue.Publish('kernel.shutdown', '', '');
+end;
+
+// debug: not sure this is under the correct class
+procedure TVRDX_Kernel.RegisterExecutive(AExec: TVRDX_Executive; AName: string);
+var
+  Filters: TJSONArray;
+  FilterObj: TJSONObject;
+  i: Integer;
+begin
+  // Only register if the executive is enabled at the top level
+  if FConfig.GetBoolean('executives.' + AName + '.enabled', True) then
+  begin
+
+    // Defensive check: If self-receipt is NOT allowed and this is a potential loop
+    if (not AAllowSelf) and (IsExecutivePublishingToTopic(AExec, ATopic)) then
+    begin
+       // Log a warning or raise an exception to prevent logic errors
+       Log.Error('Circular subscription detected: ' + AName + ' subscribing to its own output topic: ' + ATopic);
+       Exit;
+    end;
+
+    Filters := TJSONArray(FConfig.GetPath('executives.' + AName + '.filters'));
+    for i := 0 to Filters.Count - 1 do
+    begin
+      FilterObj := TJSONObject(Filters.Items[i]);
+      // Check if the specific filter is enabled
+      if FilterObj.Get('enabled', True) then
+      begin
+        FRegistry.Register(AExec, AName, FilterObj.Get('topic', ''));
+      end;
+    end;
+  end;
+end;
+
+// debug: not sure this is under the correct class
+procedure TVRDX_Kernel.Dispatch(AMessage: TVRDX_Message; APublisher: TVRDX_Executive);
+var
+  i: Integer;
+  Sub: TSubscription;
+begin
+  for i := 0 to FSubscriptions.Count - 1 do
+  begin
+    Sub := FSubscriptions[i];
+
+    // 1. First, check if the subscriber is the publisher
+    if (Sub.Executive = APublisher) then
+    begin
+      // If the subscriber is the publisher, check if they are allowed to receive it
+      if not Sub.AllowSelfReceipt then
+        Continue; // Skip this subscriber
+    end;
+
+    // 2. Perform topic matching
+    if TopicMatches(AMessage.Topic, Sub.Filter) then
+    begin
+      Sub.Executive.Queue.Enqueue(AMessage);
+    end;
+  end;
+end;
+
+end.
+
+--- FILE: .\daemon\vrdx_http.pas ---
+unit vrdx_http;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, Sockets, vrdx_whiteboard, vrdx_core;
+
+type
+  // Request/response, synchronous - deliberately does NOT round-trip through the
+  // bus. Reads board state directly via TVRDX_WhiteboardExecutive.GetBoardSnapshot,
+  // so the client gets a full initial render with no flash-of-empty-board before its
+  // WebSocket connection's live deltas start arriving.
+  TVRDX_HTTPExecutive = class(TVRDX_Executive)
+  private
+    FPort: Word;
+    FWhiteboard: TVRDX_WhiteboardExecutive;
+    FListenSocket: TSocket;
+    FAcceptThread: TThread;
+    FStopping: Boolean;
+    procedure AcceptLoop;
+  public
+    constructor Create(ABus: TVRDX_MessageQueue; AWhiteboard: TVRDX_WhiteboardExecutive);
+    property Port: Word read FPort write FPort;
+    procedure Initialize; override;
+    procedure Shutdown; override;
+    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    procedure HandleRequest(Sock: TSocket); // public: called from TReqThread below
+  end;
+
+implementation
+
+type
+  TReqThread = class(TThread)
+  private
+    FOwner: TVRDX_HTTPExecutive;
+    FSock: TSocket;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AOwner: TVRDX_HTTPExecutive; ASock: TSocket);
+  end;
+
+constructor TReqThread.Create(AOwner: TVRDX_HTTPExecutive; ASock: TSocket);
+begin
+  inherited Create(True);
+  FOwner := AOwner;
+  FSock := ASock;
+  FreeOnTerminate := True; // one-shot request thread - fine to self-free
+end;
+
+procedure TReqThread.Execute;
+begin
+  FOwner.HandleRequest(FSock);
+end;
+
+{ TVRDX_HTTPExecutive }
+
+constructor TVRDX_HTTPExecutive.Create(ABus: TVRDX_MessageQueue; AWhiteboard: TVRDX_WhiteboardExecutive);
+begin
+  inherited Create(ABus);
+  FWhiteboard := AWhiteboard;
+  FPort := 8081;
+end;
+
+procedure TVRDX_HTTPExecutive.HandleRequest(Sock: TSocket);
+var
+  Buf: array[0..1023] of Byte;
+  Received: Integer;
+  Request, Body, Response, BoardJSON: string;
+begin
+  Received := fpRecv(Sock, @Buf[0], SizeOf(Buf), 0);
+  if Received > 0 then
+  begin
+    SetString(Request, PAnsiChar(@Buf[0]), Received);
+    if Pos('GET /board/board1', Request) = 1 then
+    begin
+      BoardJSON := FWhiteboard.GetBoardSnapshot('board1'); // one synchronous call, no bus round-trip
+      Body := '<!doctype html><html><body>' +
+              '<script>window.__INITIAL_BOARD__=' + BoardJSON + ';</script>' +
+              '<div id="board"></div>' +
+              '<script src="/dashboard.js"></script></body></html>';
+      Response := 'HTTP/1.1 200 OK'#13#10 +
+                  'Content-Type: text/html'#13#10 +
+                  'Content-Length: ' + IntToStr(Length(Body)) + #13#10#13#10 + Body;
+    end
+    else
+      Response := 'HTTP/1.1 404 Not Found'#13#10#13#10;
+    fpSend(Sock, @Response[1], Length(Response), 0);
+  end;
+  CloseSocket(Sock);
+end;
+
+procedure TVRDX_HTTPExecutive.AcceptLoop;
+var
+  Addr, ClientAddr: TInetSockAddr;
+  AddrLen: TSockLen;
+  ClientSock: TSocket;
+begin
+  FListenSocket := fpSocket(AF_INET, SOCK_STREAM, 0);
+  FillChar(Addr, SizeOf(Addr), 0);
+  Addr.sin_family := AF_INET;
+  Addr.sin_port := htons(FPort);
+  Addr.sin_addr.s_addr := 0;
+  fpBind(FListenSocket, @Addr, SizeOf(Addr));
+  fpListen(FListenSocket, 16);
+  while not FStopping do
+  begin
+    AddrLen := SizeOf(ClientAddr);
+    ClientSock := fpAccept(FListenSocket, @ClientAddr, @AddrLen);
+    if ClientSock = -1 then Continue;
+    TReqThread.Create(Self, ClientSock).Start;
+  end;
+  CloseSocket(FListenSocket);
+end;
+
+procedure TVRDX_HTTPExecutive.Initialize;
+begin
+  FStopping := False;
+  FAcceptThread := TVRDX_WorkerThread.Create(@AcceptLoop);
+  FAcceptThread.FreeOnTerminate := False;
+  FAcceptThread.Start;
+end;
+
+procedure TVRDX_HTTPExecutive.Shutdown;
+begin
+  FStopping := True;
+  if FListenSocket <> 0 then CloseSocket(FListenSocket);
+  if Assigned(FAcceptThread) then
+  begin
+    FAcceptThread.WaitFor;
+    FAcceptThread.Free;
+    FAcceptThread := nil;
+  end;
+end;
+
+procedure TVRDX_HTTPExecutive.HandlePacket(const AMsg: TVRDX_Message);
+begin
+  // HTTP is request/response, not bus-driven - nothing to do here.
+end;
+
+end.
+
+--- FILE: .\daemon\vrdx_irc.pas ---
+unit vrdx_irc;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, Sockets, StrUtils, vrdx_core;
+
+type
+
+  // IRCD, not an IRC client - VDRX binds 6667 and HexChat connects to it. Just enough
+  // protocol to keep HexChat happy: NICK/USER -> welcome, JOIN echoed back, PING/PONG,
+  // PRIVMSG parsed and republished onto the bus. One thread per client connection.
+  //
+  // No shared "socket executive" base class yet - this is the first of three
+  // (IRCD/WebSocket/HTTP); wait until the pattern repeats a third time before
+  // extracting one (see session notes).
+
+  { TVRDX_IRCDExecutive }
+
+  TVRDX_IRCDExecutive = class(TVRDX_Executive)
+  private
+    FPort: Word;
+    FListenSocket: TSocket;
+    FAcceptThread: TThread;
+    FStopping: Boolean;
+    procedure AcceptLoop;
+    procedure RestartSocket;
+  public
+    constructor Create(ABus: TVRDX_MessageQueue); override;
+    property Port: Word read FPort write FPort;
+    procedure Initialize; override;
+    procedure Shutdown; override;
+    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    procedure HandleClient(Sock: TSocket); // public: called from TIRCClientThread below
+    procedure ApplyConfig; override;
+  end;
+
+implementation
+
+function JEsc(const S: string): string;
+begin
+  Result := StringReplace(S, '\', '\\', [rfReplaceAll]);
+  Result := StringReplace(Result, '"', '\"', [rfReplaceAll]);
+  Result := '"' + Result + '"';
+end;
+
+type
+  // Plain TThread wrapper rather than an anonymous-closure capture over a loop-local
+  // socket variable, since anonymous-function variable capture isn't guaranteed
+  // available across FPC versions/modeswitches - this is the portable way to hand a
+  // per-connection value to a new thread.
+  TIRCClientThread = class(TThread)
+  private
+    FOwner: TVRDX_IRCDExecutive;
+    FSock: TSocket;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AOwner: TVRDX_IRCDExecutive; ASock: TSocket);
+  end;
+
+constructor TIRCClientThread.Create(AOwner: TVRDX_IRCDExecutive; ASock: TSocket);
+begin
+  inherited Create(True);
+  FOwner := AOwner;
+  FSock := ASock;
+  FreeOnTerminate := True; // fire-and-forget per-connection thread - fine for a handful of local clients
+end;
+
+procedure TIRCClientThread.Execute;
+begin
+  FOwner.HandleClient(FSock);
+end;
+
+{ TVRDX_IRCDExecutive }
+
+constructor TVRDX_IRCDExecutive.Create(ABus: TVRDX_MessageQueue);
+begin
+  inherited Create(ABus);
+  FPort := 6667;
+end;
+
+procedure TVRDX_IRCDExecutive.HandleClient(Sock: TSocket);
+var
+  Buf: array[0..4095] of Byte;
+  Received: Integer;
+  Acc, Line, Nick: string;
+  NlPos, p1, p2: Integer;
+
+  procedure SendLine(const S: string);
+  var B: string;
+  begin
+    B := S + #13#10;
+    fpSend(Sock, @B[1], Length(B), 0);
+  end;
+
+var
+  Channel, Msg: string;
+begin
+  Kernel.Queue.Enqueue(TVRDX_Message.Create('log.info', 'Client connected from 127.0.0.1'));
+  Nick := 'guest';
+  Acc := '';
+  while not FStopping do
+  begin
+    Received := fpRecv(Sock, @Buf[0], SizeOf(Buf), 0);
+    if Received <= 0 then
+      Break;
+    SetString(Line, PAnsiChar(@Buf[0]), Received);
+    Acc := Acc + Line;
+    repeat
+      NlPos := Pos(#10, Acc);
+      if NlPos > 0 then
+      begin
+        Line := TrimRight(Copy(Acc, 1, NlPos - 1));
+        Acc := Copy(Acc, NlPos + 1, Length(Acc));
+        if Line = '' then Continue;
+
+        if Copy(Line, 1, 4) = 'PING' then
+          SendLine('PONG' + Copy(Line, 5, Length(Line)))
+        else if Copy(Line, 1, 4) = 'NICK' then
+        begin
+          Nick := Trim(Copy(Line, 6, Length(Line)));
+          SendLine(':vrdx 001 ' + Nick + ' :Welcome to VDRX');
+        end
+        else if Copy(Line, 1, 4) = 'JOIN' then
+          SendLine(':' + Nick + ' JOIN ' + Trim(Copy(Line, 6, Length(Line))))
+        else if Copy(Line, 1, 7) = 'PRIVMSG' then
+        begin
+          p1 := Pos(' ', Line);
+          p2 := PosEx(' ', Line, p1 + 1);
+          if p2 > 0 then
+          begin
+            Channel := Copy(Line, p1 + 1, p2 - p1 - 1);
+            Msg := Copy(Line, p2 + 3, Length(Line)); // skip leading ' :'
+            Bus.Publish('irc.msg.' + Channel,
+              Format('{"from":%s,"text":%s}', [JEsc(Nick), JEsc(Msg)]), 'irc.' + Nick);
+          end;
+        end;
+        // USER intentionally ignored - NICK alone is enough to identify SourceID
+      end;
+    until NlPos = 0;
+  end;
+  CloseSocket(Sock);
+end;
+
+procedure TVRDX_IRCDExecutive.AcceptLoop;
+var
+  Addr, ClientAddr: TInetSockAddr;
+  AddrLen: TSockLen;
+  ClientSock: TSocket;
+begin
+  FListenSocket := fpSocket(AF_INET, SOCK_STREAM, 0);
+  FillChar(Addr, SizeOf(Addr), 0);
+  Addr.sin_family := AF_INET;
+  Addr.sin_port := htons(FPort);
+  Addr.sin_addr.s_addr := 0;
+  fpBind(FListenSocket, @Addr, SizeOf(Addr));
+  fpListen(FListenSocket, 8);
+  while not FStopping do
+  begin
+    AddrLen := SizeOf(ClientAddr);
+    ClientSock := fpAccept(FListenSocket, @ClientAddr, @AddrLen);
+    if ClientSock = -1 then
+      Continue;
+    TIRCClientThread.Create(Self, ClientSock).Start;
+  end;
+  CloseSocket(FListenSocket);
+end;
+
+procedure TVRDX_IRCDExecutive.RestartSocket;
+begin
+  FServerSocket.Close;
+  FServerSocket.Bind(FPort);
+  FServerSocket.Listen;
+end;
+
+procedure TVRDX_IRCDExecutive.Initialize;
+begin
+  FStopping := False;
+  FAcceptThread := TVRDX_WorkerThread.Create(@AcceptLoop);
+  FAcceptThread.FreeOnTerminate := False;
+  FAcceptThread.Start;
+end;
+
+procedure TVRDX_IRCDExecutive.Shutdown;
+begin
+  FStopping := True;
+  if FListenSocket <> 0 then
+    CloseSocket(FListenSocket); // unblocks fpAccept in AcceptLoop
+  if Assigned(FAcceptThread) then
+  begin
+    FAcceptThread.WaitFor;
+    FAcceptThread.Free;
+    FAcceptThread := nil;
+  end;
+  // NOTE: per-client threads are FreeOnTerminate and not individually tracked/joined
+  // here - acceptable for tonight's scope. A production Shutdown needs to track,
+  // signal, and join every live connection thread, not just the accept loop.
+end;
+
+procedure TVRDX_IRCDExecutive.HandlePacket(const AMsg: TVRDX_Message);
+begin
+  // Outbound IRC (e.g. a bot announcing something in-channel) would go here - not
+  // needed for the hello-world flow, which is one-directional (IRC -> bus).
+end;
+
+procedure TVRDX_IRCDExecutive.ApplyConfig;
+begin
+  FPort := FConfig.GetInteger('executives.ircd.port', 6667);
+  RestartSocket;
+end;
+
+procedure TVRDX_IRCDExecutive.HandleAuth(AMsg: TVRDX_Message);
+var
+  AuthData: TJSONObject;
+begin
+  // Cast or extract the payload
+  AuthData := TJSONObject(AMsg.Payload);
+
+  // Logic: Verify credentials against your local store
+  if VerifyCredentials(AuthData.Get('user', ''), AuthData.Get('pass', '')) then
+  begin
+    // Success: Notify the bus
+    Kernel.Publish('ircd.auth.success', AuthData);
+  end
+  else
+  begin
+    // Failure
+    Kernel.Publish('ircd.auth.failure', AuthData);
+  end;
+end;
+
+procedure TVRDX_IRCDExecutive.HandleIncoming(Msg: TVRDX_Message);
+begin
+  // Assuming Msg contains the SenderID/ConnectionID
+  if not IsRegistered(Msg.SenderID) then
+  begin
+    if (Msg.Topic = 'ircd.nick') or (Msg.Topic = 'ircd.user') then
+      ProcessRegistration(Msg)
+    else
+      // RFC standard: Send 451 error if command requires registration
+      Kernel.Publish('ircd.error.451', Msg.SenderID);
+  end
+  else
+    ProcessStandardCommand(Msg);
+end;
+
+procedure TVRDX_IRCDExecutive.Execute;
+var
+  Msg: TVRDX_Message;
+begin
+  while not Terminated do
+  begin
+    // Pull from the executive's private thread-safe queue
+    if FQueue.TryDequeue(Msg) then
+    begin
+      // Route based on the topic string
+      if Msg.Topic = 'ircd.auth' then
+        HandleAuth(Msg)
+      else if Msg.Topic.StartsWith('ircd.') then
+        HandleGenericIRC(Msg)
+      else if Msg.Topic = 'sys.reload' then
+        ApplyConfig; // The virtual hook we discussed
+    end
+    else
+      Sleep(10); // Low-power idle
+  end;
+end;
+
+end.
+
+--- FILE: .\daemon\vrdx_logger.pas ---
+unit vrdx_logger;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, vrdx_core;
+
+// ANSI Color Constants
+const
+  CLR_RESET  = #27'[0m';
+  CLR_INFO   = #27'[32m'; // Green
+  CLR_WARN   = #27'[33m'; // Yellow
+  CLR_ERROR  = #27'[31m'; // Red
+
+type
+  TLogLevel = (lvlINFO, lvlWARN, lvlERROR);
+
+  TVRDX_LoggerExecutive = class(TVRDX_Executive)
+  private
+    FFileStream: TFileStream;
+    FThreshold: TLogLevel;
+  public
+    constructor Create(AQueue: TVRDX_MessageQueue; APath: string; ALevel: TLogLevel);
+    destructor Destroy; override;
+    procedure Execute; override;
+  end;
+
+implementation
+
+constructor TVRDX_LoggerExecutive.Create(AQueue: TVRDX_MessageQueue; APath: string; ALevel: TLogLevel);
+begin
+  inherited Create(AQueue);
+  FThreshold := ALevel;
+  // Open in share-exclusive mode, create if missing
+  FFileStream := TFileStream.Create(APath, fmOpenWrite or fmCreate or fmShareDenyWrite);
+end;
+
+destructor TVRDX_LoggerExecutive.Destroy;
+begin
+  FFileStream.Free;
+  inherited;
+end;
+
+procedure TVRDX_LoggerExecutive.WriteToOutput(const ATopic, AMessage: string);
+var
+  Color, Level: string;
+begin
+  if ATopic = 'log.error' then begin Color := CLR_ERROR; Level := 'ERROR'; end
+  else if ATopic = 'log.warn' then begin Color := CLR_WARN; Level := 'WARN '; end
+  else begin Color := CLR_INFO; Level := 'INFO '; end;
+
+  // File write (clean, no terminal ANSI escape colors)
+  FileLine := Format('[%s] [%s] [%s] %s%s', [DateTimeToStr(Now), LevelStr, ATopic, AMessage, LineEnding]);
+  FFileStream.WriteBuffer(FileLine[1], Length(FileLine) * SizeOf(Char));
+
+  // Console write (with terminal colors)
+  ConsoleLine := Format('%s[%s] [%s] [%s] %s%s%s', [Color, DateTimeToStr(Now), LevelStr, ATopic, AMessage, CLR_RESET, LineEnding]);
+  Write(ConsoleLine);
+end;
+
+procedure TVRDX_LoggerExecutive.Execute;
+var
+  Msg: TVRDX_Message;
+  Level: TLogLevel;
+  Line: string;
+begin
+  while not Terminated do
+  begin
+    if FQueue.TryDequeue(Msg, 500) then
+    begin
+      // Logic: Map topic to level
+      if Msg.Topic = 'log.error' then Level := lvlERROR
+      else if Msg.Topic = 'log.warn' then Level := lvlWARN
+      else Level := lvlINFO;
+
+      if Level >= FThreshold then
+      begin
+        Line := Format('[%s] [%s] %s' + LineEnding, [DateTimeToStr(Now), Msg.Topic, Msg.Payload]);
+        FFileStream.WriteBuffer(Line[1], Length(Line) * SizeOf(Char));
+        FFileStream.Flush; // Ensures data is written to disk
+      end;
+    end;
+  end;
+end;
+
+end.
+
+--- FILE: .\daemon\vrdx_websocket.pas ---
+unit vrdx_websocket;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, Sockets, SyncObjs, base64, sha1, fpjson, jsonparser,
+  vrdx_core;
+
+const
+  WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+type
+  TVRDX_WebSocketExecutive = class;
+
+  // One instance per live browser connection. Registers itself into the Registry
+  // once auth succeeds, with whatever filter the client last subscribed to - this is
+  // what lets the Dispatcher's ordinary routing deliver bus messages straight to the
+  // socket, with no separate broadcast path anywhere in the kernel. Deregisters
+  // itself on disconnect.
+  TVRDX_WSConnection = class(TVRDX_Executive)
+  private
+    FListener: TVRDX_WebSocketExecutive;
+    FSocket: TSocket;
+    FThread: TThread;
+    FAuthenticated: Boolean;
+    FSendLock: TCriticalSection;
+    function DoHandshake: Boolean;
+    function ReadFrame(out APayload: string; out AOpcode: Byte): Boolean;
+    procedure SendFrame(const APayload: string; AOpcode: Byte = 1);
+    procedure HandleRPC(const ALine: string);
+  public
+    constructor Create(ABus: TVRDX_MessageQueue; AListener: TVRDX_WebSocketExecutive; ASocket: TSocket);
+    destructor Destroy; override;
+    procedure Initialize; override;
+    procedure Shutdown; override;
+    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    procedure RunLoop; // public: called from TWSConnThread below
+  end;
+
+  TVRDX_WebSocketExecutive = class(TVRDX_Executive)
+  private
+    FPort: Word;
+    FRegistry: TVRDX_Registry;
+    FListenSocket: TSocket;
+    FAcceptThread: TThread;
+    FStopping: Boolean;
+    FConnCounter: Integer;
+    procedure AcceptLoop;
+  public
+    constructor Create(ABus: TVRDX_MessageQueue; ARegistry: TVRDX_Registry);
+    property Port: Word read FPort write FPort;
+    property Registry: TVRDX_Registry read FRegistry;
+    procedure Initialize; override;
+    procedure Shutdown; override;
+    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    function NextConnID: string;
+  end;
+
+implementation
+
+function JEsc(const S: string): string;
+begin
+  Result := StringReplace(S, '\', '\\', [rfReplaceAll]);
+  Result := StringReplace(Result, '"', '\"', [rfReplaceAll]);
+  Result := '"' + Result + '"';
+end;
+
+function ComputeAcceptKey(const AClientKey: string): string;
+var
+  Digest: TSHA1Digest;
+  RawStr: string;
+begin
+  Digest := SHA1String(AClientKey + WS_GUID);
+  SetString(RawStr, PAnsiChar(@Digest[0]), SizeOf(Digest));
+  Result := EncodeStringBase64(RawStr);
+end;
+
+type
+  // Same rationale as TIRCClientThread in vrdx_irc.pas: a plain TThread wrapper
+  // rather than an anonymous closure over a loop-local socket/connection value.
+  TWSConnThread = class(TThread)
+  private
+    FConn: TVRDX_WSConnection;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AConn: TVRDX_WSConnection);
+  end;
+
+constructor TWSConnThread.Create(AConn: TVRDX_WSConnection);
+begin
+  inherited Create(True);
+  FConn := AConn;
+  FreeOnTerminate := False;
+end;
+
+procedure TWSConnThread.Execute;
+begin
+  FConn.RunLoop;
+end;
+
+{ TVRDX_WSConnection }
+
+constructor TVRDX_WSConnection.Create(ABus: TVRDX_MessageQueue; AListener: TVRDX_WebSocketExecutive; ASocket: TSocket);
+begin
+  inherited Create(ABus);
+  FListener := AListener;
+  FSocket := ASocket;
+  FSendLock := TCriticalSection.Create;
+  FAuthenticated := False;
+end;
+
+destructor TVRDX_WSConnection.Destroy;
+begin
+  FSendLock.Free;
+  inherited Destroy;
+end;
+
+function TVRDX_WSConnection.DoHandshake: Boolean;
+var
+  Buf: array[0..2047] of Byte;
+  Received, i, tailLen: Integer;
+  Request, Key, AcceptKey, Header: string;
+begin
+  Result := False;
+  Received := fpRecv(FSocket, @Buf[0], SizeOf(Buf), 0);
+  if Received <= 0 then Exit;
+  SetString(Request, PAnsiChar(@Buf[0]), Received);
+  i := Pos('Sec-WebSocket-Key:', Request);
+  if i = 0 then Exit;
+  tailLen := Pos(#13, Copy(Request, i, Length(Request))) - 20; // 'Sec-WebSocket-Key: ' is 20 chars
+  if tailLen < 1 then Exit;
+  Key := Trim(Copy(Request, i + 19, tailLen));
+  AcceptKey := ComputeAcceptKey(Key);
+  Header := 'HTTP/1.1 101 Switching Protocols'#13#10 +
+            'Upgrade: websocket'#13#10 +
+            'Connection: Upgrade'#13#10 +
+            'Sec-WebSocket-Accept: ' + AcceptKey + #13#10#13#10;
+  fpSend(FSocket, @Header[1], Length(Header), 0);
+  Result := True;
+end;
+
+// Unfragmented text frames only, up to 64KB payload - sufficient for the short
+// JSON-RPC control messages this bridge exchanges.
+function TVRDX_WSConnection.ReadFrame(out APayload: string; out AOpcode: Byte): Boolean;
+var
+  Hdr: array[0..1] of Byte;
+  Ext: array[0..1] of Byte;
+  Len: Integer;
+  Mask: array[0..3] of Byte;
+  Data: array of Byte;
+  Received, i: Integer;
+  LenByte: Byte;
+begin
+  Result := False;
+  if fpRecv(FSocket, @Hdr[0], 2, 0) <> 2 then Exit;
+  AOpcode := Hdr[0] and $0F;
+  if AOpcode = 8 then Exit; // close frame
+  LenByte := Hdr[1] and $7F;
+  Len := LenByte;
+  if LenByte = 126 then
+  begin
+    fpRecv(FSocket, @Ext[0], 2, 0);
+    Len := (Ext[0] shl 8) or Ext[1];
+  end
+  else if LenByte = 127 then
+    Exit; // 64-bit lengths not needed for control-plane traffic
+  if (Hdr[1] and $80) <> 0 then
+    fpRecv(FSocket, @Mask[0], 4, 0)
+  else
+    FillChar(Mask, SizeOf(Mask), 0);
+  SetLength(Data, Len);
+  Received := 0;
+  while Received < Len do
+    Inc(Received, fpRecv(FSocket, @Data[Received], Len - Received, 0));
+  for i := 0 to Len - 1 do
+    Data[i] := Data[i] xor Mask[i mod 4];
+  SetString(APayload, PAnsiChar(@Data[0]), Len);
+  Result := True;
+end;
+
+procedure TVRDX_WSConnection.SendFrame(const APayload: string; AOpcode: Byte);
+var
+  Hdr: array[0..3] of Byte;
+  HdrLen: Integer;
+  Buf: string;
+begin
+  FSendLock.Enter;
+  try
+    Hdr[0] := $80 or AOpcode;
+    if Length(APayload) < 126 then
+    begin
+      Hdr[1] := Length(APayload);
+      HdrLen := 2;
+    end
+    else
+    begin
+      Hdr[1] := 126;
+      Hdr[2] := (Length(APayload) shr 8) and $FF;
+      Hdr[3] := Length(APayload) and $FF;
+      HdrLen := 4;
+    end;
+    SetString(Buf, PAnsiChar(@Hdr[0]), HdrLen);
+    Buf := Buf + APayload; // server->client frames sent unmasked, per spec
+    fpSend(FSocket, @Buf[1], Length(Buf), 0);
+  finally
+    FSendLock.Leave;
+  end;
+end;
+
+procedure TVRDX_WSConnection.HandleRPC(const ALine: string);
+var
+  J: TJSONData;
+  Obj: TJSONObject;
+  Method, Topic, Payload, Token, Src: string;
+begin
+  try
+    J := GetJSON(ALine);
+  except
+    Exit; // malformed JSON dropped, connection stays alive
+  end;
+  try
+    if not (J is TJSONObject) then Exit;
+    Obj := TJSONObject(J);
+    Method := Obj.Get('method', '');
+
+    if Method = 'sys.auth' then
+    begin
+      Token := Obj.Get('token', '');
+      Src := Obj.Get('source', ID);
+      FAuthenticated := Token <> ''; // stub - wire to real verification before this is untrusted-facing
+      SendFrame(Format('{"event":"auth.ok","source":%s}', [JEsc(Src)]));
+      Exit;
+    end;
+
+    if not FAuthenticated then Exit; // bus-level actions gated until sys.auth succeeds
+
+    if Method = 'subscribe' then
+    begin
+      Topic := Obj.Get('filter', '');
+      // Single-filter simplification (flagged in session notes): re-registering
+      // replaces this connection's one active filter rather than adding to a set.
+      FListener.Registry.Unregister(ID);
+      FListener.Registry.Register(Self, ID, Topic);
+    end
+    else if Method = 'publish' then
+    begin
+      Topic := Obj.Get('topic', '');
+      Payload := Obj.Get('payload', '{}');
+      Bus.Publish(Topic, Payload, ID);
+    end;
+  finally
+    J.Free;
+  end;
+end;
+
+procedure TVRDX_WSConnection.RunLoop;
+var
+  Payload: string;
+  Opcode: Byte;
+begin
+  if not DoHandshake then Exit;
+  while True do
+  begin
+    if not ReadFrame(Payload, Opcode) then Break;
+    if Opcode = 1 then HandleRPC(Payload);
+  end;
+  FListener.Registry.Unregister(ID); // clean up on disconnect
+end;
+
+procedure TVRDX_WSConnection.Initialize;
+begin
+  FThread := TWSConnThread.Create(Self);
+  FThread.Start;
+end;
+
+procedure TVRDX_WSConnection.Shutdown;
+begin
+  CloseSocket(FSocket); // unblocks the blocking recv in RunLoop
+  if Assigned(FThread) then
+  begin
+    FThread.WaitFor;
+    FThread.Free;
+    FThread := nil;
+  end;
+end;
+
+procedure TVRDX_WSConnection.HandlePacket(const AMsg: TVRDX_Message);
+begin
+  SendFrame(Format('{"topic":%s,"payload":%s,"source":%s,"seq":%d}',
+    [JEsc(AMsg.Topic), AMsg.Payload, JEsc(AMsg.SourceID), AMsg.Seq]));
+end;
+
+{ TVRDX_WebSocketExecutive }
+
+constructor TVRDX_WebSocketExecutive.Create(ABus: TVRDX_MessageQueue; ARegistry: TVRDX_Registry);
+begin
+  inherited Create(ABus);
+  FRegistry := ARegistry;
+  FPort := 8082;
+  FConnCounter := 0;
+end;
+
+function TVRDX_WebSocketExecutive.NextConnID: string;
+begin
+  Inc(FConnCounter);
+  Result := 'ws.conn.' + IntToStr(FConnCounter);
+end;
+
+procedure TVRDX_WebSocketExecutive.AcceptLoop;
+var
+  Addr, ClientAddr: TInetSockAddr;
+  AddrLen: TSockLen;
+  ClientSock: TSocket;
+  Conn: TVRDX_WSConnection;
+begin
+  FListenSocket := fpSocket(AF_INET, SOCK_STREAM, 0);
+  FillChar(Addr, SizeOf(Addr), 0);
+  Addr.sin_family := AF_INET;
+  Addr.sin_port := htons(FPort);
+  Addr.sin_addr.s_addr := 0;
+  fpBind(FListenSocket, @Addr, SizeOf(Addr));
+  fpListen(FListenSocket, 16);
+  while not FStopping do
+  begin
+    AddrLen := SizeOf(ClientAddr);
+    ClientSock := fpAccept(FListenSocket, @ClientAddr, @AddrLen);
+    if ClientSock = -1 then Continue;
+    // Registered with a non-matching placeholder filter until the client's own
+    // 'subscribe' RPC re-registers it with something real.
+    Conn := TVRDX_WSConnection.Create(Bus, Self, ClientSock);
+    FRegistry.Register(Conn, NextConnID, 'sys.none');
+    Conn.Initialize;
+  end;
+  CloseSocket(FListenSocket);
+end;
+
+procedure TVRDX_WebSocketExecutive.Initialize;
+begin
+  FStopping := False;
+  FAcceptThread := TVRDX_WorkerThread.Create(@AcceptLoop);
+  FAcceptThread.FreeOnTerminate := False;
+  FAcceptThread.Start;
+end;
+
+procedure TVRDX_WebSocketExecutive.Shutdown;
+begin
+  FStopping := True;
+  if FListenSocket <> 0 then CloseSocket(FListenSocket);
+  if Assigned(FAcceptThread) then
+  begin
+    FAcceptThread.WaitFor;
+    FAcceptThread.Free;
+    FAcceptThread := nil;
+  end;
+  // NOTE: same simplification as IRCD - live connections aren't individually tracked
+  // and shut down here; each unregisters itself when its own socket closes.
+end;
+
+procedure TVRDX_WebSocketExecutive.HandlePacket(const AMsg: TVRDX_Message);
+begin
+  // The listener itself isn't a message recipient - each TVRDX_WSConnection is.
+end;
+
+end.
+
+--- FILE: .\daemon\vrdx_whiteboard.pas ---
+unit vrdx_whiteboard;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, SyncObjs, fpjson, jsonparser, vrdx_core;
+
+type
+  // Trimmed hello-world version: in-memory only, no BucketStore yet (deliberately -
+  // see session notes). Subscribes 'wb.>'. HandlePacket applies a delta, republishes
+  // '<board>.synced'. FLock exists even though HandlePacket alone (Dispatcher-thread
+  // only) wouldn't strictly need it - GetBoardSnapshot is a synchronous accessor
+  // meant to be called from the HTTP executive's own request-handling thread, so
+  // board state genuinely is touched from more than one thread.
+  TVRDX_WhiteboardExecutive = class(TVRDX_Executive)
+  private
+    FLock: TCriticalSection;
+    FBoards: TStringList; // board name -> TJSONObject, owned
+    function GetBoard(const ABoardName: string): TJSONObject;
+    procedure ApplyDelta(const ABoardName: string; ADelta: TJSONObject);
+  public
+    constructor Create(ABus: TVRDX_MessageQueue); override;
+    destructor Destroy; override;
+    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    function GetBoardSnapshot(const ABoardName: string): string; // thread-safe synchronous read, for TVRDX_HTTPExecutive
+  end;
+
+implementation
+
+constructor TVRDX_WhiteboardExecutive.Create(ABus: TVRDX_MessageQueue);
+begin
+  inherited Create(ABus);
+  FLock := TCriticalSection.Create;
+  FBoards := TStringList.Create;
+  FBoards.OwnsObjects := True;
+end;
+
+destructor TVRDX_WhiteboardExecutive.Destroy;
+begin
+  FBoards.Free;
+  FLock.Free;
+  inherited Destroy;
+end;
+
+function TVRDX_WhiteboardExecutive.GetBoard(const ABoardName: string): TJSONObject;
+var
+  idx: Integer;
+begin
+  idx := FBoards.IndexOf(ABoardName);
+  if idx >= 0 then
+    Exit(TJSONObject(FBoards.Objects[idx]));
+  Result := TJSONObject.Create;
+  Result.Add('widgets', TJSONArray.Create);
+  Result.Add('links', TJSONArray.Create);
+  FBoards.AddObject(ABoardName, Result);
+  // When BucketStore is added: load from disk here (cold-start hydration) instead of
+  // always starting empty, and call FStore.SaveBucket at the end of ApplyDelta,
+  // before HandlePacket publishes '.synced' - update state, persist, THEN announce.
+end;
+
+procedure TVRDX_WhiteboardExecutive.ApplyDelta(const ABoardName: string; ADelta: TJSONObject);
+var
+  Board: TJSONObject;
+  Op: string;
+begin
+  Board := GetBoard(ABoardName);
+  Op := ADelta.Get('op', '');
+  if Op = 'add' then
+    Board.Arrays['widgets'].Add(TJSONObject(ADelta.Objects['widget'].Clone))
+  else if Op = 'move' then
+    // Widget identity / last-write-wins resolution happens client-side; server just
+    // appends the delta to history.
+    Board.Arrays['widgets'].Add(TJSONObject(ADelta.Clone))
+  else if Op = 'link' then
+    Board.Arrays['links'].Add(TJSONObject(ADelta.Objects['link'].Clone));
+end;
+
+procedure TVRDX_WhiteboardExecutive.HandlePacket(const AMsg: TVRDX_Message);
+var
+  Parts: TStringArray;
+  BoardName: string;
+  J: TJSONData;
+begin
+  // Topic shape: wb.<board>.delta
+  Parts := AMsg.Topic.Split(['.']);
+  if Length(Parts) < 3 then
+    Exit;
+  BoardName := Parts[1];
+  FLock.Enter;
+  try
+    try
+      J := GetJSON(AMsg.Payload);
+      try
+        if J is TJSONObject then
+        begin
+          ApplyDelta(BoardName, TJSONObject(J));
+          Bus.Publish('wb.' + BoardName + '.synced', AMsg.Payload, ID);
+        end;
+      finally
+        J.Free;
+      end;
+    except
+      // malformed delta - drop rather than corrupt board state
+    end;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TVRDX_WhiteboardExecutive.GetBoardSnapshot(const ABoardName: string): string;
+begin
+  FLock.Enter;
+  try
+    Result := GetBoard(ABoardName).AsJSON;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+end.
+
+--- FILE: .\daemon\WIRING.md ---
+# Wiring these into vdrx_daemon.dpr
+
+```pascal
+uses
+  ..., vrdx_core, vrdx_bridge, vrdx_whiteboard, vrdx_irc, vrdx_websocket, vrdx_http;
+
+var
+  Kernel: TVRDX_Kernel;
+  Whiteboard: TVRDX_WhiteboardExecutive;
+  IRCD: TVRDX_IRCDExecutive;
+  WS: TVRDX_WebSocketExecutive;
+  HTTP: TVRDX_HTTPExecutive;
+  // Bridge: TVRDX_BridgeExecutive;  -- only if you have an external process to run tonight
+
+begin
+  Kernel := TVRDX_Kernel.Create;
+
+  Whiteboard := TVRDX_WhiteboardExecutive.Create(Kernel.Queue);
+  Kernel.Registry.Register(Whiteboard, 'whiteboard', 'wb.>');
+
+  IRCD := TVRDX_IRCDExecutive.Create(Kernel.Queue);
+  Kernel.Registry.Register(IRCD, 'ircd', 'sys.none'); // IRCD doesn't consume bus messages tonight
+
+  WS := TVRDX_WebSocketExecutive.Create(Kernel.Queue, Kernel.Registry);
+  Kernel.Registry.Register(WS, 'websocket', 'sys.none');
+
+  HTTP := TVRDX_HTTPExecutive.Create(Kernel.Queue, Whiteboard);
+  Kernel.Registry.Register(HTTP, 'http', 'sys.none');
+
+  Kernel.Start;      // Execute() calls Registry.InitializeAll - this is what actually
+                      // binds the three listening sockets and starts their threads
+  WriteLn('Kernel running. Press ENTER to stop...');
+  ReadLn;
+  Kernel.Terminate;
+  Kernel.WaitFor;
+  Kernel.Free;
+end.
+```
+
+`'sys.none'` for the listener executives is a deliberate no-op filter (it'll never
+match a real topic) - they don't consume bus messages themselves tonight, only their
+dynamically-registered children (`TVRDX_WSConnection`) or their reader threads
+(IRCD's per-client threads) actually move data.
+
+**Wiring order note:** `Whiteboard` must be constructed and passed into `HTTP`'s
+constructor before `HTTP` is created â€” `TVRDX_HTTPExecutive` holds a direct reference
+to it for the synchronous snapshot read, per the design discussed (HTTP bypasses the
+bus for that one need).
+
+**Test path:** HexChat -> `localhost:6667`, join any channel, `PRIVMSG` a JSON delta
+as the message text (or extend `vrdx_irc`'s `PRIVMSG` handler to translate a `!wb`
+command into a delta payload, as sketched earlier) -> Whiteboard applies + republishes
+-> any WS connections subscribed to `wb.board1.>` receive it live. `GET
+localhost:8081/board/board1` gives a synchronous snapshot for a fresh page load.
+
+**Not included tonight, flagged as deferred (matches earlier session notes):**
+- BucketStore/persistence for Whiteboard
+- Real `sys.auth` token verification in the WS executive
+- RBAC on `sys.*`/`admin.*`
+- Per-connection thread tracking in IRCD/WebSocket `Shutdown` (currently only the
+  accept-loop thread is joined; live per-connection threads unblock via socket close
+  but aren't explicitly waited on)
+
+--- FILE: .\daemon\backup\vrdx_admin.pas ---
+unit vrdx_admin;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils;
+
+implementation
+
+end.
+
+
+--- FILE: .\daemon\backup\vrdx_bridge.pas ---
+unit vrdx_bridge;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, SyncObjs, Process, fpjson, vrdx_core;
+
+type
+
+  TVRDX_WorkerThread = class(TThread)
+  private
+    FExecuteMethod: TThreadMethod;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AExecuteMethod: TThreadMethod);
+  end;
+
+  // External-process manager. One instance per external process. Descends from
+  // TVRDX_Executive directly - not a special base class, just an executive that does
+  // more work in its lifecycle hooks than most. Registry manages it exactly like any
+  // other executive (register/unregister/Initialize/Shutdown), with no special-casing.
+  TVRDX_BridgeExecutive = class(TVRDX_Executive)
+  private
+    FCommand: string;
+    FProcess: TProcess;
+    FProcessLock: TCriticalSection; // guards FProcess against Handle/restart races
+    FReaderThread: TThread;
+    FMonitorThread: TThread;
+    FRestartDelayMs: Integer;
+    FMaxRestartDelayMs: Integer;
+    FStopping: Boolean;
+    procedure StartProcess;
+    procedure StopProcess;
+    procedure ReaderLoop;
+    procedure MonitorLoop;
+  public
+    constructor Create(ABus: TVRDX_MessageQueue); override;
+    destructor Destroy; override;
+    property Command: string read FCommand write FCommand;
+    procedure Initialize; override;
+    procedure Shutdown; override;
+    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+  end;
+
+implementation
+
+{ TVRDX_WorkerThread }
+
+constructor TVRDX_WorkerThread.Create(AExecuteMethod: TThreadMethod);
+begin
+  inherited Create(True);
+  FExecuteMethod := AExecuteMethod;
+  FreeOnTerminate := False;
+end;
+
+procedure TVRDX_WorkerThread.Execute;
+begin
+  if Assigned(FExecuteMethod) then
+  begin
+    FExecuteMethod();
+  end;
+end;
+
+{ TVRDX_BridgeExecutive }
+
+constructor TVRDX_BridgeExecutive.Create(ABus: TVRDX_MessageQueue);
+begin
+  inherited Create(ABus);
+  FProcessLock := TCriticalSection.Create;
+  FRestartDelayMs := 500;
+  FMaxRestartDelayMs := 30000;
+  FStopping := False;
+end;
+
+destructor TVRDX_BridgeExecutive.Destroy;
+begin
+  FProcessLock.Free;
+  inherited Destroy;
+end;
+
+procedure TVRDX_BridgeExecutive.StartProcess;
+begin
+  FProcessLock.Enter;
+  try
+    FProcess := TProcess.Create(nil);
+    FProcess.CommandLine := FCommand;
+    FProcess.Options := [poUsePipes, poStderrToOutPut];
+    FProcess.Execute;
+  finally
+    FProcessLock.Leave;
+  end;
+  FReaderThread := TVRDX_WorkerThread.Create(@ReaderLoop);
+  FReaderThread.FreeOnTerminate := False;
+  FReaderThread.Start;
+end;
+
+procedure TVRDX_BridgeExecutive.StopProcess;
+begin
+  FProcessLock.Enter;
+  try
+    if Assigned(FProcess) then
+    begin
+      try
+        if FProcess.Running then
+          FProcess.Terminate(0); // unblocks the reader thread's blocking read via EOF
+      except
+      end;
+      FProcess.Free;
+      FProcess := nil;
+    end;
+  finally
+    FProcessLock.Leave;
+  end;
+  if Assigned(FReaderThread) then
+  begin
+    FReaderThread.WaitFor;
+    FReaderThread.Free;
+    FReaderThread := nil;
+  end;
+end;
+
+// Blocking char-by-char read, buffered until newline. Deliberately not using
+// NumBytesAvailable - not reliably present across FPC versions; a plain blocking
+// Read is simpler and fully portable.
+procedure TVRDX_BridgeExecutive.ReaderLoop;
+var
+  Line, Buf: string;
+  Ch: Char;
+  Proc: TProcess;
+begin
+  Buf := '';
+  FProcessLock.Enter;
+  Proc := FProcess;
+  FProcessLock.Leave;
+  while (not FStopping) and Assigned(Proc) and Proc.Running do
+  begin
+    if Proc.Output.Read(Ch, 1) = 1 then
+    begin
+      if Ch = #10 then
+      begin
+        Line := Trim(Buf);
+        Buf := '';
+        if Line <> '' then
+          Bus.Publish(ID + '.out', Line, ID); // process output re-enters the bus, namespaced by this executive's ID
+      end
+      else if Ch <> #13 then
+        Buf := Buf + Ch;
+    end
+    else
+      Sleep(20);
+  end;
+end;
+
+procedure TVRDX_BridgeExecutive.MonitorLoop;
+var
+  NeedsRestart: Boolean;
+begin
+  while not FStopping do
+  begin
+    Sleep(1000);
+    if FStopping then
+      Break;
+    FProcessLock.Enter;
+    NeedsRestart := (not Assigned(FProcess)) or (not FProcess.Running);
+    FProcessLock.Leave;
+    if NeedsRestart and (not FStopping) then
+    begin
+      StopProcess;
+      Sleep(FRestartDelayMs);
+      if FRestartDelayMs < FMaxRestartDelayMs then
+        FRestartDelayMs := FRestartDelayMs * 2; // exponential backoff on a crash loop
+      if not FStopping then
+      begin
+        StartProcess;
+        FRestartDelayMs := 500; // reset after a clean (re)start
+      end;
+    end;
+  end;
+end;
+
+procedure TVRDX_BridgeExecutive.Initialize;
+begin
+  FStopping := False;
+  StartProcess;
+  FMonitorThread := TVRDX_WorkerThread.Create(@MonitorLoop);
+  FMonitorThread.FreeOnTerminate := False;
+  FMonitorThread.Start;
+end;
+
+procedure TVRDX_BridgeExecutive.Shutdown;
+begin
+  FStopping := True;
+  StopProcess;
+  if Assigned(FMonitorThread) then
+  begin
+    FMonitorThread.WaitFor;
+    FMonitorThread.Free;
+    FMonitorThread := nil;
+  end;
+end;
+
+procedure TVRDX_BridgeExecutive.HandlePacket(const AMsg: TVRDX_Message);
+var
+  Line: string;
+begin
+  FProcessLock.Enter;
+  try
+    if Assigned(FProcess) and FProcess.Running then
+    begin
+      Line := Format('{"topic":%s,"payload":%s,"source":%s}',
+        [StringToJSONString(AMsg.Topic), AMsg.Payload, StringToJSONString(AMsg.SourceID)])
+        + LineEnding;
+      FProcess.Input.Write(Line[1], Length(Line));
+    end;
+  finally
+    FProcessLock.Leave;
+  end;
+end;
+
+end.
+
+--- FILE: .\daemon\backup\vrdx_config.pas ---
+unit vrdx_config;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, fpjson, jsonparser;
+
+type
+  TVRDX_Config = class
+  private
+    FData: TJSONObject;
+    FLock: TCriticalSection;
+    FFilePath: string;
+  public
+    constructor Create(const AFilePath: string);
+    destructor Destroy; override;
+    function GetString(APath: string; ADefault: string): string;
+    function GetInteger(APath: string; ADefault: Integer): Integer;
+    procedure Reload;
+  end;
+
+implementation
+
+constructor TVRDX_Config.Create(const AFilePath: string);
+var
+  JSONString: TStringList;
+begin
+  FLock := TCriticalSection.Create;
+  if FileExists(AFilePath) then
+  begin
+    JSONString := TStringList.Create;
+    try
+      JSONString.LoadFromFile(AFilePath);
+      FData := TJSONObject(GetJSON(JSONString.Text));
+    finally
+      JSONString.Free;
+    end;
+  end
+  else
+    FData := TJSONObject.Create;
+end;
+
+destructor TVRDX_Config.Destroy;
+begin
+  FData.Free;
+  FLock.Free;
+  inherited;
+end;
+
+function TVRDX_Config.GetString(APath: string; ADefault: string): string;
+begin
+  // Simple path traversal (e.g., 'system.log_path')
+  // In a full implementation, you'd split the path by '.'
+  if FData.FindPath(APath) <> nil then
+    Result := FData.GetPath(APath).AsString
+  else
+    Result := ADefault;
+end;
+
+function TVRDX_Config.GetInteger(APath: string; ADefault: Integer): Integer;
+begin
+  if FData.FindPath(APath) <> nil then
+    Result := FData.GetPath(APath).AsInteger
+  else
+    Result := ADefault;
+end;
+
+procedure TVRDX_Config.Reload;
+var
+  JSONString: TStringList;
+begin
+  FLock.Enter; // Thread-safe protection
+  try
+    if FileExists(FFilePath) then
+    begin
+      JSONString := TStringList.Create;
+      try
+        JSONString.LoadFromFile(FFilePath);
+        FData.Free; // Clear previous data
+        FData := TJSONObject(GetJSON(JSONString.Text));
+      finally
+        JSONString.Free;
+      end;
+    end;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+end.
+
+--- FILE: .\daemon\backup\vrdx_core.pas ---
+unit vrdx_core;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes,
+  SysUtils,
+  SyncObjs,
+  DateUtils,
+  Generics.Collections;
+
+const
+  Infinite = UInt32(-1);
+
+type
+
+  TVRDX_Executive = class;
+
+  TVRDX_Message = record
+    Topic: string;
+    Payload: string;
+    SourceID: string;
+    Seq: Int64;
+    Timestamp: TDateTime;
+  end;
+
+  TVRDX_ExecList = specialize TList<TVRDX_Executive>;
+  TVRDX_ExecListDictionary = specialize TObjectDictionary<string, TVRDX_ExecList>;
+  TVRDX_ExecMasterMap = specialize TObjectDictionary<string, TVRDX_Executive>;
+  TVRDX_MessageList = specialize TList<TVRDX_Message>;
+
+  TVRDX_WorkerThread = class(TThread)
+  private
+    FExecuteMethod: TThreadMethod;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AExecuteMethod: TThreadMethod);
+  end;
+
+  TVRDX_MessageQueue = class
+  private
+    FList: TVRDX_MessageList;
+    FLock: TCriticalSection;
+    FSignal: TEvent;
+    FSeqCounter: Int64;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Publish(const ATopic, APayload, ASourceID: string);
+    function TryDequeue(out AMsg: TVRDX_Message; TimeoutMs: Cardinal = 500): Boolean;
+  end;
+
+  // Base for every executive - internal object, external-process Bridge, or socket
+  // listener. Holds a Bus reference so descendants can Publish from Initialize,
+  // reader threads, or HandlePacket alike. Initialize/Shutdown are virtual with an
+  // empty default so most executives (Logger, Whiteboard) can ignore them entirely;
+  // Bridge and the socket listeners override both to spawn/bind on startup and tear
+  // down cleanly on shutdown. No intermediate base class for "threaded" or "socket"
+  // executives yet - deliberately waiting for three concrete, near-identical
+  // examples before extracting one (see session notes).
+
+  { TVRDX_Executive }
+
+  TVRDX_Executive = class
+  private
+    FID: string;
+    FFilter: string;
+    FBus: TVRDX_MessageQueue;
+  public
+    constructor Create(ABus: TVRDX_MessageQueue); virtual;
+    property ID: string read FID write FID;
+    property Filter: string read FFilter write FFilter;
+    property Bus: TVRDX_MessageQueue read FBus;
+    procedure Initialize; virtual;
+    procedure Shutdown; virtual;
+    procedure HandlePacket(const AMsg: TVRDX_Message); virtual; abstract;
+    procedure ApplyConfig; virtual;
+  end;
+
+  // MasterMap (owning, ID -> Executive) is the single source of truth for lifecycle
+  // and memory management. LiteralSubs/WildcardSubs are reference-only routing
+  // indices - an executive lands in exactly one of the two, decided by whether its
+  // filter contains '*' or '>'.
+  TVRDX_Registry = class
+  private
+    FMasterMap: TVRDX_ExecMasterMap;
+    FLiteralSubs: TVRDX_ExecListDictionary;
+    FWildcardSubs: TVRDX_ExecList;
+    FLock: TCriticalSection;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Register(AExec: TVRDX_Executive; const AID, AFilter: string);
+    procedure Unregister(const AID: string);
+    function GetSubscribers(const ATopic: string): TVRDX_ExecList;
+    procedure InitializeAll;
+    procedure ShutdownAll;
+    procedure HandleSystemReload;
+    procedure ApplyAllConfigs;
+  end;
+
+  { TVRDX_Kernel }
+
+  TVRDX_Kernel = class(TThread)
+  private
+    FQueue: TVRDX_MessageQueue;
+    FRegistry: TVRDX_Registry;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Terminate;
+  public
+    property Queue: TVRDX_MessageQueue read FQueue;
+    property Registry: TVRDX_Registry read FRegistry;
+  end;
+
+implementation
+
+function TopicMatches(const Filter, Topic: string): Boolean;
+var
+  fParts, tParts: TStringArray;
+  i: Integer;
+begin
+  fParts := Filter.Split(['.']);
+  tParts := Topic.Split(['.']);
+  for i := 0 to High(fParts) do
+  begin
+    if fParts[i] = '>' then
+      Exit(True);
+    if i > High(tParts) then
+      Exit(False);
+    if (fParts[i] <> '*') and (fParts[i] <> tParts[i]) then
+      Exit(False);
+  end;
+  Result := Length(fParts) = Length(tParts);
+end;
+
+{ TVRDX_WorkerThread }
+
+constructor TVRDX_WorkerThread.Create(AExecuteMethod: TThreadMethod);
+begin
+  inherited Create(True);
+  FExecuteMethod := AExecuteMethod;
+  FreeOnTerminate := False;
+end;
+
+procedure TVRDX_WorkerThread.Execute;
+begin
+  if Assigned(FExecuteMethod) then
+  begin
+    FExecuteMethod();
+  end;
+end;
+
+{ TVRDX_MessageQueue }
+
+constructor TVRDX_MessageQueue.Create;
+begin
+  FList := TVRDX_MessageList.Create;
+  FLock := TCriticalSection.Create;
+  FSignal := TEvent.Create(nil, False, False, '');
+end;
+
+destructor TVRDX_MessageQueue.Destroy;
+begin
+  FSignal.Free;
+  FLock.Free;
+  FList.Free;
+  inherited;
+end;
+
+procedure TVRDX_MessageQueue.Publish(const ATopic, APayload, ASourceID: string);
+var
+  Msg: TVRDX_Message;
+begin
+  FLock.Enter;
+  try
+    Inc(FSeqCounter);
+    Msg.Topic := ATopic;
+    Msg.Payload := APayload;
+    Msg.SourceID := ASourceID;
+    Msg.Seq := FSeqCounter;
+    Msg.Timestamp := Now;
+    FList.Add(Msg);
+  finally
+    FLock.Leave;
+  end;
+  FSignal.SetEvent;
+end;
+
+function TVRDX_MessageQueue.TryDequeue(out AMsg: TVRDX_Message; TimeoutMs: Cardinal): Boolean;
+begin
+  Result := False;
+  if FSignal.WaitFor(TimeoutMs) <> wrSignaled then
+    Exit;
+  FLock.Enter;
+  try
+    Result := FList.Count > 0;
+    if Result then
+    begin
+      AMsg := FList[0];
+      FList.Delete(0);
+      if FList.Count > 0 then
+        FSignal.SetEvent;
+    end;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+{ TVRDX_Executive }
+
+constructor TVRDX_Executive.Create(ABus: TVRDX_MessageQueue);
+begin
+  inherited Create;
+  FBus := ABus;
+end;
+
+procedure TVRDX_Executive.Initialize;
+begin
+end;
+
+procedure TVRDX_Executive.Shutdown;
+begin
+end;
+
+procedure TVRDX_Executive.ApplyConfig;
+begin
+end;
+
+{ TVRDX_Registry }
+
+constructor TVRDX_Registry.Create;
+begin
+  FLock := TCriticalSection.Create;
+  FMasterMap := TVRDX_ExecMasterMap.Create([doOwnsValues]);
+  FLiteralSubs := TVRDX_ExecListDictionary.Create([doOwnsValues]);
+  FWildcardSubs := TVRDX_ExecList.Create;
+end;
+
+destructor TVRDX_Registry.Destroy;
+begin
+  FWildcardSubs.Free;
+  FLiteralSubs.Free;
+  FMasterMap.Free; // owns and frees every registered executive
+  FLock.Free;
+  inherited;
+end;
+
+procedure TVRDX_Registry.Register(AExec: TVRDX_Executive; const AID, AFilter: string);
+var
+  List: TVRDX_ExecList;
+begin
+  FLock.Enter;
+  try
+    AExec.ID := AID;
+    AExec.Filter := AFilter;
+    FMasterMap.Add(AID, AExec);
+    if (Pos('*', AFilter) > 0) or (Pos('>', AFilter) > 0) then
+      FWildcardSubs.Add(AExec)
+    else
+    begin
+      if not FLiteralSubs.TryGetValue(AFilter, List) then
+      begin
+        List := TVRDX_ExecList.Create;
+        FLiteralSubs.Add(AFilter, List);
+      end;
+      List.Add(AExec);
+    end;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TVRDX_Registry.Unregister(const AID: string);
+var
+  Exec: TVRDX_Executive;
+  List: TVRDX_ExecList;
+begin
+  FLock.Enter;
+  try
+    if not FMasterMap.TryGetValue(AID, Exec) then
+      Exit;
+    FWildcardSubs.Remove(Exec);
+    for List in FLiteralSubs.Values do
+      List.Remove(Exec);
+    FMasterMap.Remove(AID); // owning map - this is what actually frees Exec
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TVRDX_Registry.GetSubscribers(const ATopic: string): TVRDX_ExecList;
+var
+  Exec: TVRDX_Executive;
+begin
+  FLock.Enter;
+  try
+    Result := TVRDX_ExecList.Create;
+    if FLiteralSubs.ContainsKey(ATopic) then
+      Result.AddRange(FLiteralSubs[ATopic]);
+    for Exec in FWildcardSubs do
+      if TopicMatches(Exec.Filter, ATopic) then
+        Result.Add(Exec);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TVRDX_Registry.InitializeAll;
+var
+  Snapshot: TVRDX_ExecList;
+  Exec: TVRDX_Executive;
+begin
+  Snapshot := TVRDX_ExecList.Create;
+  try
+    FLock.Enter;
+    try
+      Snapshot.AddRange(FMasterMap.Values);
+    finally
+      FLock.Leave;
+    end;
+    // Deliberately called outside FLock - Initialize can block for a while (binding
+    // a socket, spawning a process) and must not stall Register/Unregister/
+    // GetSubscribers while it runs.
+    for Exec in Snapshot do
+      Exec.Initialize;
+  finally
+    Snapshot.Free;
+  end;
+end;
+
+procedure TVRDX_Registry.ShutdownAll;
+var
+  Snapshot: TVRDX_ExecList;
+  Exec: TVRDX_Executive;
+begin
+  Snapshot := TVRDX_ExecList.Create;
+  try
+    FLock.Enter;
+    try
+      Snapshot.AddRange(FMasterMap.Values);
+    finally
+      FLock.Leave;
+    end;
+    for Exec in Snapshot do
+      Exec.Shutdown;
+  finally
+    Snapshot.Free;
+  end;
+end;
+
+procedure TVRDX_Registry.HandleSystemReload;
+var
+  Exec: TVRDX_Executive;
+begin
+  FConfig.Reload;
+  for Exec in FRegistry do
+  begin
+    Exec.ApplyConfig;
+  end;
+end;
+
+procedure TVRDX_Registry.ApplyAllConfigs;
+var
+  Exec: TVRDX_Executive;
+begin
+  for Exec in FRegistry do
+  begin
+    Exec.ApplyConfig;
+  end;
+end;
+
+{ TVRDX_Kernel }
+
+constructor TVRDX_Kernel.Create;
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FRegistry := TVRDX_Registry.Create;
+  FQueue := TVRDX_MessageQueue.Create;
+end;
+
+destructor TVRDX_Kernel.Destroy;
+begin
+  inherited;
+end;
+
+procedure TVRDX_Kernel.Execute;
+var
+  Msg: TVRDX_Message;
+  Subscribers: TVRDX_ExecList;
+  Exec: TVRDX_Executive;
+begin
+  FRegistry.InitializeAll;
+  while not Terminated do
+  begin
+    if FQueue.TryDequeue(Msg, 500) then
+    begin
+      if Msg.Topic = 'kernel.shutdown' then
+      begin
+        WriteLn('Dispatcher: Shutdown signal processed.');
+        Break;
+      end;
+      Subscribers := FRegistry.GetSubscribers(Msg.Topic);
+      try
+        for Exec in Subscribers do
+          Exec.HandlePacket(Msg);
+      finally
+        Subscribers.Free;
+      end;
+    end;
+  end;
+  FRegistry.ShutdownAll;
+  FQueue.Free;
+  FRegistry.Free;
+  WriteLn('Dispatcher: Exited loop cleanly.');
+end;
+
+procedure TVRDX_Kernel.Terminate;
+begin
+  inherited Terminate;
+  FQueue.Publish('kernel.shutdown', '', '');
+end;
+
+// debug: not sure this is under the correct class
+procedure TVRDX_Kernel.RegisterExecutive(AExec: TVRDX_Executive; AName: string);
+var
+  Filters: TJSONArray;
+  FilterObj: TJSONObject;
+  i: Integer;
+begin
+  // Only register if the executive is enabled at the top level
+  if FConfig.GetBoolean('executives.' + AName + '.enabled', True) then
+  begin
+
+    // Defensive check: If self-receipt is NOT allowed and this is a potential loop
+    if (not AAllowSelf) and (IsExecutivePublishingToTopic(AExec, ATopic)) then
+    begin
+       // Log a warning or raise an exception to prevent logic errors
+       Log.Error('Circular subscription detected: ' + AName + ' subscribing to its own output topic: ' + ATopic);
+       Exit;
+    end;
+
+    Filters := TJSONArray(FConfig.GetPath('executives.' + AName + '.filters'));
+    for i := 0 to Filters.Count - 1 do
+    begin
+      FilterObj := TJSONObject(Filters.Items[i]);
+      // Check if the specific filter is enabled
+      if FilterObj.Get('enabled', True) then
+      begin
+        FRegistry.Register(AExec, AName, FilterObj.Get('topic', ''));
+      end;
+    end;
+  end;
+end;
+
+// debug: not sure this is under the correct class
+procedure TVRDX_Kernel.Dispatch(AMessage: TVRDX_Message; APublisher: TVRDX_Executive);
+var
+  i: Integer;
+  Sub: TSubscription;
+begin
+  for i := 0 to FSubscriptions.Count - 1 do
+  begin
+    Sub := FSubscriptions[i];
+
+    // 1. First, check if the subscriber is the publisher
+    if (Sub.Executive = APublisher) then
+    begin
+      // If the subscriber is the publisher, check if they are allowed to receive it
+      if not Sub.AllowSelfReceipt then
+        Continue; // Skip this subscriber
+    end;
+
+    // 2. Perform topic matching
+    if TopicMatches(AMessage.Topic, Sub.Filter) then
+    begin
+      Sub.Executive.Queue.Enqueue(AMessage);
+    end;
+  end;
+end;
+
+end.
+
+--- FILE: .\daemon\backup\vrdx_http.pas ---
+unit vrdx_http;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, Sockets, vrdx_whiteboard, vrdx_core;
+
+type
+  // Request/response, synchronous - deliberately does NOT round-trip through the
+  // bus. Reads board state directly via TVRDX_WhiteboardExecutive.GetBoardSnapshot,
+  // so the client gets a full initial render with no flash-of-empty-board before its
+  // WebSocket connection's live deltas start arriving.
+  TVRDX_HTTPExecutive = class(TVRDX_Executive)
+  private
+    FPort: Word;
+    FWhiteboard: TVRDX_WhiteboardExecutive;
+    FListenSocket: TSocket;
+    FAcceptThread: TThread;
+    FStopping: Boolean;
+    procedure AcceptLoop;
+  public
+    constructor Create(ABus: TVRDX_MessageQueue; AWhiteboard: TVRDX_WhiteboardExecutive);
+    property Port: Word read FPort write FPort;
+    procedure Initialize; override;
+    procedure Shutdown; override;
+    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    procedure HandleRequest(Sock: TSocket); // public: called from TReqThread below
+  end;
+
+implementation
+
+type
+  TReqThread = class(TThread)
+  private
+    FOwner: TVRDX_HTTPExecutive;
+    FSock: TSocket;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AOwner: TVRDX_HTTPExecutive; ASock: TSocket);
+  end;
+
+constructor TReqThread.Create(AOwner: TVRDX_HTTPExecutive; ASock: TSocket);
+begin
+  inherited Create(True);
+  FOwner := AOwner;
+  FSock := ASock;
+  FreeOnTerminate := True; // one-shot request thread - fine to self-free
+end;
+
+procedure TReqThread.Execute;
+begin
+  FOwner.HandleRequest(FSock);
+end;
+
+{ TVRDX_HTTPExecutive }
+
+constructor TVRDX_HTTPExecutive.Create(ABus: TVRDX_MessageQueue; AWhiteboard: TVRDX_WhiteboardExecutive);
+begin
+  inherited Create(ABus);
+  FWhiteboard := AWhiteboard;
+  FPort := 8081;
+end;
+
+procedure TVRDX_HTTPExecutive.HandleRequest(Sock: TSocket);
+var
+  Buf: array[0..1023] of Byte;
+  Received: Integer;
+  Request, Body, Response, BoardJSON: string;
+begin
+  Received := fpRecv(Sock, @Buf[0], SizeOf(Buf), 0);
+  if Received > 0 then
+  begin
+    SetString(Request, PAnsiChar(@Buf[0]), Received);
+    if Pos('GET /board/board1', Request) = 1 then
+    begin
+      BoardJSON := FWhiteboard.GetBoardSnapshot('board1'); // one synchronous call, no bus round-trip
+      Body := '<!doctype html><html><body>' +
+              '<script>window.__INITIAL_BOARD__=' + BoardJSON + ';</script>' +
+              '<div id="board"></div>' +
+              '<script src="/dashboard.js"></script></body></html>';
+      Response := 'HTTP/1.1 200 OK'#13#10 +
+                  'Content-Type: text/html'#13#10 +
+                  'Content-Length: ' + IntToStr(Length(Body)) + #13#10#13#10 + Body;
+    end
+    else
+      Response := 'HTTP/1.1 404 Not Found'#13#10#13#10;
+    fpSend(Sock, @Response[1], Length(Response), 0);
+  end;
+  CloseSocket(Sock);
+end;
+
+procedure TVRDX_HTTPExecutive.AcceptLoop;
+var
+  Addr, ClientAddr: TInetSockAddr;
+  AddrLen: TSockLen;
+  ClientSock: TSocket;
+begin
+  FListenSocket := fpSocket(AF_INET, SOCK_STREAM, 0);
+  FillChar(Addr, SizeOf(Addr), 0);
+  Addr.sin_family := AF_INET;
+  Addr.sin_port := htons(FPort);
+  Addr.sin_addr.s_addr := 0;
+  fpBind(FListenSocket, @Addr, SizeOf(Addr));
+  fpListen(FListenSocket, 16);
+  while not FStopping do
+  begin
+    AddrLen := SizeOf(ClientAddr);
+    ClientSock := fpAccept(FListenSocket, @ClientAddr, @AddrLen);
+    if ClientSock = -1 then Continue;
+    TReqThread.Create(Self, ClientSock).Start;
+  end;
+  CloseSocket(FListenSocket);
+end;
+
+procedure TVRDX_HTTPExecutive.Initialize;
+begin
+  FStopping := False;
+  FAcceptThread := TThread.CreateAnonymousThread(@AcceptLoop);
+  FAcceptThread.FreeOnTerminate := False;
+  FAcceptThread.Start;
+end;
+
+procedure TVRDX_HTTPExecutive.Shutdown;
+begin
+  FStopping := True;
+  if FListenSocket <> 0 then CloseSocket(FListenSocket);
+  if Assigned(FAcceptThread) then
+  begin
+    FAcceptThread.WaitFor;
+    FAcceptThread.Free;
+    FAcceptThread := nil;
+  end;
+end;
+
+procedure TVRDX_HTTPExecutive.HandlePacket(const AMsg: TVRDX_Message);
+begin
+  // HTTP is request/response, not bus-driven - nothing to do here.
+end;
+
+end.
+
+--- FILE: .\daemon\backup\vrdx_irc.pas ---
+unit vrdx_irc;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, Sockets, StrUtils, vrdx_core;
+
+type
+  // IRCD, not an IRC client - VDRX binds 6667 and HexChat connects to it. Just enough
+  // protocol to keep HexChat happy: NICK/USER -> welcome, JOIN echoed back, PING/PONG,
+  // PRIVMSG parsed and republished onto the bus. One thread per client connection.
+  //
+  // No shared "socket executive" base class yet - this is the first of three
+  // (IRCD/WebSocket/HTTP); wait until the pattern repeats a third time before
+  // extracting one (see session notes).
+
+  { TVRDX_IRCDExecutive }
+
+  TVRDX_IRCDExecutive = class(TVRDX_Executive)
+  private
+    FPort: Word;
+    FListenSocket: TSocket;
+    FAcceptThread: TThread;
+    FStopping: Boolean;
+    procedure AcceptLoop;
+    procedure RestartSocket;
+  public
+    constructor Create(ABus: TVRDX_MessageQueue); override;
+    property Port: Word read FPort write FPort;
+    procedure Initialize; override;
+    procedure Shutdown; override;
+    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    procedure HandleClient(Sock: TSocket); // public: called from TIRCClientThread below
+    procedure ApplyConfig; override;
+  end;
+
+implementation
+
+function JEsc(const S: string): string;
+begin
+  Result := StringReplace(S, '\', '\\', [rfReplaceAll]);
+  Result := StringReplace(Result, '"', '\"', [rfReplaceAll]);
+  Result := '"' + Result + '"';
+end;
+
+type
+  // Plain TThread wrapper rather than an anonymous-closure capture over a loop-local
+  // socket variable, since anonymous-function variable capture isn't guaranteed
+  // available across FPC versions/modeswitches - this is the portable way to hand a
+  // per-connection value to a new thread.
+  TIRCClientThread = class(TThread)
+  private
+    FOwner: TVRDX_IRCDExecutive;
+    FSock: TSocket;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AOwner: TVRDX_IRCDExecutive; ASock: TSocket);
+  end;
+
+constructor TIRCClientThread.Create(AOwner: TVRDX_IRCDExecutive; ASock: TSocket);
+begin
+  inherited Create(True);
+  FOwner := AOwner;
+  FSock := ASock;
+  FreeOnTerminate := True; // fire-and-forget per-connection thread - fine for a handful of local clients
+end;
+
+procedure TIRCClientThread.Execute;
+begin
+  FOwner.HandleClient(FSock);
+end;
+
+{ TVRDX_IRCDExecutive }
+
+constructor TVRDX_IRCDExecutive.Create(ABus: TVRDX_MessageQueue);
+begin
+  inherited Create(ABus);
+  FPort := 6667;
+end;
+
+procedure TVRDX_IRCDExecutive.HandleClient(Sock: TSocket);
+var
+  Buf: array[0..4095] of Byte;
+  Received: Integer;
+  Acc, Line, Nick: string;
+  NlPos, p1, p2: Integer;
+
+  procedure SendLine(const S: string);
+  var B: string;
+  begin
+    B := S + #13#10;
+    fpSend(Sock, @B[1], Length(B), 0);
+  end;
+
+var
+  Channel, Msg: string;
+begin
+  Kernel.Queue.Enqueue(TVRDX_Message.Create('log.info', 'Client connected from 127.0.0.1'));
+  Nick := 'guest';
+  Acc := '';
+  while not FStopping do
+  begin
+    Received := fpRecv(Sock, @Buf[0], SizeOf(Buf), 0);
+    if Received <= 0 then
+      Break;
+    SetString(Line, PAnsiChar(@Buf[0]), Received);
+    Acc := Acc + Line;
+    repeat
+      NlPos := Pos(#10, Acc);
+      if NlPos > 0 then
+      begin
+        Line := TrimRight(Copy(Acc, 1, NlPos - 1));
+        Acc := Copy(Acc, NlPos + 1, Length(Acc));
+        if Line = '' then Continue;
+
+        if Copy(Line, 1, 4) = 'PING' then
+          SendLine('PONG' + Copy(Line, 5, Length(Line)))
+        else if Copy(Line, 1, 4) = 'NICK' then
+        begin
+          Nick := Trim(Copy(Line, 6, Length(Line)));
+          SendLine(':vrdx 001 ' + Nick + ' :Welcome to VDRX');
+        end
+        else if Copy(Line, 1, 4) = 'JOIN' then
+          SendLine(':' + Nick + ' JOIN ' + Trim(Copy(Line, 6, Length(Line))))
+        else if Copy(Line, 1, 7) = 'PRIVMSG' then
+        begin
+          p1 := Pos(' ', Line);
+          p2 := PosEx(' ', Line, p1 + 1);
+          if p2 > 0 then
+          begin
+            Channel := Copy(Line, p1 + 1, p2 - p1 - 1);
+            Msg := Copy(Line, p2 + 3, Length(Line)); // skip leading ' :'
+            Bus.Publish('irc.msg.' + Channel,
+              Format('{"from":%s,"text":%s}', [JEsc(Nick), JEsc(Msg)]), 'irc.' + Nick);
+          end;
+        end;
+        // USER intentionally ignored - NICK alone is enough to identify SourceID
+      end;
+    until NlPos = 0;
+  end;
+  CloseSocket(Sock);
+end;
+
+procedure TVRDX_IRCDExecutive.AcceptLoop;
+var
+  Addr, ClientAddr: TInetSockAddr;
+  AddrLen: TSockLen;
+  ClientSock: TSocket;
+begin
+  FListenSocket := fpSocket(AF_INET, SOCK_STREAM, 0);
+  FillChar(Addr, SizeOf(Addr), 0);
+  Addr.sin_family := AF_INET;
+  Addr.sin_port := htons(FPort);
+  Addr.sin_addr.s_addr := 0;
+  fpBind(FListenSocket, @Addr, SizeOf(Addr));
+  fpListen(FListenSocket, 8);
+  while not FStopping do
+  begin
+    AddrLen := SizeOf(ClientAddr);
+    ClientSock := fpAccept(FListenSocket, @ClientAddr, @AddrLen);
+    if ClientSock = -1 then
+      Continue;
+    TIRCClientThread.Create(Self, ClientSock).Start;
+  end;
+  CloseSocket(FListenSocket);
+end;
+
+procedure TVRDX_IRCDExecutive.RestartSocket;
+begin
+  FServerSocket.Close;
+  FServerSocket.Bind(FPort);
+  FServerSocket.Listen;
+end;
+
+procedure TVRDX_IRCDExecutive.Initialize;
+begin
+  FStopping := False;
+  FAcceptThread := TVRDX_WorkerThread.Create(@AcceptLoop);
+  FAcceptThread.FreeOnTerminate := False;
+  FAcceptThread.Start;
+end;
+
+procedure TVRDX_IRCDExecutive.Shutdown;
+begin
+  FStopping := True;
+  if FListenSocket <> 0 then
+    CloseSocket(FListenSocket); // unblocks fpAccept in AcceptLoop
+  if Assigned(FAcceptThread) then
+  begin
+    FAcceptThread.WaitFor;
+    FAcceptThread.Free;
+    FAcceptThread := nil;
+  end;
+  // NOTE: per-client threads are FreeOnTerminate and not individually tracked/joined
+  // here - acceptable for tonight's scope. A production Shutdown needs to track,
+  // signal, and join every live connection thread, not just the accept loop.
+end;
+
+procedure TVRDX_IRCDExecutive.HandlePacket(const AMsg: TVRDX_Message);
+begin
+  // Outbound IRC (e.g. a bot announcing something in-channel) would go here - not
+  // needed for the hello-world flow, which is one-directional (IRC -> bus).
+end;
+
+procedure TVRDX_IRCDExecutive.ApplyConfig;
+begin
+  FPort := FConfig.GetInteger('executives.ircd.port', 6667);
+  RestartSocket;
+end;
+
+end.
+
+--- FILE: .\daemon\backup\vrdx_logger.pas ---
+unit vrdx_logger;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, vrdx_core;
+
+// ANSI Color Constants
+const
+  CLR_RESET  = #27'[0m';
+  CLR_INFO   = #27'[32m'; // Green
+  CLR_WARN   = #27'[33m'; // Yellow
+  CLR_ERROR  = #27'[31m'; // Red
+
+type
+  TLogLevel = (lvlINFO, lvlWARN, lvlERROR);
+
+  TVRDX_LoggerExecutive = class(TVRDX_Executive)
+  private
+    FFileStream: TFileStream;
+    FThreshold: TLogLevel;
+  public
+    constructor Create(AQueue: TVRDX_MessageQueue; APath: string; ALevel: TLogLevel);
+    destructor Destroy; override;
+    procedure Execute; override;
+  end;
+
+implementation
+
+constructor TVRDX_LoggerExecutive.Create(AQueue: TVRDX_MessageQueue; APath: string; ALevel: TLogLevel);
+begin
+  inherited Create(AQueue);
+  FThreshold := ALevel;
+  // Open in share-exclusive mode, create if missing
+  FFileStream := TFileStream.Create(APath, fmOpenWrite or fmCreate or fmShareDenyWrite);
+end;
+
+destructor TVRDX_LoggerExecutive.Destroy;
+begin
+  FFileStream.Free;
+  inherited;
+end;
+
+procedure TVRDX_LoggerExecutive.WriteToOutput(const ATopic, AMessage: string);
+var
+  Color, Level: string;
+begin
+  if ATopic = 'log.error' then begin Color := CLR_ERROR; Level := 'ERROR'; end
+  else if ATopic = 'log.warn' then begin Color := CLR_WARN; Level := 'WARN '; end
+  else begin Color := CLR_INFO; Level := 'INFO '; end;
+
+  // File write (clean, no colors)
+  Append(FLogFile);
+  WriteLn(FLogFile, Format('[%s] [%s] %s', [DateTimeToStr(Now), Level, AMessage]));
+  Close(FLogFile);
+
+  // Console write (with colors)
+  WriteLn(Format('%s[%s] [%s] %s%s', [Color, DateTimeToStr(Now), Level, AMessage, CLR_RESET]));
+end;
+
+procedure TVRDX_LoggerExecutive.Execute;
+var
+  Msg: TVRDX_Message;
+  Level: TLogLevel;
+  Line: string;
+begin
+  while not Terminated do
+  begin
+    if FQueue.TryDequeue(Msg, 500) then
+    begin
+      // Logic: Map topic to level
+      if Msg.Topic = 'log.error' then Level := lvlERROR
+      else if Msg.Topic = 'log.warn' then Level := lvlWARN
+      else Level := lvlINFO;
+
+      if Level >= FThreshold then
+      begin
+        Line := Format('[%s] [%s] %s' + LineEnding, [DateTimeToStr(Now), Msg.Topic, Msg.Payload]);
+        FFileStream.WriteBuffer(Line[1], Length(Line) * SizeOf(Char));
+        FFileStream.Flush; // Ensures data is written to disk
+      end;
+    end;
+  end;
+end;
+
+end.
+
+--- FILE: .\daemon\backup\vrdx_websocket.pas ---
+unit vrdx_websocket;
+
+{$mode ObjFPC}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, Sockets, SyncObjs, base64, sha1, fpjson, jsonparser,
+  vrdx_core;
+
+const
+  WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+type
+  TVRDX_WebSocketExecutive = class;
+
+  // One instance per live browser connection. Registers itself into the Registry
+  // once auth succeeds, with whatever filter the client last subscribed to - this is
+  // what lets the Dispatcher's ordinary routing deliver bus messages straight to the
+  // socket, with no separate broadcast path anywhere in the kernel. Deregisters
+  // itself on disconnect.
+  TVRDX_WSConnection = class(TVRDX_Executive)
+  private
+    FListener: TVRDX_WebSocketExecutive;
+    FSocket: TSocket;
+    FThread: TThread;
+    FAuthenticated: Boolean;
+    FSendLock: TCriticalSection;
+    function DoHandshake: Boolean;
+    function ReadFrame(out APayload: string; out AOpcode: Byte): Boolean;
+    procedure SendFrame(const APayload: string; AOpcode: Byte = 1);
+    procedure HandleRPC(const ALine: string);
+  public
+    constructor Create(ABus: TVRDX_MessageQueue; AListener: TVRDX_WebSocketExecutive; ASocket: TSocket);
+    destructor Destroy; override;
+    procedure Initialize; override;
+    procedure Shutdown; override;
+    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    procedure RunLoop; // public: called from TWSConnThread below
+  end;
+
+  TVRDX_WebSocketExecutive = class(TVRDX_Executive)
+  private
+    FPort: Word;
+    FRegistry: TVRDX_Registry;
+    FListenSocket: TSocket;
+    FAcceptThread: TThread;
+    FStopping: Boolean;
+    FConnCounter: Integer;
+    procedure AcceptLoop;
+  public
+    constructor Create(ABus: TVRDX_MessageQueue; ARegistry: TVRDX_Registry);
+    property Port: Word read FPort write FPort;
+    property Registry: TVRDX_Registry read FRegistry;
+    procedure Initialize; override;
+    procedure Shutdown; override;
+    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    function NextConnID: string;
+  end;
+
+implementation
+
+function JEsc(const S: string): string;
+begin
+  Result := StringReplace(S, '\', '\\', [rfReplaceAll]);
+  Result := StringReplace(Result, '"', '\"', [rfReplaceAll]);
+  Result := '"' + Result + '"';
+end;
+
+function ComputeAcceptKey(const AClientKey: string): string;
+var
+  Digest: TSHA1Digest;
+  RawStr: string;
+begin
+  Digest := SHA1String(AClientKey + WS_GUID);
+  SetString(RawStr, PAnsiChar(@Digest[0]), SizeOf(Digest));
+  Result := EncodeStringBase64(RawStr);
+end;
+
+type
+  // Same rationale as TIRCClientThread in vrdx_irc.pas: a plain TThread wrapper
+  // rather than an anonymous closure over a loop-local socket/connection value.
+  TWSConnThread = class(TThread)
+  private
+    FConn: TVRDX_WSConnection;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AConn: TVRDX_WSConnection);
+  end;
+
+constructor TWSConnThread.Create(AConn: TVRDX_WSConnection);
+begin
+  inherited Create(True);
+  FConn := AConn;
+  FreeOnTerminate := False;
+end;
+
+procedure TWSConnThread.Execute;
+begin
+  FConn.RunLoop;
+end;
+
+{ TVRDX_WSConnection }
+
+constructor TVRDX_WSConnection.Create(ABus: TVRDX_MessageQueue; AListener: TVRDX_WebSocketExecutive; ASocket: TSocket);
+begin
+  inherited Create(ABus);
+  FListener := AListener;
+  FSocket := ASocket;
+  FSendLock := TCriticalSection.Create;
+  FAuthenticated := False;
+end;
+
+destructor TVRDX_WSConnection.Destroy;
+begin
+  FSendLock.Free;
+  inherited Destroy;
+end;
+
+function TVRDX_WSConnection.DoHandshake: Boolean;
+var
+  Buf: array[0..2047] of Byte;
+  Received, i, tailLen: Integer;
+  Request, Key, AcceptKey, Header: string;
+begin
+  Result := False;
+  Received := fpRecv(FSocket, @Buf[0], SizeOf(Buf), 0);
+  if Received <= 0 then Exit;
+  SetString(Request, PAnsiChar(@Buf[0]), Received);
+  i := Pos('Sec-WebSocket-Key:', Request);
+  if i = 0 then Exit;
+  tailLen := Pos(#13, Copy(Request, i, Length(Request))) - 20; // 'Sec-WebSocket-Key: ' is 20 chars
+  if tailLen < 1 then Exit;
+  Key := Trim(Copy(Request, i + 19, tailLen));
+  AcceptKey := ComputeAcceptKey(Key);
+  Header := 'HTTP/1.1 101 Switching Protocols'#13#10 +
+            'Upgrade: websocket'#13#10 +
+            'Connection: Upgrade'#13#10 +
+            'Sec-WebSocket-Accept: ' + AcceptKey + #13#10#13#10;
+  fpSend(FSocket, @Header[1], Length(Header), 0);
+  Result := True;
+end;
+
+// Unfragmented text frames only, up to 64KB payload - sufficient for the short
+// JSON-RPC control messages this bridge exchanges.
+function TVRDX_WSConnection.ReadFrame(out APayload: string; out AOpcode: Byte): Boolean;
+var
+  Hdr: array[0..1] of Byte;
+  Ext: array[0..1] of Byte;
+  Len: Integer;
+  Mask: array[0..3] of Byte;
+  Data: array of Byte;
+  Received, i: Integer;
+  LenByte: Byte;
+begin
+  Result := False;
+  if fpRecv(FSocket, @Hdr[0], 2, 0) <> 2 then Exit;
+  AOpcode := Hdr[0] and $0F;
+  if AOpcode = 8 then Exit; // close frame
+  LenByte := Hdr[1] and $7F;
+  Len := LenByte;
+  if LenByte = 126 then
+  begin
+    fpRecv(FSocket, @Ext[0], 2, 0);
+    Len := (Ext[0] shl 8) or Ext[1];
+  end
+  else if LenByte = 127 then
+    Exit; // 64-bit lengths not needed for control-plane traffic
+  if (Hdr[1] and $80) <> 0 then
+    fpRecv(FSocket, @Mask[0], 4, 0)
+  else
+    FillChar(Mask, SizeOf(Mask), 0);
+  SetLength(Data, Len);
+  Received := 0;
+  while Received < Len do
+    Inc(Received, fpRecv(FSocket, @Data[Received], Len - Received, 0));
+  for i := 0 to Len - 1 do
+    Data[i] := Data[i] xor Mask[i mod 4];
+  SetString(APayload, PAnsiChar(@Data[0]), Len);
+  Result := True;
+end;
+
+procedure TVRDX_WSConnection.SendFrame(const APayload: string; AOpcode: Byte);
+var
+  Hdr: array[0..3] of Byte;
+  HdrLen: Integer;
+  Buf: string;
+begin
+  FSendLock.Enter;
+  try
+    Hdr[0] := $80 or AOpcode;
+    if Length(APayload) < 126 then
+    begin
+      Hdr[1] := Length(APayload);
+      HdrLen := 2;
+    end
+    else
+    begin
+      Hdr[1] := 126;
+      Hdr[2] := (Length(APayload) shr 8) and $FF;
+      Hdr[3] := Length(APayload) and $FF;
+      HdrLen := 4;
+    end;
+    SetString(Buf, PAnsiChar(@Hdr[0]), HdrLen);
+    Buf := Buf + APayload; // server->client frames sent unmasked, per spec
+    fpSend(FSocket, @Buf[1], Length(Buf), 0);
+  finally
+    FSendLock.Leave;
+  end;
+end;
+
+procedure TVRDX_WSConnection.HandleRPC(const ALine: string);
+var
+  J: TJSONData;
+  Obj: TJSONObject;
+  Method, Topic, Payload, Token, Src: string;
+begin
+  try
+    J := GetJSON(ALine);
+  except
+    Exit; // malformed JSON dropped, connection stays alive
+  end;
+  try
+    if not (J is TJSONObject) then Exit;
+    Obj := TJSONObject(J);
+    Method := Obj.Get('method', '');
+
+    if Method = 'sys.auth' then
+    begin
+      Token := Obj.Get('token', '');
+      Src := Obj.Get('source', ID);
+      FAuthenticated := Token <> ''; // stub - wire to real verification before this is untrusted-facing
+      SendFrame(Format('{"event":"auth.ok","source":%s}', [JEsc(Src)]));
+      Exit;
+    end;
+
+    if not FAuthenticated then Exit; // bus-level actions gated until sys.auth succeeds
+
+    if Method = 'subscribe' then
+    begin
+      Topic := Obj.Get('filter', '');
+      // Single-filter simplification (flagged in session notes): re-registering
+      // replaces this connection's one active filter rather than adding to a set.
+      FListener.Registry.Unregister(ID);
+      FListener.Registry.Register(Self, ID, Topic);
+    end
+    else if Method = 'publish' then
+    begin
+      Topic := Obj.Get('topic', '');
+      Payload := Obj.Get('payload', '{}');
+      Bus.Publish(Topic, Payload, ID);
+    end;
+  finally
+    J.Free;
+  end;
+end;
+
+procedure TVRDX_WSConnection.RunLoop;
+var
+  Payload: string;
+  Opcode: Byte;
+begin
+  if not DoHandshake then Exit;
+  while True do
+  begin
+    if not ReadFrame(Payload, Opcode) then Break;
+    if Opcode = 1 then HandleRPC(Payload);
+  end;
+  FListener.Registry.Unregister(ID); // clean up on disconnect
+end;
+
+procedure TVRDX_WSConnection.Initialize;
+begin
+  FThread := TWSConnThread.Create(Self);
+  FThread.Start;
+end;
+
+procedure TVRDX_WSConnection.Shutdown;
+begin
+  CloseSocket(FSocket); // unblocks the blocking recv in RunLoop
+  if Assigned(FThread) then
+  begin
+    FThread.WaitFor;
+    FThread.Free;
+    FThread := nil;
+  end;
+end;
+
+procedure TVRDX_WSConnection.HandlePacket(const AMsg: TVRDX_Message);
+begin
+  SendFrame(Format('{"topic":%s,"payload":%s,"source":%s,"seq":%d}',
+    [JEsc(AMsg.Topic), AMsg.Payload, JEsc(AMsg.SourceID), AMsg.Seq]));
+end;
+
+{ TVRDX_WebSocketExecutive }
+
+constructor TVRDX_WebSocketExecutive.Create(ABus: TVRDX_MessageQueue; ARegistry: TVRDX_Registry);
+begin
+  inherited Create(ABus);
+  FRegistry := ARegistry;
+  FPort := 8082;
+  FConnCounter := 0;
+end;
+
+function TVRDX_WebSocketExecutive.NextConnID: string;
+begin
+  Inc(FConnCounter);
+  Result := 'ws.conn.' + IntToStr(FConnCounter);
+end;
+
+procedure TVRDX_WebSocketExecutive.AcceptLoop;
+var
+  Addr, ClientAddr: TInetSockAddr;
+  AddrLen: TSockLen;
+  ClientSock: TSocket;
+  Conn: TVRDX_WSConnection;
+begin
+  FListenSocket := fpSocket(AF_INET, SOCK_STREAM, 0);
+  FillChar(Addr, SizeOf(Addr), 0);
+  Addr.sin_family := AF_INET;
+  Addr.sin_port := htons(FPort);
+  Addr.sin_addr.s_addr := 0;
+  fpBind(FListenSocket, @Addr, SizeOf(Addr));
+  fpListen(FListenSocket, 16);
+  while not FStopping do
+  begin
+    AddrLen := SizeOf(ClientAddr);
+    ClientSock := fpAccept(FListenSocket, @ClientAddr, @AddrLen);
+    if ClientSock = -1 then Continue;
+    // Registered with a non-matching placeholder filter until the client's own
+    // 'subscribe' RPC re-registers it with something real.
+    Conn := TVRDX_WSConnection.Create(Bus, Self, ClientSock);
+    FRegistry.Register(Conn, NextConnID, 'sys.none');
+    Conn.Initialize;
+  end;
+  CloseSocket(FListenSocket);
+end;
+
+procedure TVRDX_WebSocketExecutive.Initialize;
+begin
+  FStopping := False;
+  FAcceptThread := TThread.CreateAnonymousThread(@AcceptLoop);
+  FAcceptThread.FreeOnTerminate := False;
+  FAcceptThread.Start;
+end;
+
+procedure TVRDX_WebSocketExecutive.Shutdown;
+begin
+  FStopping := True;
+  if FListenSocket <> 0 then CloseSocket(FListenSocket);
+  if Assigned(FAcceptThread) then
+  begin
+    FAcceptThread.WaitFor;
+    FAcceptThread.Free;
+    FAcceptThread := nil;
+  end;
+  // NOTE: same simplification as IRCD - live connections aren't individually tracked
+  // and shut down here; each unregisters itself when its own socket closes.
+end;
+
+procedure TVRDX_WebSocketExecutive.HandlePacket(const AMsg: TVRDX_Message);
+begin
+  // The listener itself isn't a message recipient - each TVRDX_WSConnection is.
+end;
+
+end.

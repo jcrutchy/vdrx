@@ -8,26 +8,52 @@
       <Unit>
         <Filename Value="vrdx_daemon.lpr"/>
         <IsPartOfProject Value="True"/>
-        <UnitName Value="vdrx_daemon"/>
-        <IsVisibleTab Value="True"/>
-        <CursorPos X="33" Y="13"/>
-        <UsageCount Value="28"/>
+        <CursorPos X="27" Y="3"/>
+        <UsageCount Value="68"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vrdx_core.pas"/>
         <IsPartOfProject Value="True"/>
+        <IsVisibleTab Value="True"/>
         <EditorIndex Value="1"/>
-        <CursorPos X="9" Y="6"/>
-        <UsageCount Value="28"/>
+        <TopLine Value="419"/>
+        <CursorPos X="5" Y="452"/>
+        <UsageCount Value="68"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vrdx_irc.pas"/>
         <IsPartOfProject Value="True"/>
-        <EditorIndex Value="2"/>
-        <CursorPos X="18" Y="3"/>
-        <UsageCount Value="27"/>
+        <EditorIndex Value="6"/>
+        <TopLine Value="97"/>
+        <CursorPos X="35" Y="130"/>
+        <UsageCount Value="67"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vrdx_logger.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="7"/>
+        <CursorPos X="36" Y="94"/>
+        <UsageCount Value="31"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vrdx_config.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="10"/>
+        <TopLine Value="24"/>
+        <CursorPos X="45" Y="48"/>
+        <UsageCount Value="31"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vrdx_admin.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="11"/>
+        <CursorPos X="50" Y="19"/>
+        <UsageCount Value="30"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
@@ -35,142 +61,184 @@
         <UnitName Value="Classes"/>
         <EditorIndex Value="-1"/>
         <CursorPos X="23" Y="8"/>
-        <UsageCount Value="10"/>
+        <UsageCount Value="6"/>
       </Unit>
       <Unit>
         <Filename Value="C:\lazarus\fpc\3.2.2\source\rtl\win\sysutils.pp"/>
         <UnitName Value="SysUtils"/>
         <EditorIndex Value="-1"/>
-        <UsageCount Value="10"/>
+        <UsageCount Value="6"/>
       </Unit>
       <Unit>
         <Filename Value="C:\lazarus\fpc\3.2.2\source\rtl\objpas\classes\classesh.inc"/>
         <EditorIndex Value="-1"/>
         <TopLine Value="1772"/>
         <CursorPos X="68" Y="1790"/>
+        <UsageCount Value="6"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vrdx_bridge.pas"/>
+        <EditorIndex Value="2"/>
+        <CursorPos X="17" Y="7"/>
+        <UsageCount Value="16"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vrdx_http.pas"/>
+        <EditorIndex Value="5"/>
+        <CursorPos X="11" Y="4"/>
+        <UsageCount Value="16"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vrdx_websocket.pas"/>
+        <EditorIndex Value="3"/>
+        <CursorPos X="20"/>
+        <UsageCount Value="16"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vrdx_whiteboard.pas"/>
+        <EditorIndex Value="4"/>
+        <CursorPos X="25" Y="9"/>
+        <UsageCount Value="16"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vrdx_socketlistener.pas"/>
+        <EditorIndex Value="8"/>
+        <CursorPos X="36" Y="7"/>
         <UsageCount Value="10"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vrdx_weblistener.pas"/>
+        <EditorIndex Value="9"/>
+        <CursorPos X="36" Y="10"/>
+        <UsageCount Value="10"/>
+        <Loaded Value="True"/>
       </Unit>
     </Units>
     <JumpHistory HistoryIndex="29">
       <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="176" Column="35" TopLine="148"/>
+        <Filename Value="vrdx_daemon.lpr"/>
+        <Caret Line="32" Column="22"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_bridge.pas"/>
+        <Caret Line="72" Column="69" TopLine="49"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_bridge.pas"/>
+        <Caret Line="180" Column="16" TopLine="160"/>
       </Position>
       <Position>
         <Filename Value="vrdx_core.pas"/>
-        <Caret Line="148" Column="40" TopLine="130"/>
+        <Caret Line="27" Column="14"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_bridge.pas"/>
+        <Caret Line="191" Column="57" TopLine="157"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_http.pas"/>
+        <Caret Line="115" Column="34" TopLine="86"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_http.pas"/>
+        <Caret Line="136" Column="33" TopLine="94"/>
       </Position>
       <Position>
         <Filename Value="vrdx_core.pas"/>
-        <Caret Line="160" Column="31" TopLine="137"/>
+        <Caret Line="129" Column="18" TopLine="105"/>
       </Position>
       <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="175" Column="22" TopLine="156"/>
+        <Filename Value="vrdx_http.pas"/>
+        <Caret Line="124" Column="59" TopLine="94"/>
       </Position>
       <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="191" Column="37" TopLine="167"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="64" Column="26" TopLine="51"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="131" Column="37" TopLine="109"/>
+        <Filename Value="vrdx_websocket.pas"/>
+        <Caret Line="346" Column="61" TopLine="318"/>
       </Position>
       <Position>
         <Filename Value="vrdx_irc.pas"/>
-        <Caret Line="10" Column="12"/>
+        <Caret Line="99" Column="17" TopLine="76"/>
       </Position>
       <Position>
         <Filename Value="vrdx_irc.pas"/>
-        <Caret Line="17" Column="64"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_irc.pas"/>
-        <Caret Line="21" Column="59"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_irc.pas"/>
-        <Caret Line="19" Column="52"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_irc.pas"/>
-        <Caret Line="9" Column="48"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_irc.pas"/>
-        <Caret Line="13" Column="12"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_irc.pas"/>
-        <Caret Line="14"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="192" Column="33" TopLine="176"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="203" Column="62" TopLine="183"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="43" Column="45" TopLine="24"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="29" Column="27" TopLine="15"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="23" Column="26" TopLine="12"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="19" Column="42"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="175" Column="13" TopLine="158"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="166" Column="53" TopLine="144"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="250" Column="55" TopLine="225"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="108" Column="47" TopLine="91"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="103" Column="27" TopLine="88"/>
+        <Caret Line="14" Column="38"/>
       </Position>
       <Position>
         <Filename Value="vrdx_daemon.lpr"/>
-        <Caret Line="11" Column="15"/>
+        <Caret Line="26" Column="39"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_logger.pas"/>
+        <Caret Line="11" Column="100"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_logger.pas"/>
+        <Caret Line="24" Column="39"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_config.pas"/>
+        <Caret Line="12" Column="60"/>
       </Position>
       <Position>
         <Filename Value="vrdx_core.pas"/>
-        <Caret Line="75" Column="24" TopLine="54"/>
+        <Caret Line="80" Column="15" TopLine="46"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_irc.pas"/>
+        <Caret Line="28" Column="21"/>
       </Position>
       <Position>
         <Filename Value="vrdx_core.pas"/>
-        <Caret Line="68" Column="27" TopLine="54"/>
+        <Caret Line="114" Column="16" TopLine="80"/>
       </Position>
       <Position>
         <Filename Value="vrdx_core.pas"/>
-        <Caret Line="254" Column="42" TopLine="235"/>
+        <Caret Line="116" Column="18" TopLine="91"/>
       </Position>
       <Position>
         <Filename Value="vrdx_core.pas"/>
-        <Caret Line="22" Column="78"/>
+        <Caret Line="114" Column="13" TopLine="84"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_core.pas"/>
+        <Caret Line="440" Column="8" TopLine="404"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_logger.pas"/>
+        <Caret Line="76" Column="32" TopLine="52"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_logger.pas"/>
+        <Caret Line="57" Column="17" TopLine="42"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_core.pas"/>
+        <Caret Line="367" Column="20" TopLine="350"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_core.pas"/>
+        <Caret Line="103" Column="22" TopLine="86"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_core.pas"/>
+        <Caret Line="372" Column="58" TopLine="354"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_core.pas"/>
+        <Caret Line="105" Column="30" TopLine="80"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_websocket.pas"/>
+        <Caret Line="338" Column="67" TopLine="317"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_core.pas"/>
+        <Caret Line="411" Column="44" TopLine="397"/>
       </Position>
     </JumpHistory>
     <RunParams>
