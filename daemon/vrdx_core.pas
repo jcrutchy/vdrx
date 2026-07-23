@@ -115,6 +115,11 @@ type
     // use this (then Register again) to replace an executive's subscriptions in
     // place, e.g. a WebSocket connection re-subscribing to a new topic.
     procedure ClearFilters(const AID: string);
+    // Drops just the one (AID, AFilter) subscription, leaving any other filters
+    // that AID is registered under untouched - use this when an executive wants to
+    // leave a single topic without losing its other subscriptions, e.g. an IRC
+    // connection PARTing one channel while staying in others.
+    procedure UnregisterFilter(const AID, AFilter: string);
     // Drops every filter subscription for AID AND destroys the executive (owning
     // map). Use when the executive itself is going away, not just its subscriptions.
     procedure Unregister(const AID: string);
@@ -255,14 +260,23 @@ procedure TVRDX_Executive.ApplyConfig;
 begin
 end;
 
+{ TVRDX_Subscription }
+
+constructor TVRDX_Subscription.Create(AExec: TVRDX_Executive; const AFilter: string);
+begin
+  inherited Create;
+  Exec := AExec;
+  Filter := AFilter;
+end;
+
 { TVRDX_Registry }
 
 constructor TVRDX_Registry.Create;
 begin
   FLock := TCriticalSection.Create;
   FMasterMap := TVRDX_ExecMasterMap.Create([doOwnsValues]);
-  FLiteralSubs := TVRDX_ExecListDictionary.Create([doOwnsValues]);
-  FWildcardSubs := TVRDX_ExecList.Create;
+  FLiteralSubs := TVRDX_SubListDictionary.Create([doOwnsValues]);
+  FWildcardSubs := TVRDX_SubList.Create; // owns its Subscriptions
 end;
 
 destructor TVRDX_Registry.Destroy;
@@ -274,26 +288,88 @@ begin
   inherited;
 end;
 
+// Adds one more filter subscription for AExec under AID. Only takes ownership of
+// AExec (adds it to the owning MasterMap) the first time AID is seen; subsequent
+// calls with the same AID just add another Subscription for the already-owned
+// executive - this is what lets one executive be registered under any number of
+// filters, e.g. Register(Logger, 'logger', 'log.>') then
+// Register(Logger, 'logger', 'irc.>').
 procedure TVRDX_Registry.Register(AExec: TVRDX_Executive; const AID, AFilter: string);
 var
-  List: TVRDX_ExecList;
+  List: TVRDX_SubList;
+  Sub: TVRDX_Subscription;
 begin
   FLock.Enter;
   try
-    AExec.ID := AID;
-    AExec.Filter := AFilter;
-    FMasterMap.Add(AID, AExec);
+    if not FMasterMap.ContainsKey(AID) then
+    begin
+      AExec.ID := AID;
+      FMasterMap.Add(AID, AExec);
+    end;
+    Sub := TVRDX_Subscription.Create(AExec, AFilter);
     if (Pos('*', AFilter) > 0) or (Pos('>', AFilter) > 0) then
-      FWildcardSubs.Add(AExec)
+      FWildcardSubs.Add(Sub)
     else
     begin
       if not FLiteralSubs.TryGetValue(AFilter, List) then
       begin
-        List := TVRDX_ExecList.Create;
+        List := TVRDX_SubList.Create;
         FLiteralSubs.Add(AFilter, List);
       end;
-      List.Add(AExec);
+      List.Add(Sub);
     end;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+// Removes every Subscription that points at AExec, from both the wildcard list and
+// every literal-filter bucket, without touching the MasterMap. Caller holds FLock.
+procedure TVRDX_Registry.RemoveSubscriptionsUnlocked(AExec: TVRDX_Executive);
+var
+  i: Integer;
+  List: TVRDX_SubList;
+begin
+  for i := FWildcardSubs.Count - 1 downto 0 do
+    if FWildcardSubs[i].Exec = AExec then
+      FWildcardSubs.Delete(i); // owned list - frees the Subscription
+
+  for List in FLiteralSubs.Values do
+    for i := List.Count - 1 downto 0 do
+      if List[i].Exec = AExec then
+        List.Delete(i);
+end;
+
+procedure TVRDX_Registry.ClearFilters(const AID: string);
+var
+  Exec: TVRDX_Executive;
+begin
+  FLock.Enter;
+  try
+    if FMasterMap.TryGetValue(AID, Exec) then
+      RemoveSubscriptionsUnlocked(Exec);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TVRDX_Registry.UnregisterFilter(const AID, AFilter: string);
+var
+  Exec: TVRDX_Executive;
+  i: Integer;
+  List: TVRDX_SubList;
+begin
+  FLock.Enter;
+  try
+    if not FMasterMap.TryGetValue(AID, Exec) then
+      Exit;
+    for i := FWildcardSubs.Count - 1 downto 0 do
+      if (FWildcardSubs[i].Exec = Exec) and (FWildcardSubs[i].Filter = AFilter) then
+        FWildcardSubs.Delete(i);
+    if FLiteralSubs.TryGetValue(AFilter, List) then
+      for i := List.Count - 1 downto 0 do
+        if List[i].Exec = Exec then
+          List.Delete(i);
   finally
     FLock.Leave;
   end;
@@ -302,33 +378,37 @@ end;
 procedure TVRDX_Registry.Unregister(const AID: string);
 var
   Exec: TVRDX_Executive;
-  List: TVRDX_ExecList;
 begin
   FLock.Enter;
   try
     if not FMasterMap.TryGetValue(AID, Exec) then
       Exit;
-    FWildcardSubs.Remove(Exec);
-    for List in FLiteralSubs.Values do
-      List.Remove(Exec);
+    RemoveSubscriptionsUnlocked(Exec);
     FMasterMap.Remove(AID); // owning map - this is what actually frees Exec
   finally
     FLock.Leave;
   end;
 end;
 
+// Same executive can be reachable via more than one matching Subscription (e.g. two
+// overlapping wildcard filters, or a literal + a wildcard both matching ATopic) -
+// dedupe so HandlePacket is never called twice for one message.
 function TVRDX_Registry.GetSubscribers(const ATopic: string): TVRDX_ExecList;
 var
-  Exec: TVRDX_Executive;
+  Sub: TVRDX_Subscription;
+  List: TVRDX_SubList;
 begin
   FLock.Enter;
   try
     Result := TVRDX_ExecList.Create;
-    if FLiteralSubs.ContainsKey(ATopic) then
-      Result.AddRange(FLiteralSubs[ATopic]);
-    for Exec in FWildcardSubs do
-      if TopicMatches(Exec.Filter, ATopic) then
-        Result.Add(Exec);
+    if FLiteralSubs.TryGetValue(ATopic, List) then
+      for Sub in List do
+        if Result.IndexOf(Sub.Exec) < 0 then
+          Result.Add(Sub.Exec);
+    for Sub in FWildcardSubs do
+      if TopicMatches(Sub.Filter, ATopic) then
+        if Result.IndexOf(Sub.Exec) < 0 then
+          Result.Add(Sub.Exec);
   finally
     FLock.Leave;
   end;

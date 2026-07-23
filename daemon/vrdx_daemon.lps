@@ -8,27 +8,28 @@
       <Unit>
         <Filename Value="vrdx_daemon.lpr"/>
         <IsPartOfProject Value="True"/>
-        <CursorPos X="27" Y="3"/>
-        <UsageCount Value="68"/>
+        <IsVisibleTab Value="True"/>
+        <TopLine Value="27"/>
+        <CursorPos X="53" Y="41"/>
+        <UsageCount Value="69"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vrdx_core.pas"/>
         <IsPartOfProject Value="True"/>
-        <IsVisibleTab Value="True"/>
         <EditorIndex Value="1"/>
         <TopLine Value="419"/>
         <CursorPos X="5" Y="452"/>
-        <UsageCount Value="68"/>
+        <UsageCount Value="69"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vrdx_irc.pas"/>
         <IsPartOfProject Value="True"/>
         <EditorIndex Value="6"/>
-        <TopLine Value="97"/>
-        <CursorPos X="35" Y="130"/>
-        <UsageCount Value="67"/>
+        <TopLine Value="515"/>
+        <CursorPos X="53" Y="525"/>
+        <UsageCount Value="68"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
@@ -36,24 +37,24 @@
         <IsPartOfProject Value="True"/>
         <EditorIndex Value="7"/>
         <CursorPos X="36" Y="94"/>
-        <UsageCount Value="31"/>
+        <UsageCount Value="32"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vrdx_config.pas"/>
         <IsPartOfProject Value="True"/>
-        <EditorIndex Value="10"/>
+        <EditorIndex Value="11"/>
         <TopLine Value="24"/>
         <CursorPos X="45" Y="48"/>
-        <UsageCount Value="31"/>
+        <UsageCount Value="32"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vrdx_admin.pas"/>
         <IsPartOfProject Value="True"/>
-        <EditorIndex Value="11"/>
+        <EditorIndex Value="12"/>
         <CursorPos X="50" Y="19"/>
-        <UsageCount Value="30"/>
+        <UsageCount Value="31"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
@@ -100,7 +101,7 @@
       <Unit>
         <Filename Value="vrdx_whiteboard.pas"/>
         <EditorIndex Value="4"/>
-        <CursorPos X="25" Y="9"/>
+        <CursorPos X="58" Y="6"/>
         <UsageCount Value="16"/>
         <Loaded Value="True"/>
       </Unit>
@@ -113,33 +114,21 @@
       </Unit>
       <Unit>
         <Filename Value="vrdx_weblistener.pas"/>
-        <EditorIndex Value="9"/>
+        <EditorIndex Value="10"/>
         <CursorPos X="36" Y="10"/>
+        <UsageCount Value="10"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vrdx_transport.pas"/>
+        <EditorIndex Value="9"/>
+        <TopLine Value="100"/>
+        <CursorPos X="11" Y="124"/>
         <UsageCount Value="10"/>
         <Loaded Value="True"/>
       </Unit>
     </Units>
     <JumpHistory HistoryIndex="29">
-      <Position>
-        <Filename Value="vrdx_daemon.lpr"/>
-        <Caret Line="32" Column="22"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_bridge.pas"/>
-        <Caret Line="72" Column="69" TopLine="49"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_bridge.pas"/>
-        <Caret Line="180" Column="16" TopLine="160"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_core.pas"/>
-        <Caret Line="27" Column="14"/>
-      </Position>
-      <Position>
-        <Filename Value="vrdx_bridge.pas"/>
-        <Caret Line="191" Column="57" TopLine="157"/>
-      </Position>
       <Position>
         <Filename Value="vrdx_http.pas"/>
         <Caret Line="115" Column="34" TopLine="86"/>
@@ -239,6 +228,26 @@
       <Position>
         <Filename Value="vrdx_core.pas"/>
         <Caret Line="411" Column="44" TopLine="397"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_daemon.lpr"/>
+        <Caret Line="13" Column="32"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_transport.pas"/>
+        <Caret Line="19" Column="77" TopLine="60"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_transport.pas"/>
+        <Caret Line="80" Column="3" TopLine="63"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_transport.pas"/>
+        <Caret Line="81" Column="26" TopLine="62"/>
+      </Position>
+      <Position>
+        <Filename Value="vrdx_transport.pas"/>
+        <Caret Line="125" Column="48" TopLine="141"/>
       </Position>
     </JumpHistory>
     <RunParams>

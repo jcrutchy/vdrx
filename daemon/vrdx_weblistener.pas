@@ -5,27 +5,28 @@ unit vrdx_weblistener;
 interface
 
 uses
-  Classes, SysUtils, Sockets, vrdx_core, vrdx_socketlistener, vrdx_http,
-  vrdx_websocket, vrdx_whiteboard;
+  Classes, SysUtils, Sockets, vrdx_core, vrdx_socketlistener, vrdx_transport,
+  vrdx_http, vrdx_websocket, vrdx_whiteboard;
 
 type
-  // Optional: binds ONE port and routes each connection to plain HTTP handling or a
-  // WebSocket upgrade, based on peeking the initial request for an
-  // 'Upgrade: websocket' header. Entirely optional - TVRDX_HTTPExecutive and
-  // TVRDX_WebSocketExecutive remain independently usable on their own ports if you'd
-  // rather keep them split (see WIRING.md). This is for the case where you want both
-  // reachable on a single port, e.g. 80.
+  // Optional: binds ONE port (plus optionally one TLS port) and routes each
+  // connection to plain HTTP handling or a WebSocket upgrade, based on peeking the
+  // initial request for an 'Upgrade: websocket' header. Entirely optional -
+  // TVRDX_HTTPExecutive and TVRDX_WebSocketExecutive remain independently usable on
+  // their own ports if you'd rather keep them split (see WIRING.md). This is for
+  // the case where you want both reachable on a single port, e.g. 80/443.
   //
   // Doesn't reimplement either protocol: HTTP responses come from
   // TVRDX_HTTPExecutive.BuildResponse (a class function, no listener needed), and a
-  // WebSocket upgrade is handed off via AWebSocket.AdoptConnection, passing along the
-  // bytes already read here so the connection doesn't do a second fpRecv.
+  // WebSocket upgrade is handed off via AWebSocket.AdoptConnection, passing along
+  // the transport and bytes already read here so the connection doesn't do a second
+  // Read.
   TVRDX_WebListenerExecutive = class(TVRDX_SocketListenerExecutive)
   private
     FWhiteboard: TVRDX_WhiteboardExecutive;
     FWebSocket: TVRDX_WebSocketExecutive;
   protected
-    procedure HandleConnection(ASock: TSocket); override;
+    procedure HandleConnection(ATransport: TVRDX_Transport); override;
   public
     constructor Create(ABus: TVRDX_MessageQueue; AWhiteboard: TVRDX_WhiteboardExecutive;
       AWebSocket: TVRDX_WebSocketExecutive); reintroduce;
@@ -43,29 +44,31 @@ begin
   Port := 80;
 end;
 
-procedure TVRDX_WebListenerExecutive.HandleConnection(ASock: TSocket);
+procedure TVRDX_WebListenerExecutive.HandleConnection(ATransport: TVRDX_Transport);
 var
   Buf: array[0..2047] of Byte;
   Received: Integer;
   Request, Response: string;
 begin
-  Received := fpRecv(ASock, @Buf[0], SizeOf(Buf), 0);
+  Received := ATransport.Read(Buf[0], SizeOf(Buf));
   if Received <= 0 then
   begin
-    CloseSocket(ASock);
+    ATransport.Close;
+    ATransport.Free;
     Exit;
   end;
   SetString(Request, PAnsiChar(@Buf[0]), Received);
 
   if TVRDX_WSConnection.IsUpgradeRequest(Request) then
-    // FWebSocket.AdoptConnection takes ownership of ASock from here - including
-    // eventually closing it - via a registered TVRDX_WSConnection.
-    FWebSocket.AdoptConnection(ASock, Request)
+    // FWebSocket.AdoptConnection takes ownership of ATransport from here -
+    // including eventually closing it - via a registered TVRDX_WSConnection.
+    FWebSocket.AdoptConnection(ATransport, Request)
   else
   begin
     Response := TVRDX_HTTPExecutive.BuildResponse(Request, FWhiteboard);
-    fpSend(ASock, @Response[1], Length(Response), 0);
-    CloseSocket(ASock);
+    ATransport.Write(Response[1], Length(Response));
+    ATransport.Close;
+    ATransport.Free;
   end;
 end;
 

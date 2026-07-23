@@ -6,7 +6,7 @@ interface
 
 uses
   Classes, SysUtils, Sockets, SyncObjs, base64, sha1, fpjson, jsonparser,
-  vrdx_core, vrdx_socketlistener;
+  vrdx_core, vrdx_socketlistener, vrdx_transport, vrdx_config;
 
 const
   WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -15,14 +15,17 @@ type
   TVRDX_WebSocketExecutive = class;
 
   // One instance per live browser connection. Registers itself into the Registry
-  // once auth succeeds, with whatever filter the client last subscribed to - this is
-  // what lets the Dispatcher's ordinary routing deliver bus messages straight to the
-  // socket, with no separate broadcast path anywhere in the kernel. Deregisters
-  // itself on disconnect.
+  // once auth succeeds, and can hold any number of active filters at once (each
+  // 'subscribe' RPC adds one, 'unsubscribe'/'unsubscribe_all' drop one or all) -
+  // this is what lets the Dispatcher's ordinary routing deliver bus messages
+  // straight to the socket, with no separate broadcast path anywhere in the kernel.
+  // Deregisters itself on disconnect. Talks to FTransport rather than a raw socket,
+  // so it works identically whether the browser connected plain (ws://) or TLS
+  // (wss://) - see TVRDX_SocketListenerExecutive/vrdx_transport.pas.
   TVRDX_WSConnection = class(TVRDX_Executive)
   private
     FListener: TVRDX_WebSocketExecutive;
-    FSocket: TSocket;
+    FTransport: TVRDX_Transport;
     FThread: TThread;
     FAuthenticated: Boolean;
     FSendLock: TCriticalSection;
@@ -32,7 +35,7 @@ type
     procedure SendFrame(const APayload: string; AOpcode: Byte = 1);
     procedure HandleRPC(const ALine: string);
   public
-    constructor Create(ABus: TVRDX_MessageQueue; AListener: TVRDX_WebSocketExecutive; ASocket: TSocket);
+    constructor Create(ABus: TVRDX_MessageQueue; AListener: TVRDX_WebSocketExecutive; ATransport: TVRDX_Transport);
     destructor Destroy; override;
     property PendingRequest: string read FPendingRequest write FPendingRequest;
     procedure Initialize; override;
@@ -46,21 +49,23 @@ type
 
   TVRDX_WebSocketExecutive = class(TVRDX_SocketListenerExecutive)
   private
+    FConfig: TVRDX_Config;
     FRegistry: TVRDX_Registry;
     FConnCounter: Integer;
   protected
-    procedure HandleConnection(ASock: TSocket); override;
+    procedure HandleConnection(ATransport: TVRDX_Transport); override;
   public
-    constructor Create(ABus: TVRDX_MessageQueue; ARegistry: TVRDX_Registry); reintroduce;
+    constructor Create(ABus: TVRDX_MessageQueue; AConfig: TVRDX_Config; ARegistry: TVRDX_Registry); reintroduce;
     property Registry: TVRDX_Registry read FRegistry;
     procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    procedure ApplyConfig; override;
     function NextConnID: string;
-    // Constructs, registers, and launches a connection for a socket someone else
-    // already accepted. AInitialRequest carries any bytes already read off the wire
-    // (pass '' if none were - the connection will do its own fpRecv for the
-    // handshake). Used by our own HandleConnection and, optionally, by a combined
-    // HTTP/WS listener sharing one port.
-    procedure AdoptConnection(ASock: TSocket; const AInitialRequest: string);
+    // Constructs, registers, and launches a connection for a transport someone else
+    // already accepted (and, if TLS, already handshook). AInitialRequest carries any
+    // bytes already read off the wire (pass '' if none were - the connection will do
+    // its own Read for the handshake). Used by our own HandleConnection and,
+    // optionally, by a combined HTTP/WS listener sharing one port.
+    procedure AdoptConnection(ATransport: TVRDX_Transport; const AInitialRequest: string);
   end;
 
 implementation
@@ -109,17 +114,18 @@ end;
 
 { TVRDX_WSConnection }
 
-constructor TVRDX_WSConnection.Create(ABus: TVRDX_MessageQueue; AListener: TVRDX_WebSocketExecutive; ASocket: TSocket);
+constructor TVRDX_WSConnection.Create(ABus: TVRDX_MessageQueue; AListener: TVRDX_WebSocketExecutive; ATransport: TVRDX_Transport);
 begin
   inherited Create(ABus);
   FListener := AListener;
-  FSocket := ASocket;
+  FTransport := ATransport;
   FSendLock := TCriticalSection.Create;
   FAuthenticated := False;
 end;
 
 destructor TVRDX_WSConnection.Destroy;
 begin
+  FTransport.Free;
   FSendLock.Free;
   inherited Destroy;
 end;
@@ -127,7 +133,7 @@ end;
 class function TVRDX_WSConnection.IsUpgradeRequest(const ARequest: string): Boolean;
 begin
   // Cheap header sniff, not a full parse - good enough to route on before either
-  // handler takes over the socket for real.
+  // handler takes over the connection for real.
   Result := (Pos('Upgrade:', ARequest) > 0) and (Pos('websocket', LowerCase(ARequest)) > 0);
 end;
 
@@ -142,7 +148,7 @@ begin
     Request := FPendingRequest // handed to us already-read by AdoptConnection
   else
   begin
-    Received := fpRecv(FSocket, @Buf[0], SizeOf(Buf), 0);
+    Received := FTransport.Read(Buf[0], SizeOf(Buf));
     if Received <= 0 then Exit;
     SetString(Request, PAnsiChar(@Buf[0]), Received);
   end;
@@ -156,7 +162,7 @@ begin
             'Upgrade: websocket'#13#10 +
             'Connection: Upgrade'#13#10 +
             'Sec-WebSocket-Accept: ' + AcceptKey + #13#10#13#10;
-  fpSend(FSocket, @Header[1], Length(Header), 0);
+  FTransport.Write(Header[1], Length(Header));
   Result := True;
 end;
 
@@ -173,26 +179,26 @@ var
   LenByte: Byte;
 begin
   Result := False;
-  if fpRecv(FSocket, @Hdr[0], 2, 0) <> 2 then Exit;
+  if FTransport.Read(Hdr[0], 2) <> 2 then Exit;
   AOpcode := Hdr[0] and $0F;
   if AOpcode = 8 then Exit; // close frame
   LenByte := Hdr[1] and $7F;
   Len := LenByte;
   if LenByte = 126 then
   begin
-    fpRecv(FSocket, @Ext[0], 2, 0);
+    FTransport.Read(Ext[0], 2);
     Len := (Ext[0] shl 8) or Ext[1];
   end
   else if LenByte = 127 then
     Exit; // 64-bit lengths not needed for control-plane traffic
   if (Hdr[1] and $80) <> 0 then
-    fpRecv(FSocket, @Mask[0], 4, 0)
+    FTransport.Read(Mask[0], 4)
   else
     FillChar(Mask, SizeOf(Mask), 0);
   SetLength(Data, Len);
   Received := 0;
   while Received < Len do
-    Inc(Received, fpRecv(FSocket, @Data[Received], Len - Received, 0));
+    Inc(Received, FTransport.Read(Data[Received], Len - Received));
   for i := 0 to Len - 1 do
     Data[i] := Data[i] xor Mask[i mod 4];
   SetString(APayload, PAnsiChar(@Data[0]), Len);
@@ -222,7 +228,7 @@ begin
     end;
     SetString(Buf, PAnsiChar(@Hdr[0]), HdrLen);
     Buf := Buf + APayload; // server->client frames sent unmasked, per spec
-    fpSend(FSocket, @Buf[1], Length(Buf), 0);
+    FTransport.Write(Buf[1], Length(Buf));
   finally
     FSendLock.Leave;
   end;
@@ -257,12 +263,22 @@ begin
 
     if Method = 'subscribe' then
     begin
+      // Adds one more filter to this connection's set - repeat 'subscribe' calls
+      // accumulate rather than replace, so a client can listen to several topics
+      // at once (e.g. 'wb.board1.>' and 'irc.#general.>' concurrently).
       Topic := Obj.Get('filter', '');
-      // Single-filter simplification (flagged in session notes): re-registering
-      // replaces this connection's one active filter rather than adding to a set.
-      FListener.Registry.Unregister(ID);
       FListener.Registry.Register(Self, ID, Topic);
     end
+    else if Method = 'unsubscribe' then
+    begin
+      // Drops just this one filter, leaving any other active subscriptions alone.
+      Topic := Obj.Get('filter', '');
+      FListener.Registry.UnregisterFilter(ID, Topic);
+    end
+    else if Method = 'unsubscribe_all' then
+      // Drops every filter this connection currently holds, without destroying the
+      // connection itself - use before a fresh batch of 'subscribe' calls.
+      FListener.Registry.ClearFilters(ID)
     else if Method = 'publish' then
     begin
       Topic := Obj.Get('topic', '');
@@ -296,7 +312,7 @@ end;
 
 procedure TVRDX_WSConnection.Shutdown;
 begin
-  CloseSocket(FSocket); // unblocks the blocking recv in RunLoop
+  FTransport.Close; // unblocks the blocking Read in RunLoop
   if Assigned(FThread) then
   begin
     FThread.WaitFor;
@@ -313,9 +329,10 @@ end;
 
 { TVRDX_WebSocketExecutive }
 
-constructor TVRDX_WebSocketExecutive.Create(ABus: TVRDX_MessageQueue; ARegistry: TVRDX_Registry);
+constructor TVRDX_WebSocketExecutive.Create(ABus: TVRDX_MessageQueue; AConfig: TVRDX_Config; ARegistry: TVRDX_Registry);
 begin
   inherited Create(ABus);
+  FConfig := AConfig;
   FRegistry := ARegistry;
   Port := 8082;
   FConnCounter := 0;
@@ -327,11 +344,11 @@ begin
   Result := 'ws.conn.' + IntToStr(FConnCounter);
 end;
 
-procedure TVRDX_WebSocketExecutive.AdoptConnection(ASock: TSocket; const AInitialRequest: string);
+procedure TVRDX_WebSocketExecutive.AdoptConnection(ATransport: TVRDX_Transport; const AInitialRequest: string);
 var
   Conn: TVRDX_WSConnection;
 begin
-  Conn := TVRDX_WSConnection.Create(Bus, Self, ASock);
+  Conn := TVRDX_WSConnection.Create(Bus, Self, ATransport);
   Conn.PendingRequest := AInitialRequest;
   // Registered with a non-matching placeholder filter until the client's own
   // 'subscribe' RPC re-registers it with something real.
@@ -339,14 +356,33 @@ begin
   Conn.Initialize;
 end;
 
-procedure TVRDX_WebSocketExecutive.HandleConnection(ASock: TSocket);
+procedure TVRDX_WebSocketExecutive.HandleConnection(ATransport: TVRDX_Transport);
 begin
-  AdoptConnection(ASock, ''); // no bytes pre-read - the connection does its own recv
+  AdoptConnection(ATransport, ''); // no bytes pre-read - the connection does its own Read
 end;
 
 procedure TVRDX_WebSocketExecutive.HandlePacket(const AMsg: TVRDX_Message);
 begin
   // The listener itself isn't a message recipient - each TVRDX_WSConnection is.
+end;
+
+// Same restart-on-change pattern as TVRDX_IRCDExecutive.ApplyConfig.
+procedure TVRDX_WebSocketExecutive.ApplyConfig;
+var
+  NewPort, NewTLSPort: Integer;
+  CertFile, KeyFile: string;
+begin
+  NewPort := FConfig.GetInteger('executives.ws.port', 8082);
+  NewTLSPort := FConfig.GetInteger('executives.ws.tls_port', 0);
+  CertFile := FConfig.GetString('executives.ws.tls_cert', '');
+  KeyFile := FConfig.GetString('executives.ws.tls_key', '');
+  if (NewPort <> Port) or (NewTLSPort <> TLSPort) then
+  begin
+    Shutdown;
+    Port := NewPort;
+    ConfigureTLS(NewTLSPort, CertFile, KeyFile);
+    Initialize;
+  end;
 end;
 
 end.

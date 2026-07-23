@@ -37,6 +37,7 @@ begin
   // plain in vrdx_daemon.log.
   Logger := TVRDX_LoggerExecutive.Create(Kernel.Queue, 'vrdx_daemon.log', lvlINFO);
   Kernel.Registry.Register(Logger, 'logger', 'log.>');
+  Kernel.Registry.Register(Logger, 'logger', 'irc.>');
 
   // Listens for 'sys.reload' - reloads vrdx_daemon.conf and re-applies it to every
   // registered executive. Not required for the basic IRCD test, but cheap to have
@@ -45,8 +46,12 @@ begin
   Admin := TVRDX_AdminExecutive.Create(Kernel.Queue, Config, Kernel.Registry);
   Kernel.Registry.Register(Admin, 'admin', 'sys.reload');
 
-  IRCD := TVRDX_IRCDExecutive.Create(Kernel.Queue, Config);
+  IRCD := TVRDX_IRCDExecutive.Create(Kernel.Queue, Config, Kernel.Registry);
   IRCD.Port := Config.GetInteger('executives.ircd.port', 6667);
+  IRCD.ConfigureTLS(
+    Config.GetInteger('executives.ircd.tls_port', 0),
+    Config.GetString('executives.ircd.tls_cert', ''),
+    Config.GetString('executives.ircd.tls_key', ''));
   Kernel.Registry.Register(IRCD, 'ircd', 'sys.none'); // doesn't consume bus messages itself
 
   Kernel.Start; // Execute() calls Registry.InitializeAll - this is what actually
@@ -54,6 +59,10 @@ begin
 
   WriteLn('VDRX daemon running.');
   WriteLn('  IRCD listening on port ', IRCD.Port, ' - connect with HexChat to test.');
+  if IRCD.TLSActive then
+    WriteLn('  IRCD also listening TLS on port ', IRCD.TLSPort, '.')
+  else if IRCD.TLSPort <> 0 then
+    WriteLn('  IRCD TLS was configured (port ', IRCD.TLSPort, ') but failed to come up - check tls_cert/tls_key in vrdx_daemon.conf and that libssl is loadable.');
   WriteLn('  Logger writing to vrdx_daemon.log (console threshold: INFO).');
   WriteLn('Press ENTER to stop...');
   ReadLn;

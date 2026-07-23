@@ -18,6 +18,7 @@ type
     destructor Destroy; override;
     function GetString(APath: string; ADefault: string): string;
     function GetInteger(APath: string; ADefault: Integer): Integer;
+    function GetStringArray(APath: string): TStringArray;
     procedure Reload;
   end;
 
@@ -58,6 +59,27 @@ begin
       Result := FData.GetPath(APath).AsInteger
     else
       Result := ADefault;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TVRDX_Config.GetStringArray(APath: string): TStringArray;
+var
+  Node: TJSONData;
+  Arr: TJSONArray;
+  i: Integer;
+begin
+  SetLength(Result, 0);
+  FLock.Enter;
+  try
+    if not Assigned(FData) then Exit;
+    Node := FData.FindPath(APath);
+    if not Assigned(Node) or not (Node is TJSONArray) then Exit;
+    Arr := TJSONArray(Node);
+    SetLength(Result, Arr.Count);
+    for i := 0 to Arr.Count - 1 do
+      Result[i] := Arr.Strings[i];
   finally
     FLock.Leave;
   end;
