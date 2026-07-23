@@ -120,8 +120,11 @@ end;
 function TVRDX_SocketListenerExecutive.BindListenSocket(APort: Word): TSocket;
 var
   Addr: TInetSockAddr;
+  OptVal: LongInt;
 begin
   Result := fpSocket(AF_INET, SOCK_STREAM, 0);
+  OptVal := 1;
+  fpSetSockOpt(Result, SOL_SOCKET, SO_REUSEADDR, @OptVal, SizeOf(OptVal)); // avoid "address in use" on a fast restart while the old socket's still in TIME_WAIT
   FillChar(Addr, SizeOf(Addr), 0);
   Addr.sin_family := AF_INET;
   Addr.sin_port := htons(APort);

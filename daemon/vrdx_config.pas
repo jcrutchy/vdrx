@@ -18,6 +18,7 @@ type
     destructor Destroy; override;
     function GetString(APath: string; ADefault: string): string;
     function GetInteger(APath: string; ADefault: Integer): Integer;
+    function GetBoolean(APath: string; ADefault: Boolean): Boolean;
     function GetStringArray(APath: string): TStringArray;
     procedure Reload;
   end;
@@ -57,6 +58,19 @@ begin
   try
     if Assigned(FData) and (FData.FindPath(APath) <> nil) then
       Result := FData.GetPath(APath).AsInteger
+    else
+      Result := ADefault;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TVRDX_Config.GetBoolean(APath: string; ADefault: Boolean): Boolean;
+begin
+  FLock.Enter;
+  try
+    if Assigned(FData) and (FData.FindPath(APath) <> nil) then
+      Result := FData.GetPath(APath).AsBoolean
     else
       Result := ADefault;
   finally

@@ -23,6 +23,8 @@ type
     FRestartDelayMs: Integer;
     FMaxRestartDelayMs: Integer;
     FStopping: Boolean;
+    FIRCChannel: string;  // '' = disabled (default) - relay-out target channel, e.g. '#general'
+    FIRCFromName: string; // display nick/user for relayed lines
     procedure StartProcess;
     procedure StopProcess;
     procedure ReaderLoop;
@@ -31,6 +33,12 @@ type
     constructor Create(ABus: TVRDX_MessageQueue); override;
     destructor Destroy; override;
     property Command: string read FCommand write FCommand;
+    // Optional: set both to have every line the child process prints also show up
+    // as a PRIVMSG in this IRC channel (in addition to the existing <ID>.out bus
+    // publish, which still happens either way). Leave IRCChannel '' to disable -
+    // that's the default, so existing non-IRC uses of Bridge are unaffected.
+    property IRCChannel: string read FIRCChannel write FIRCChannel;
+    property IRCFromName: string read FIRCFromName write FIRCFromName;
     procedure Initialize; override;
     procedure Shutdown; override;
     procedure HandlePacket(const AMsg: TVRDX_Message); override;
@@ -47,6 +55,7 @@ begin
   FRestartDelayMs := 500;
   FMaxRestartDelayMs := 30000;
   FStopping := False;
+  FIRCFromName := 'bridge';
 end;
 
 destructor TVRDX_BridgeExecutive.Destroy;
@@ -118,7 +127,16 @@ begin
         Line := Trim(Buf);
         Buf := '';
         if Line <> '' then
+        begin
           Bus.Publish(ID + '.out', Line, ID); // process output re-enters the bus, namespaced by this executive's ID
+          if FIRCChannel <> '' then
+            // Same 'irc.<channel>.event' shape TVRDX_IRCConnection.HandlePacket already
+            // understands - this is what closes the "!run ..." -> reply-in-channel loop.
+            Bus.Publish('irc.' + FIRCChannel + '.event',
+              Format('{"kind":"privmsg","from":%s,"user":%s,"text":%s}',
+                [StringToJSONString(FIRCFromName), StringToJSONString(FIRCFromName), StringToJSONString(Line)]),
+              ID);
+        end;
       end
       else if Ch <> #13 then
         Buf := Buf + Ch;
