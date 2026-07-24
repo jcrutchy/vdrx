@@ -61,7 +61,6 @@
       </Unit>
       <Unit>
         <Filename Value="vdrx_socketlistener.pas"/>
-        <IsVisibleTab Value="True"/>
         <EditorIndex Value="8"/>
         <CursorPos X="76" Y="22"/>
         <UsageCount Value="10"/>
@@ -69,32 +68,46 @@
       </Unit>
       <Unit>
         <Filename Value="vdrx_templates.pas"/>
-        <EditorIndex Value="9"/>
-        <UsageCount Value="10"/>
-        <Loaded Value="True"/>
-      </Unit>
-      <Unit>
-        <Filename Value="vdrx_transport.pas"/>
-        <EditorIndex Value="10"/>
-        <UsageCount Value="10"/>
-        <Loaded Value="True"/>
-      </Unit>
-      <Unit>
-        <Filename Value="vdrx_weblistener.pas"/>
         <EditorIndex Value="11"/>
         <UsageCount Value="10"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="vdrx_websocket.pas"/>
+        <Filename Value="vdrx_transport.pas"/>
         <EditorIndex Value="12"/>
         <UsageCount Value="10"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="vdrx_whiteboard.pas"/>
+        <Filename Value="vdrx_weblistener.pas"/>
         <EditorIndex Value="13"/>
+        <UsageCount Value="10"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vdrx_websocket.pas"/>
+        <EditorIndex Value="14"/>
+        <UsageCount Value="10"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vdrx_whiteboard.pas"/>
+        <EditorIndex Value="15"/>
         <CursorPos X="70" Y="18"/>
+        <UsageCount Value="10"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vdrx_admincmd.pas"/>
+        <EditorIndex Value="9"/>
+        <UsageCount Value="10"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vdrx_procutil.pas"/>
+        <IsVisibleTab Value="True"/>
+        <EditorIndex Value="10"/>
+        <CursorPos X="78" Y="19"/>
         <UsageCount Value="10"/>
         <Loaded Value="True"/>
       </Unit>

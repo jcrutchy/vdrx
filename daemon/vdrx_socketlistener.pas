@@ -5,7 +5,7 @@ unit vdrx_socketlistener;
 interface
 
 uses
-  Classes, SysUtils, Sockets, SyncObjs, vdrx_core, vdrx_transport;
+  Classes, SysUtils, Sockets, SyncObjs, vdrx_core, vdrx_transport, vdrx_procutil;
 
 type
 
@@ -19,6 +19,9 @@ type
     procedure Execute; override;
   public
     constructor Create(AOwner: TVDRX_SocketListenerExecutive; ATransport: TVDRX_Transport);
+    // Exposed so Shutdown can force-close a hung connection's transport to
+    // unblock a blocking Read/Write that FStopping alone can't interrupt.
+    property Transport: TVDRX_Transport read FTransport;
   end;
 
   TVDRX_SocketListenerExecutive = class(TVDRX_Executive)
@@ -34,6 +37,7 @@ type
     FPlainThread: TThread;
     FTLSThread: TThread;
     FStopping: Boolean;
+    FGracefulTimeoutMs: Integer;
 
     // Thread tracking synchronization
     FCriticalSection: TCriticalSection;
@@ -57,6 +61,11 @@ type
     procedure ConfigureTLS(ATLSPort: Word; const ACertFile, AKeyFile: string);
     property Backlog: Integer read FBacklog write FBacklog;
     property Stopping: Boolean read FStopping;
+    // How long Shutdown waits for accept/connection threads to exit on their
+    // own before force-closing their sockets to unblock a hung blocking
+    // Read/Write. Defaults to 5000ms; set from vdrx_daemon.conf's top-level
+    // "shutdown_grace_ms" in vdrx_daemon.lpr.
+    property GracefulTimeoutMs: Integer read FGracefulTimeoutMs write FGracefulTimeoutMs;
     procedure Initialize; override;
     procedure Shutdown; override;
   end;
@@ -91,6 +100,7 @@ constructor TVDRX_SocketListenerExecutive.Create(ABus: TVDRX_MessageQueue);
 begin
   inherited Create(ABus);
   FBacklog := 16;
+  FGracefulTimeoutMs := 5000;
   FCriticalSection := TCriticalSection.Create;
   FActiveConnections := TList.Create;
 end;
@@ -262,21 +272,26 @@ begin
   if FTLSSocket <> 0 then
     CloseSocket(FTLSSocket);
 
-  // 2. Join accept threads
+  // 2. Join accept threads (bounded - these should return almost immediately
+  // once their listen socket is closed above).
   if Assigned(FPlainThread) then
   begin
-    FPlainThread.WaitFor;
-    FPlainThread.Free;
+    if WaitThreadOrTimeout(FPlainThread, FGracefulTimeoutMs) then
+      FPlainThread.Free
+    else
+      Bus.Publish('log.warn', ID + ': plain accept thread did not exit in time - abandoning it', ID);
     FPlainThread := nil;
   end;
   if Assigned(FTLSThread) then
   begin
-    FTLSThread.WaitFor;
-    FTLSThread.Free;
+    if WaitThreadOrTimeout(FTLSThread, FGracefulTimeoutMs) then
+      FTLSThread.Free
+    else
+      Bus.Publish('log.warn', ID + ': TLS accept thread did not exit in time - abandoning it', ID);
     FTLSThread := nil;
   end;
 
-  // 3. Make a thread-safe snapshot of active connection threads to join
+  // 3. Thread-safe snapshot of active connection threads to close
   FCriticalSection.Acquire;
   try
     CopyList := TList.Create;
@@ -289,8 +304,23 @@ begin
     for I := 0 to CopyList.Count - 1 do
     begin
       ConnThread := TVDRX_ListenerConnThread(CopyList[I]);
-      ConnThread.WaitFor;
-      ConnThread.Free;
+      // First give it FGracefulTimeoutMs to notice FStopping/EOF and exit on
+      // its own; if it doesn't, force its transport closed - that unblocks a
+      // blocking Read/Write (a connection idling on a client that never
+      // sends/disconnects, the classic hang case) and lets HandleConnection
+      // return. Give it one more short window after that before giving up.
+      if not WaitThreadOrTimeout(ConnThread, FGracefulTimeoutMs) then
+      begin
+        Bus.Publish('log.warn', ID + ': connection thread did not exit in time - forcing its socket closed', ID);
+        try ConnThread.Transport.Close; except end;
+      end;
+      if WaitThreadOrTimeout(ConnThread, FGracefulTimeoutMs) then
+        ConnThread.Free
+      else
+        // Genuinely stuck even after a forced close (shouldn't happen) -
+        // abandon it rather than risk freeing an object a live thread is
+        // still touching.
+        Bus.Publish('log.warn', ID + ': connection thread still stuck after forcing its socket closed - abandoning it', ID);
     end;
   finally
     CopyList.Free;

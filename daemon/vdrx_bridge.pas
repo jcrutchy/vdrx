@@ -5,7 +5,7 @@ unit vdrx_bridge;
 interface
 
 uses
-  Classes, SysUtils, SyncObjs, Process, fpjson, vdrx_core;
+  Classes, SysUtils, SyncObjs, Process, fpjson, vdrx_core, vdrx_procutil;
 
 type
 
@@ -22,6 +22,8 @@ type
     FMonitorThread: TThread;
     FRestartDelayMs: Integer;
     FMaxRestartDelayMs: Integer;
+    FGracefulTimeoutMs: Integer; // how long StopProcess waits for a clean exit
+                                  // before escalating to a forced kill
     FStopping: Boolean;
     FIRCChannel: string;  // '' = disabled (default) - relay-out target channel, e.g. '#general'
     FIRCFromName: string; // display nick/user for relayed lines
@@ -39,6 +41,19 @@ type
     // that's the default, so existing non-IRC uses of Bridge are unaffected.
     property IRCChannel: string read FIRCChannel write FIRCChannel;
     property IRCFromName: string read FIRCFromName write FIRCFromName;
+    // How long to wait for the child to exit cleanly (after CloseInput + SIGTERM
+    // on Unix) before force-killing it. Defaults to 5000ms; set from
+    // vdrx_daemon.conf's top-level "shutdown_grace_ms" in vdrx_daemon.lpr.
+    property GracefulTimeoutMs: Integer read FGracefulTimeoutMs write FGracefulTimeoutMs;
+    // Current child PID, or 0 if no process is currently running - used by
+    // vdrx_admin.pas's 'sys.kill' to find "which bridge owns this PID".
+    function CurrentPID: Integer;
+    // Force a graceful-then-kill of just the current child process. The Bridge
+    // executive itself is untouched, so MonitorLoop notices within ~1s and
+    // restarts it (normal crash-recovery path) - this is a "restart this one
+    // stuck process" operation, not a "remove this Bridge" operation (use
+    // sys.kill with this executive's ID, or sys.killall, for that instead).
+    procedure KillCurrentProcess;
     procedure Initialize; override;
     procedure Shutdown; override;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
@@ -54,6 +69,7 @@ begin
   FProcessLock := TCriticalSection.Create;
   FRestartDelayMs := 500;
   FMaxRestartDelayMs := 30000;
+  FGracefulTimeoutMs := 5000;
   FStopping := False;
   FIRCFromName := 'bridge';
 end;
@@ -80,28 +96,62 @@ begin
   FReaderThread.Start;
 end;
 
+// Graceful-then-kill: closes stdin (an EOF hint some children, especially on
+// Windows, exit on by themselves), sends SIGTERM on Unix, waits up to
+// FGracefulTimeoutMs for the process to actually exit, and only then
+// force-kills it (SIGKILL on Unix, 'taskkill /T /F' on Windows - see
+// vdrx_procutil.pas). The reader thread is given the same grace window to
+// notice EOF and exit on its own before being abandoned (never freed while
+// possibly still touching a live handle - see comment below).
 procedure TVDRX_BridgeExecutive.StopProcess;
+var
+  Proc: TProcess;
+  ReaderThread: TThread;
 begin
   FProcessLock.Enter;
   try
-    if Assigned(FProcess) then
-    begin
-      try
-        if FProcess.Running then
-          FProcess.Terminate(0); // unblocks the reader thread's blocking read via EOF
-      except
-      end;
-      FProcess.Free;
-      FProcess := nil;
-    end;
+    Proc := FProcess;
+    FProcess := nil; // detach immediately - a concurrent StopProcess call (e.g.
+                      // MonitorLoop racing an admin sys.kill by PID) then sees
+                      // nil and exits below without double-freeing anything
+    ReaderThread := FReaderThread;
+    FReaderThread := nil;
   finally
     FProcessLock.Leave;
   end;
-  if Assigned(FReaderThread) then
+
+  if not Assigned(Proc) then Exit;
+
+  try
+    if Proc.Running then
+    begin
+      try Proc.CloseInput; except end; // EOF hint - see unit comment
+      TryGracefulTerminate(Proc);      // SIGTERM on Unix; no-op on Windows
+      if not WaitProcessOrTimeout(Proc, FGracefulTimeoutMs) then
+      begin
+        Bus.Publish('log.warn', Format('bridge %s: process pid %d did not exit within %dms, force-killing',
+          [ID, Proc.ProcessID, FGracefulTimeoutMs]), ID);
+        ForceKillProcess(Proc);
+      end;
+    end;
+  except
+  end;
+
+  // The reader thread's blocking Read should unblock once the process (and
+  // its pipes) are actually gone. Give it one more short window before
+  // deciding it's genuinely stuck.
+  if WaitThreadOrTimeout(ReaderThread, FGracefulTimeoutMs) then
   begin
-    FReaderThread.WaitFor;
-    FReaderThread.Free;
-    FReaderThread := nil;
+    if Assigned(ReaderThread) then ReaderThread.Free;
+    Proc.Free;
+  end
+  else
+  begin
+    // Truly stuck (shouldn't happen once the process is confirmed dead) -
+    // abandon both rather than risk freeing objects a live thread might
+    // still be touching. Leaks this one instance; logged loudly so it's
+    // visible rather than silently swallowed.
+    Bus.Publish('log.warn', Format('bridge %s: reader thread did not exit - abandoning it to avoid a crash', [ID]), ID);
   end;
 end;
 
@@ -173,6 +223,24 @@ begin
   end;
 end;
 
+function TVDRX_BridgeExecutive.CurrentPID: Integer;
+begin
+  FProcessLock.Enter;
+  try
+    if Assigned(FProcess) and FProcess.Running then
+      Result := FProcess.ProcessID
+    else
+      Result := 0;
+  finally
+    FProcessLock.Leave;
+  end;
+end;
+
+procedure TVDRX_BridgeExecutive.KillCurrentProcess;
+begin
+  StopProcess; // MonitorLoop notices FProcess is gone within ~1s and restarts it
+end;
+
 procedure TVDRX_BridgeExecutive.Initialize;
 begin
   FStopping := False;
@@ -188,8 +256,10 @@ begin
   StopProcess;
   if Assigned(FMonitorThread) then
   begin
-    FMonitorThread.WaitFor;
-    FMonitorThread.Free;
+    if WaitThreadOrTimeout(FMonitorThread, FGracefulTimeoutMs) then
+      FMonitorThread.Free
+    else
+      Bus.Publish('log.warn', 'bridge ' + ID + ': monitor thread did not exit in time - abandoning it', ID);
     FMonitorThread := nil;
   end;
 end;

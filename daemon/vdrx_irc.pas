@@ -6,7 +6,7 @@ interface
 
 uses
   Classes, SysUtils, Sockets, SyncObjs, StrUtils, fpjson, jsonparser,
-  vdrx_core, vdrx_socketlistener, vdrx_transport, vdrx_config;
+  vdrx_core, vdrx_socketlistener, vdrx_transport, vdrx_config, vdrx_admincmd;
 
 type
   TVDRX_IRCDExecutive = class;
@@ -349,6 +349,11 @@ begin
     SendNumeric('442', ATarget + ' :You''re not on that channel');
     Exit;
   end;
+  // Not authenticated - any user in the channel can quit/restart/kill the
+  // daemon this way. Matches vdrx_admincmd.pas's stdin behavior; fine for
+  // now, same "not secure yet" bar as the rest of the daemon.
+  if (Length(AText) > 1) and (AText[1] = '!') then
+    DispatchAdminCommandLine(Bus, ID, Copy(AText, 2, MaxInt));
   Payload := Format('{"kind":"privmsg","from":%s,"user":%s,"text":%s}', [JEsc(FNick), JEsc(FUser), JEsc(AText)]);
   Bus.Publish(ChannelTopic(ATarget), Payload, ID);
 end;

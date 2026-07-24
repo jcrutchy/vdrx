@@ -120,10 +120,18 @@ type
     // leave a single topic without losing its other subscriptions, e.g. an IRC
     // connection PARTing one channel while staying in others.
     procedure UnregisterFilter(const AID, AFilter: string);
-    // Drops every filter subscription for AID AND destroys the executive (owning
-    // map). Use when the executive itself is going away, not just its subscriptions.
+    // Drops every filter subscription for AID, calls the executive's Shutdown
+    // (threads/child processes torn down here), THEN destroys it (owning map).
+    // Use when the executive itself is going away, not just its subscriptions -
+    // this is what 'sys.kill'/'sys.killall' (see vdrx_admin.pas) actually call.
     procedure Unregister(const AID: string);
+    // Thread-safe lookup without taking ownership - used by admin kill-by-id.
+    function Find(const AID: string): TVDRX_Executive;
     function GetSubscribers(const ATopic: string): TVDRX_ExecList;
+    // Caller-owned copy of every currently-registered executive (references only,
+    // doesn't affect ownership) - used by admin kill-by-pid/killall to enumerate
+    // without holding the lock while doing potentially slow work per executive.
+    function Snapshot: TVDRX_ExecList;
     procedure InitializeAll;
     procedure ShutdownAll;
     procedure ApplyAllConfigs;
@@ -135,6 +143,7 @@ type
   private
     FQueue: TVDRX_MessageQueue;
     FRegistry: TVDRX_Registry;
+    FRestartRequested: Boolean;
   protected
     procedure Execute; override;
   public
@@ -144,6 +153,10 @@ type
   public
     property Queue: TVDRX_MessageQueue read FQueue;
     property Registry: TVDRX_Registry read FRegistry;
+    // Set by TVDRX_AdminExecutive when handling 'sys.restart', read by
+    // vdrx_daemon.lpr's main after Kernel.WaitFor returns, to decide whether
+    // to respawn a fresh instance of the daemon before this process exits.
+    property RestartRequested: Boolean read FRestartRequested write FRestartRequested;
   end;
 
 implementation
@@ -384,7 +397,34 @@ begin
     if not FMasterMap.TryGetValue(AID, Exec) then
       Exit;
     RemoveSubscriptionsUnlocked(Exec);
+  finally
+    FLock.Leave;
+  end;
+  // Shutdown deliberately runs outside FLock - it can block for a while
+  // (joining threads, waiting out a process's graceful-kill window before
+  // force-killing it) and must not stall Register/GetSubscribers/Find while
+  // it runs. Previously this method skipped Shutdown entirely and just let
+  // FMasterMap.Remove's destructor call run - which meant killing/unregistering
+  // a Bridge (or any executive holding a thread/child process) never actually
+  // stopped what it owned. Small race window here: a concurrent Register(AID,...)
+  // could re-add a *different* executive under AID before the Remove below runs,
+  // which would then be silently dropped - acceptable for now (nothing here is
+  // authenticated or under heavy concurrency yet, see vdrx_admincmd.pas).
+  Exec.Shutdown;
+  FLock.Enter;
+  try
     FMasterMap.Remove(AID); // owning map - this is what actually frees Exec
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TVDRX_Registry.Find(const AID: string): TVDRX_Executive;
+begin
+  FLock.Enter;
+  try
+    if not FMasterMap.TryGetValue(AID, Result) then
+      Result := nil;
   finally
     FLock.Leave;
   end;
@@ -414,66 +454,59 @@ begin
   end;
 end;
 
+function TVDRX_Registry.Snapshot: TVDRX_ExecList;
+begin
+  Result := TVDRX_ExecList.Create;
+  FLock.Enter;
+  try
+    Result.AddRange(FMasterMap.Values);
+  finally
+    FLock.Leave;
+  end;
+end;
+
 procedure TVDRX_Registry.InitializeAll;
 var
-  Snapshot: TVDRX_ExecList;
+  Snap: TVDRX_ExecList;
   Exec: TVDRX_Executive;
 begin
-  Snapshot := TVDRX_ExecList.Create;
+  Snap := Snapshot;
   try
-    FLock.Enter;
-    try
-      Snapshot.AddRange(FMasterMap.Values);
-    finally
-      FLock.Leave;
-    end;
     // Deliberately called outside FLock - Initialize can block for a while (binding
     // a socket, spawning a process) and must not stall Register/Unregister/
     // GetSubscribers while it runs.
-    for Exec in Snapshot do
+    for Exec in Snap do
       Exec.Initialize;
   finally
-    Snapshot.Free;
+    Snap.Free;
   end;
 end;
 
 procedure TVDRX_Registry.ShutdownAll;
 var
-  Snapshot: TVDRX_ExecList;
+  Snap: TVDRX_ExecList;
   Exec: TVDRX_Executive;
 begin
-  Snapshot := TVDRX_ExecList.Create;
+  Snap := Snapshot;
   try
-    FLock.Enter;
-    try
-      Snapshot.AddRange(FMasterMap.Values);
-    finally
-      FLock.Leave;
-    end;
-    for Exec in Snapshot do
+    for Exec in Snap do
       Exec.Shutdown;
   finally
-    Snapshot.Free;
+    Snap.Free;
   end;
 end;
 
 procedure TVDRX_Registry.ApplyAllConfigs;
 var
-  Snapshot: TVDRX_ExecList;
+  Snap: TVDRX_ExecList;
   Exec: TVDRX_Executive;
 begin
-  Snapshot := TVDRX_ExecList.Create;
+  Snap := Snapshot;
   try
-    FLock.Enter;
-    try
-      Snapshot.AddRange(FMasterMap.Values);
-    finally
-      FLock.Leave;
-    end;
-    for Exec in Snapshot do
+    for Exec in Snap do
       Exec.ApplyConfig;
   finally
-    Snapshot.Free;
+    Snap.Free;
   end;
 end;
 
@@ -485,6 +518,7 @@ begin
   FreeOnTerminate := False;
   FRegistry := TVDRX_Registry.Create;
   FQueue := TVDRX_MessageQueue.Create;
+  FRestartRequested := False;
 end;
 
 destructor TVDRX_Kernel.Destroy;
