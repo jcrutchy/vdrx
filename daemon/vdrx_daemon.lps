@@ -61,7 +61,9 @@
       </Unit>
       <Unit>
         <Filename Value="vdrx_socketlistener.pas"/>
+        <IsVisibleTab Value="True"/>
         <EditorIndex Value="8"/>
+        <CursorPos X="76" Y="22"/>
         <UsageCount Value="10"/>
         <Loaded Value="True"/>
       </Unit>
@@ -91,13 +93,30 @@
       </Unit>
       <Unit>
         <Filename Value="vdrx_whiteboard.pas"/>
-        <IsVisibleTab Value="True"/>
         <EditorIndex Value="13"/>
+        <CursorPos X="70" Y="18"/>
         <UsageCount Value="10"/>
         <Loaded Value="True"/>
       </Unit>
     </Units>
-    <JumpHistory HistoryIndex="-1"/>
+    <JumpHistory HistoryIndex="3">
+      <Position>
+        <Filename Value="vdrx_socketlistener.pas"/>
+        <Caret Line="87" Column="26" TopLine="76"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_socketlistener.pas"/>
+        <Caret Line="70" Column="15" TopLine="55"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_socketlistener.pas"/>
+        <Caret Line="212" Column="12" TopLine="207"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_socketlistener.pas"/>
+        <Caret Line="229" Column="33" TopLine="207"/>
+      </Position>
+    </JumpHistory>
     <RunParams>
       <FormatVersion Value="2"/>
       <Modes ActiveMode=""/>

@@ -1,4 +1,4 @@
-$outputFile = "vrdx_daemon_snapshot.txt"
+$outputFile = "vdrx_daemon_snapshot.txt"
 $excludeFolders = @("lib", ".git", "backup")
 
 "--- PROJECT STRUCTURE ---" | Set-Content -Path $outputFile -Encoding utf8
