@@ -1,38 +1,38 @@
-unit vrdx_admin;
+unit vdrx_admin;
 
 {$mode ObjFPC}{$H+}
 
 interface
 
 uses
-  Classes, SysUtils, vrdx_core, vrdx_config;
+  Classes, SysUtils, vdrx_core, vdrx_config;
 
 type
 
   // Listens on 'sys.reload'. Reloads the config file, then walks every registered
   // executive via Registry.ApplyAllConfigs so listener ports, log thresholds, etc.
   // all pick up the new values through the same virtual ApplyConfig hook.
-  TVRDX_AdminExecutive = class(TVRDX_Executive)
+  TVDRX_AdminExecutive = class(TVDRX_Executive)
   private
-    FConfig: TVRDX_Config;
-    FRegistry: TVRDX_Registry;
+    FConfig: TVDRX_Config;
+    FRegistry: TVDRX_Registry;
   public
-    constructor Create(ABus: TVRDX_MessageQueue; AConfig: TVRDX_Config;
-      ARegistry: TVRDX_Registry); reintroduce;
-    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    constructor Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config;
+      ARegistry: TVDRX_Registry); reintroduce;
+    procedure HandlePacket(const AMsg: TVDRX_Message); override;
   end;
 
 implementation
 
-constructor TVRDX_AdminExecutive.Create(ABus: TVRDX_MessageQueue;
-  AConfig: TVRDX_Config; ARegistry: TVRDX_Registry);
+constructor TVDRX_AdminExecutive.Create(ABus: TVDRX_MessageQueue;
+  AConfig: TVDRX_Config; ARegistry: TVDRX_Registry);
 begin
   inherited Create(ABus);
   FConfig := AConfig;
   FRegistry := ARegistry;
 end;
 
-procedure TVRDX_AdminExecutive.HandlePacket(const AMsg: TVRDX_Message);
+procedure TVDRX_AdminExecutive.HandlePacket(const AMsg: TVDRX_Message);
 begin
   if AMsg.Topic = 'sys.reload' then
   begin

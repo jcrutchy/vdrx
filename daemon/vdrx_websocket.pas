@@ -1,4 +1,4 @@
-unit vrdx_websocket;
+unit vdrx_websocket;
 
 {$mode ObjFPC}{$H+}
 
@@ -6,13 +6,13 @@ interface
 
 uses
   Classes, SysUtils, Sockets, SyncObjs, base64, sha1, fpjson, jsonparser,
-  vrdx_core, vrdx_socketlistener, vrdx_transport, vrdx_config;
+  vdrx_core, vdrx_socketlistener, vdrx_transport, vdrx_config;
 
 const
   WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
 type
-  TVRDX_WebSocketExecutive = class;
+  TVDRX_WebSocketExecutive = class;
 
   // One instance per live browser connection. Registers itself into the Registry
   // once auth succeeds, and can hold any number of active filters at once (each
@@ -21,11 +21,11 @@ type
   // straight to the socket, with no separate broadcast path anywhere in the kernel.
   // Deregisters itself on disconnect. Talks to FTransport rather than a raw socket,
   // so it works identically whether the browser connected plain (ws://) or TLS
-  // (wss://) - see TVRDX_SocketListenerExecutive/vrdx_transport.pas.
-  TVRDX_WSConnection = class(TVRDX_Executive)
+  // (wss://) - see TVDRX_SocketListenerExecutive/vdrx_transport.pas.
+  TVDRX_WSConnection = class(TVDRX_Executive)
   private
-    FListener: TVRDX_WebSocketExecutive;
-    FTransport: TVRDX_Transport;
+    FListener: TVDRX_WebSocketExecutive;
+    FTransport: TVDRX_Transport;
     FThread: TThread;
     FAuthenticated: Boolean;
     FSendLock: TCriticalSection;
@@ -35,29 +35,29 @@ type
     procedure SendFrame(const APayload: string; AOpcode: Byte = 1);
     procedure HandleRPC(const ALine: string);
   public
-    constructor Create(ABus: TVRDX_MessageQueue; AListener: TVRDX_WebSocketExecutive; ATransport: TVRDX_Transport);
+    constructor Create(ABus: TVDRX_MessageQueue; AListener: TVDRX_WebSocketExecutive; ATransport: TVDRX_Transport);
     destructor Destroy; override;
     property PendingRequest: string read FPendingRequest write FPendingRequest;
     procedure Initialize; override;
     procedure Shutdown; override;
-    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    procedure HandlePacket(const AMsg: TVDRX_Message); override;
     procedure RunLoop; // public: called from TWSConnThread below
     // Used by the combined HTTP/WS listener to decide, from bytes it already read,
     // whether a connection should be routed here instead of to plain HTTP.
     class function IsUpgradeRequest(const ARequest: string): Boolean;
   end;
 
-  TVRDX_WebSocketExecutive = class(TVRDX_SocketListenerExecutive)
+  TVDRX_WebSocketExecutive = class(TVDRX_SocketListenerExecutive)
   private
-    FConfig: TVRDX_Config;
-    FRegistry: TVRDX_Registry;
+    FConfig: TVDRX_Config;
+    FRegistry: TVDRX_Registry;
     FConnCounter: Integer;
   protected
-    procedure HandleConnection(ATransport: TVRDX_Transport); override;
+    procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
-    constructor Create(ABus: TVRDX_MessageQueue; AConfig: TVRDX_Config; ARegistry: TVRDX_Registry); reintroduce;
-    property Registry: TVRDX_Registry read FRegistry;
-    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    constructor Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config; ARegistry: TVDRX_Registry); reintroduce;
+    property Registry: TVDRX_Registry read FRegistry;
+    procedure HandlePacket(const AMsg: TVDRX_Message); override;
     procedure ApplyConfig; override;
     function NextConnID: string;
     // Constructs, registers, and launches a connection for a transport someone else
@@ -65,7 +65,7 @@ type
     // bytes already read off the wire (pass '' if none were - the connection will do
     // its own Read for the handshake). Used by our own HandleConnection and,
     // optionally, by a combined HTTP/WS listener sharing one port.
-    procedure AdoptConnection(ATransport: TVRDX_Transport; const AInitialRequest: string);
+    procedure AdoptConnection(ATransport: TVDRX_Transport; const AInitialRequest: string);
   end;
 
 implementation
@@ -88,19 +88,19 @@ begin
 end;
 
 type
-  // Same rationale as TVRDX_ListenerConnThread in vrdx_socketlistener.pas: a plain
+  // Same rationale as TVDRX_ListenerConnThread in vdrx_socketlistener.pas: a plain
   // TThread wrapper rather than an anonymous closure over a loop-local connection
   // value.
   TWSConnThread = class(TThread)
   private
-    FConn: TVRDX_WSConnection;
+    FConn: TVDRX_WSConnection;
   protected
     procedure Execute; override;
   public
-    constructor Create(AConn: TVRDX_WSConnection);
+    constructor Create(AConn: TVDRX_WSConnection);
   end;
 
-constructor TWSConnThread.Create(AConn: TVRDX_WSConnection);
+constructor TWSConnThread.Create(AConn: TVDRX_WSConnection);
 begin
   inherited Create(True);
   FConn := AConn;
@@ -112,9 +112,9 @@ begin
   FConn.RunLoop;
 end;
 
-{ TVRDX_WSConnection }
+{ TVDRX_WSConnection }
 
-constructor TVRDX_WSConnection.Create(ABus: TVRDX_MessageQueue; AListener: TVRDX_WebSocketExecutive; ATransport: TVRDX_Transport);
+constructor TVDRX_WSConnection.Create(ABus: TVDRX_MessageQueue; AListener: TVDRX_WebSocketExecutive; ATransport: TVDRX_Transport);
 begin
   inherited Create(ABus);
   FListener := AListener;
@@ -123,21 +123,21 @@ begin
   FAuthenticated := False;
 end;
 
-destructor TVRDX_WSConnection.Destroy;
+destructor TVDRX_WSConnection.Destroy;
 begin
   FTransport.Free;
   FSendLock.Free;
   inherited Destroy;
 end;
 
-class function TVRDX_WSConnection.IsUpgradeRequest(const ARequest: string): Boolean;
+class function TVDRX_WSConnection.IsUpgradeRequest(const ARequest: string): Boolean;
 begin
   // Cheap header sniff, not a full parse - good enough to route on before either
   // handler takes over the connection for real.
   Result := (Pos('Upgrade:', ARequest) > 0) and (Pos('websocket', LowerCase(ARequest)) > 0);
 end;
 
-function TVRDX_WSConnection.DoHandshake: Boolean;
+function TVDRX_WSConnection.DoHandshake: Boolean;
 var
   Buf: array[0..2047] of Byte;
   Received, i, tailLen: Integer;
@@ -168,7 +168,7 @@ end;
 
 // Unfragmented text frames only, up to 64KB payload - sufficient for the short
 // JSON-RPC control messages this bridge exchanges.
-function TVRDX_WSConnection.ReadFrame(out APayload: string; out AOpcode: Byte): Boolean;
+function TVDRX_WSConnection.ReadFrame(out APayload: string; out AOpcode: Byte): Boolean;
 var
   Hdr: array[0..1] of Byte;
   Ext: array[0..1] of Byte;
@@ -205,7 +205,7 @@ begin
   Result := True;
 end;
 
-procedure TVRDX_WSConnection.SendFrame(const APayload: string; AOpcode: Byte);
+procedure TVDRX_WSConnection.SendFrame(const APayload: string; AOpcode: Byte);
 var
   Hdr: array[0..3] of Byte;
   HdrLen: Integer;
@@ -234,7 +234,7 @@ begin
   end;
 end;
 
-procedure TVRDX_WSConnection.HandleRPC(const ALine: string);
+procedure TVDRX_WSConnection.HandleRPC(const ALine: string);
 var
   J: TJSONData;
   Obj: TJSONObject;
@@ -290,7 +290,7 @@ begin
   end;
 end;
 
-procedure TVRDX_WSConnection.RunLoop;
+procedure TVDRX_WSConnection.RunLoop;
 var
   Payload: string;
   Opcode: Byte;
@@ -304,13 +304,13 @@ begin
   FListener.Registry.Unregister(ID); // clean up on disconnect
 end;
 
-procedure TVRDX_WSConnection.Initialize;
+procedure TVDRX_WSConnection.Initialize;
 begin
   FThread := TWSConnThread.Create(Self);
   FThread.Start;
 end;
 
-procedure TVRDX_WSConnection.Shutdown;
+procedure TVDRX_WSConnection.Shutdown;
 begin
   FTransport.Close; // unblocks the blocking Read in RunLoop
   if Assigned(FThread) then
@@ -321,15 +321,15 @@ begin
   end;
 end;
 
-procedure TVRDX_WSConnection.HandlePacket(const AMsg: TVRDX_Message);
+procedure TVDRX_WSConnection.HandlePacket(const AMsg: TVDRX_Message);
 begin
   SendFrame(Format('{"topic":%s,"payload":%s,"source":%s,"seq":%d}',
     [JEsc(AMsg.Topic), AMsg.Payload, JEsc(AMsg.SourceID), AMsg.Seq]));
 end;
 
-{ TVRDX_WebSocketExecutive }
+{ TVDRX_WebSocketExecutive }
 
-constructor TVRDX_WebSocketExecutive.Create(ABus: TVRDX_MessageQueue; AConfig: TVRDX_Config; ARegistry: TVRDX_Registry);
+constructor TVDRX_WebSocketExecutive.Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config; ARegistry: TVDRX_Registry);
 begin
   inherited Create(ABus);
   FConfig := AConfig;
@@ -338,17 +338,17 @@ begin
   FConnCounter := 0;
 end;
 
-function TVRDX_WebSocketExecutive.NextConnID: string;
+function TVDRX_WebSocketExecutive.NextConnID: string;
 begin
   Inc(FConnCounter);
   Result := 'ws.conn.' + IntToStr(FConnCounter);
 end;
 
-procedure TVRDX_WebSocketExecutive.AdoptConnection(ATransport: TVRDX_Transport; const AInitialRequest: string);
+procedure TVDRX_WebSocketExecutive.AdoptConnection(ATransport: TVDRX_Transport; const AInitialRequest: string);
 var
-  Conn: TVRDX_WSConnection;
+  Conn: TVDRX_WSConnection;
 begin
-  Conn := TVRDX_WSConnection.Create(Bus, Self, ATransport);
+  Conn := TVDRX_WSConnection.Create(Bus, Self, ATransport);
   Conn.PendingRequest := AInitialRequest;
   // Registered with a non-matching placeholder filter until the client's own
   // 'subscribe' RPC re-registers it with something real.
@@ -356,18 +356,18 @@ begin
   Conn.Initialize;
 end;
 
-procedure TVRDX_WebSocketExecutive.HandleConnection(ATransport: TVRDX_Transport);
+procedure TVDRX_WebSocketExecutive.HandleConnection(ATransport: TVDRX_Transport);
 begin
   AdoptConnection(ATransport, ''); // no bytes pre-read - the connection does its own Read
 end;
 
-procedure TVRDX_WebSocketExecutive.HandlePacket(const AMsg: TVRDX_Message);
+procedure TVDRX_WebSocketExecutive.HandlePacket(const AMsg: TVDRX_Message);
 begin
-  // The listener itself isn't a message recipient - each TVRDX_WSConnection is.
+  // The listener itself isn't a message recipient - each TVDRX_WSConnection is.
 end;
 
-// Same restart-on-change pattern as TVRDX_IRCDExecutive.ApplyConfig.
-procedure TVRDX_WebSocketExecutive.ApplyConfig;
+// Same restart-on-change pattern as TVDRX_IRCDExecutive.ApplyConfig.
+procedure TVDRX_WebSocketExecutive.ApplyConfig;
 var
   NewPort, NewTLSPort: Integer;
   CertFile, KeyFile: string;

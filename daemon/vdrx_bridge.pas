@@ -1,19 +1,19 @@
-unit vrdx_bridge;
+unit vdrx_bridge;
 
 {$mode ObjFPC}{$H+}
 
 interface
 
 uses
-  Classes, SysUtils, SyncObjs, Process, fpjson, vrdx_core;
+  Classes, SysUtils, SyncObjs, Process, fpjson, vdrx_core;
 
 type
 
   // External-process manager. One instance per external process. Descends from
-  // TVRDX_Executive directly - not a special base class, just an executive that does
+  // TVDRX_Executive directly - not a special base class, just an executive that does
   // more work in its lifecycle hooks than most. Registry manages it exactly like any
   // other executive (register/unregister/Initialize/Shutdown), with no special-casing.
-  TVRDX_BridgeExecutive = class(TVRDX_Executive)
+  TVDRX_BridgeExecutive = class(TVDRX_Executive)
   private
     FCommand: string;
     FProcess: TProcess;
@@ -30,7 +30,7 @@ type
     procedure ReaderLoop;
     procedure MonitorLoop;
   public
-    constructor Create(ABus: TVRDX_MessageQueue); override;
+    constructor Create(ABus: TVDRX_MessageQueue); override;
     destructor Destroy; override;
     property Command: string read FCommand write FCommand;
     // Optional: set both to have every line the child process prints also show up
@@ -41,14 +41,14 @@ type
     property IRCFromName: string read FIRCFromName write FIRCFromName;
     procedure Initialize; override;
     procedure Shutdown; override;
-    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    procedure HandlePacket(const AMsg: TVDRX_Message); override;
   end;
 
 implementation
 
-{ TVRDX_BridgeExecutive }
+{ TVDRX_BridgeExecutive }
 
-constructor TVRDX_BridgeExecutive.Create(ABus: TVRDX_MessageQueue);
+constructor TVDRX_BridgeExecutive.Create(ABus: TVDRX_MessageQueue);
 begin
   inherited Create(ABus);
   FProcessLock := TCriticalSection.Create;
@@ -58,13 +58,13 @@ begin
   FIRCFromName := 'bridge';
 end;
 
-destructor TVRDX_BridgeExecutive.Destroy;
+destructor TVDRX_BridgeExecutive.Destroy;
 begin
   FProcessLock.Free;
   inherited Destroy;
 end;
 
-procedure TVRDX_BridgeExecutive.StartProcess;
+procedure TVDRX_BridgeExecutive.StartProcess;
 begin
   FProcessLock.Enter;
   try
@@ -75,12 +75,12 @@ begin
   finally
     FProcessLock.Leave;
   end;
-  FReaderThread := TVRDX_WorkerThread.Create(@ReaderLoop);
+  FReaderThread := TVDRX_WorkerThread.Create(@ReaderLoop);
   FReaderThread.FreeOnTerminate := False;
   FReaderThread.Start;
 end;
 
-procedure TVRDX_BridgeExecutive.StopProcess;
+procedure TVDRX_BridgeExecutive.StopProcess;
 begin
   FProcessLock.Enter;
   try
@@ -108,7 +108,7 @@ end;
 // Blocking char-by-char read, buffered until newline. Deliberately not using
 // NumBytesAvailable - not reliably present across FPC versions; a plain blocking
 // Read is simpler and fully portable.
-procedure TVRDX_BridgeExecutive.ReaderLoop;
+procedure TVDRX_BridgeExecutive.ReaderLoop;
 var
   Line, Buf: string;
   Ch: Char;
@@ -130,7 +130,7 @@ begin
         begin
           Bus.Publish(ID + '.out', Line, ID); // process output re-enters the bus, namespaced by this executive's ID
           if FIRCChannel <> '' then
-            // Same 'irc.<channel>.event' shape TVRDX_IRCConnection.HandlePacket already
+            // Same 'irc.<channel>.event' shape TVDRX_IRCConnection.HandlePacket already
             // understands - this is what closes the "!run ..." -> reply-in-channel loop.
             Bus.Publish('irc.' + FIRCChannel + '.event',
               Format('{"kind":"privmsg","from":%s,"user":%s,"text":%s}',
@@ -146,7 +146,7 @@ begin
   end;
 end;
 
-procedure TVRDX_BridgeExecutive.MonitorLoop;
+procedure TVDRX_BridgeExecutive.MonitorLoop;
 var
   NeedsRestart: Boolean;
 begin
@@ -173,16 +173,16 @@ begin
   end;
 end;
 
-procedure TVRDX_BridgeExecutive.Initialize;
+procedure TVDRX_BridgeExecutive.Initialize;
 begin
   FStopping := False;
   StartProcess;
-  FMonitorThread := TVRDX_WorkerThread.Create(@MonitorLoop);
+  FMonitorThread := TVDRX_WorkerThread.Create(@MonitorLoop);
   FMonitorThread.FreeOnTerminate := False;
   FMonitorThread.Start;
 end;
 
-procedure TVRDX_BridgeExecutive.Shutdown;
+procedure TVDRX_BridgeExecutive.Shutdown;
 begin
   FStopping := True;
   StopProcess;
@@ -194,7 +194,7 @@ begin
   end;
 end;
 
-procedure TVRDX_BridgeExecutive.HandlePacket(const AMsg: TVRDX_Message);
+procedure TVDRX_BridgeExecutive.HandlePacket(const AMsg: TVDRX_Message);
 var
   Line: string;
 begin

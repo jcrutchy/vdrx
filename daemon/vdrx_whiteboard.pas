@@ -1,11 +1,11 @@
-unit vrdx_whiteboard;
+unit vdrx_whiteboard;
 
 {$mode ObjFPC}{$H+}
 
 interface
 
 uses
-  Classes, SysUtils, SyncObjs, fpjson, jsonparser, vrdx_core;
+  Classes, SysUtils, SyncObjs, fpjson, jsonparser, vdrx_core;
 
 type
   // Subscribes 'wb.>'. HandlePacket applies a delta, persists the board to disk,
@@ -20,7 +20,7 @@ type
   // after a restart (cold-start hydration) - deliberately simple (no incremental
   // append-log, no compaction) since board sizes here are small; revisit if that
   // stops being true.
-  TVRDX_WhiteboardExecutive = class(TVRDX_Executive)
+  TVDRX_WhiteboardExecutive = class(TVDRX_Executive)
   private
     FLock: TCriticalSection;
     FBoards: TStringList; // board name -> TJSONObject, owned
@@ -31,15 +31,15 @@ type
     function GetBoard(const ABoardName: string): TJSONObject;
     procedure ApplyDelta(const ABoardName: string; ADelta: TJSONObject);
   public
-    constructor Create(ABus: TVRDX_MessageQueue; const ADataDir: string); reintroduce;
+    constructor Create(ABus: TVDRX_MessageQueue; const ADataDir: string); reintroduce;
     destructor Destroy; override;
-    procedure HandlePacket(const AMsg: TVRDX_Message); override;
-    function GetBoardSnapshot(const ABoardName: string): string; // thread-safe synchronous read, for TVRDX_HTTPExecutive
+    procedure HandlePacket(const AMsg: TVDRX_Message); override;
+    function GetBoardSnapshot(const ABoardName: string): string; // thread-safe synchronous read, for TVDRX_HTTPExecutive
   end;
 
 implementation
 
-constructor TVRDX_WhiteboardExecutive.Create(ABus: TVRDX_MessageQueue; const ADataDir: string);
+constructor TVDRX_WhiteboardExecutive.Create(ABus: TVDRX_MessageQueue; const ADataDir: string);
 begin
   inherited Create(ABus);
   FLock := TCriticalSection.Create;
@@ -48,18 +48,18 @@ begin
   if ADataDir <> '' then
     FDataDir := ADataDir
   else
-    FDataDir := 'vrdx_data' + PathDelim + 'whiteboard';
+    FDataDir := 'vdrx_data' + PathDelim + 'whiteboard';
   ForceDirectories(FDataDir);
 end;
 
-destructor TVRDX_WhiteboardExecutive.Destroy;
+destructor TVDRX_WhiteboardExecutive.Destroy;
 begin
   FBoards.Free;
   FLock.Free;
   inherited Destroy;
 end;
 
-function TVRDX_WhiteboardExecutive.BoardFilePath(const ABoardName: string): string;
+function TVDRX_WhiteboardExecutive.BoardFilePath(const ABoardName: string): string;
 begin
   // Board names come from the topic ('wb.<board>.delta'), not arbitrary user input
   // over the wire, so no path-traversal sanitising here - revisit if that stops
@@ -67,7 +67,7 @@ begin
   Result := IncludeTrailingPathDelimiter(FDataDir) + ABoardName + '.json';
 end;
 
-procedure TVRDX_WhiteboardExecutive.SaveBoardToDisk(const ABoardName: string; ABoard: TJSONObject);
+procedure TVDRX_WhiteboardExecutive.SaveBoardToDisk(const ABoardName: string; ABoard: TJSONObject);
 var
   SL: TStringList;
 begin
@@ -80,7 +80,7 @@ begin
   end;
 end;
 
-function TVRDX_WhiteboardExecutive.LoadBoardFromDisk(const ABoardName: string): TJSONObject;
+function TVDRX_WhiteboardExecutive.LoadBoardFromDisk(const ABoardName: string): TJSONObject;
 var
   SL: TStringList;
   J: TJSONData;
@@ -106,7 +106,7 @@ begin
   end;
 end;
 
-function TVRDX_WhiteboardExecutive.GetBoard(const ABoardName: string): TJSONObject;
+function TVDRX_WhiteboardExecutive.GetBoard(const ABoardName: string): TJSONObject;
 var
   idx: Integer;
 begin
@@ -124,7 +124,7 @@ begin
   FBoards.AddObject(ABoardName, Result);
 end;
 
-procedure TVRDX_WhiteboardExecutive.ApplyDelta(const ABoardName: string; ADelta: TJSONObject);
+procedure TVDRX_WhiteboardExecutive.ApplyDelta(const ABoardName: string; ADelta: TJSONObject);
 var
   Board: TJSONObject;
   Op: string;
@@ -145,7 +145,7 @@ begin
   SaveBoardToDisk(ABoardName, Board);
 end;
 
-procedure TVRDX_WhiteboardExecutive.HandlePacket(const AMsg: TVRDX_Message);
+procedure TVDRX_WhiteboardExecutive.HandlePacket(const AMsg: TVDRX_Message);
 var
   Parts: TStringArray;
   BoardName: string;
@@ -182,7 +182,7 @@ begin
   end;
 end;
 
-function TVRDX_WhiteboardExecutive.GetBoardSnapshot(const ABoardName: string): string;
+function TVDRX_WhiteboardExecutive.GetBoardSnapshot(const ABoardName: string): string;
 begin
   FLock.Enter;
   try

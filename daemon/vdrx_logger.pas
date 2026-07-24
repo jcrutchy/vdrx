@@ -1,11 +1,11 @@
-unit vrdx_logger;
+unit vdrx_logger;
 
 {$mode ObjFPC}{$H+}
 
 interface
 
 uses
-  Classes, SysUtils, vrdx_core;
+  Classes, SysUtils, vdrx_core;
 
 // ANSI Color Constants
 const
@@ -17,7 +17,7 @@ const
 type
   TLogLevel = (lvlINFO, lvlWARN, lvlERROR);
 
-  TVRDX_LoggerExecutive = class(TVRDX_Executive)
+  TVDRX_LoggerExecutive = class(TVDRX_Executive)
   private
     FFileStream: TFileStream;
     FThreshold: TLogLevel;
@@ -25,15 +25,15 @@ type
     function LevelName(ALevel: TLogLevel): string;
     function LevelColor(ALevel: TLogLevel): string;
   public
-    constructor Create(ABus: TVRDX_MessageQueue; const APath: string;
+    constructor Create(ABus: TVDRX_MessageQueue; const APath: string;
       ALevel: TLogLevel); reintroduce;
     destructor Destroy; override;
-    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    procedure HandlePacket(const AMsg: TVDRX_Message); override;
   end;
 
 implementation
 
-constructor TVRDX_LoggerExecutive.Create(ABus: TVRDX_MessageQueue;
+constructor TVDRX_LoggerExecutive.Create(ABus: TVDRX_MessageQueue;
   const APath: string; ALevel: TLogLevel);
 begin
   inherited Create(ABus);
@@ -47,13 +47,13 @@ begin
   FFileStream.Seek(0, soEnd);
 end;
 
-destructor TVRDX_LoggerExecutive.Destroy;
+destructor TVDRX_LoggerExecutive.Destroy;
 begin
   FFileStream.Free;
   inherited;
 end;
 
-function TVRDX_LoggerExecutive.LevelOf(const ATopic: string): TLogLevel;
+function TVDRX_LoggerExecutive.LevelOf(const ATopic: string): TLogLevel;
 begin
   if ATopic = 'log.error' then
     Result := lvlERROR
@@ -63,7 +63,7 @@ begin
     Result := lvlINFO;
 end;
 
-function TVRDX_LoggerExecutive.LevelName(ALevel: TLogLevel): string;
+function TVDRX_LoggerExecutive.LevelName(ALevel: TLogLevel): string;
 begin
   case ALevel of
     lvlERROR: Result := 'ERROR';
@@ -73,7 +73,7 @@ begin
   end;
 end;
 
-function TVRDX_LoggerExecutive.LevelColor(ALevel: TLogLevel): string;
+function TVDRX_LoggerExecutive.LevelColor(ALevel: TLogLevel): string;
 begin
   case ALevel of
     lvlERROR: Result := CLR_ERROR;
@@ -83,7 +83,7 @@ begin
   end;
 end;
 
-procedure TVRDX_LoggerExecutive.HandlePacket(const AMsg: TVRDX_Message);
+procedure TVDRX_LoggerExecutive.HandlePacket(const AMsg: TVDRX_Message);
 var
   Level: TLogLevel;
   Stamp, FileLine, ConsoleLine: string;

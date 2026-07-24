@@ -25,28 +25,33 @@
     </RunParams>
     <Units>
       <Unit>
-        <Filename Value="vrdx_daemon.lpr"/>
+        <Filename Value="vdrx_daemon.lpr"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="vrdx_core.pas"/>
+        <Filename Value="vdrx_core.pas"/>
         <IsPartOfProject Value="True"/>
+        <UnitName Value="vdrx_core"/>
       </Unit>
       <Unit>
-        <Filename Value="vrdx_irc.pas"/>
+        <Filename Value="vdrx_irc.pas"/>
         <IsPartOfProject Value="True"/>
+        <UnitName Value="vdrx_irc"/>
       </Unit>
       <Unit>
-        <Filename Value="vrdx_logger.pas"/>
+        <Filename Value="vdrx_logger.pas"/>
         <IsPartOfProject Value="True"/>
+        <UnitName Value="vdrx_logger"/>
       </Unit>
       <Unit>
-        <Filename Value="vrdx_config.pas"/>
+        <Filename Value="vdrx_config.pas"/>
         <IsPartOfProject Value="True"/>
+        <UnitName Value="vdrx_config"/>
       </Unit>
       <Unit>
-        <Filename Value="vrdx_admin.pas"/>
+        <Filename Value="vdrx_admin.pas"/>
         <IsPartOfProject Value="True"/>
+        <UnitName Value="vdrx_admin"/>
       </Unit>
     </Units>
   </ProjectOptions>
@@ -54,7 +59,7 @@
     <Version Value="11"/>
     <PathDelim Value="\"/>
     <Target>
-      <Filename Value="vrdx_daemon"/>
+      <Filename Value="vdrx_daemon"/>
     </Target>
     <SearchPaths>
       <IncludeFiles Value="$(ProjOutDir)"/>

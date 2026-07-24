@@ -1,35 +1,45 @@
-unit vrdx_irc;
+unit vdrx_irc;
 
 {$mode ObjFPC}{$H+}
 
 interface
 
 uses
-  Classes, SysUtils, Sockets, StrUtils, fpjson, jsonparser,
-  vrdx_core, vrdx_socketlistener, vrdx_transport, vrdx_config;
+  Classes, SysUtils, Sockets, SyncObjs, StrUtils, fpjson, jsonparser,
+  vdrx_core, vdrx_socketlistener, vdrx_transport, vdrx_config;
 
 type
-  TVRDX_IRCDExecutive = class;
+  TVDRX_IRCDExecutive = class;
 
   // One instance per live HexChat/IRC connection. Talks to FTransport rather than a
   // raw socket, so it works identically whether the client connected plain (6667)
-  // or TLS/ircs (6697 by convention) - see TVRDX_SocketListenerExecutive and
-  // vrdx_transport.pas. Each connection is a proper registered TVRDX_Executive
-  // (same pattern as TVRDX_WSConnection) - that's what lets channel members
+  // or TLS/ircs (6697 by convention) - see TVDRX_SocketListenerExecutive and
+  // vdrx_transport.pas. Each connection is a proper registered TVDRX_Executive
+  // (same pattern as TVDRX_WSConnection) - that's what lets channel members
   // actually see each other: JOIN/PART/QUIT/PRIVMSG all go out onto the bus under
   // 'irc.<channel>.event', every other connection subscribed to that channel's
   // filter gets HandlePacket called, and relays the line to its own connection. No
   // direct socket-to-socket fan-out anywhere - it's all ordinary bus routing.
-  TVRDX_IRCConnection = class(TVRDX_Executive)
+  TVDRX_IRCConnection = class(TVDRX_Executive)
   private
-    FListener: TVRDX_IRCDExecutive;
-    FTransport: TVRDX_Transport;
+    FListener: TVDRX_IRCDExecutive;
+    FTransport: TVDRX_Transport;
     FThread: TThread;
+    FSendLock: TCriticalSection; // SendLine is called from both this connection's own
+                                  // read thread AND HandlePacket (on the Kernel's
+                                  // dispatch thread whenever a channel event arrives) -
+                                  // without this, concurrent writes to the same
+                                  // socket/SSL object interleave and corrupt the
+                                  // stream. See vdrx_websocket.pas's FSendLock for the
+                                  // same fix, already in place there.
     FNick: string;
     FUser: string;
     FRealname: string;
     FRegistered: Boolean; // NICK + USER both seen, welcome burst sent
     FChannels: TStringList; // channels this connection has JOINed, as typed (e.g. '#general')
+    FAwaitingPong: Boolean;
+    FLastPingSent: TDateTime;
+    FLastActivity: TDateTime;
     function HostMask: string;
     procedure SendLine(const S: string);
     procedure SendNumeric(const ANumeric, AParams: string);
@@ -44,36 +54,36 @@ type
     procedure DoQuitAllChannels(const AReason: string);
     procedure SendNames(const AChannel: string);
   public
-    constructor Create(ABus: TVRDX_MessageQueue; AListener: TVRDX_IRCDExecutive; ATransport: TVRDX_Transport);
+    constructor Create(ABus: TVDRX_MessageQueue; AListener: TVDRX_IRCDExecutive; ATransport: TVDRX_Transport);
     destructor Destroy; override;
     property Nick: string read FNick;
     procedure Initialize; override;
     procedure Shutdown; override;
-    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    procedure HandlePacket(const AMsg: TVDRX_Message); override;
     procedure RunLoop; // public: called from TIRCConnThread below
   end;
 
   // IRCD, not an IRC client - VDRX binds 6667 (and optionally 6697 for TLS) and
   // HexChat connects to it. Accept loop, per-connection threading, and plain-vs-TLS
-  // transport selection all come from TVRDX_SocketListenerExecutive; this unit
-  // hands each accepted connection off to a long-lived TVRDX_IRCConnection
-  // (AdoptConnection-style, matching vrdx_websocket.pas) rather than handling the
+  // transport selection all come from TVDRX_SocketListenerExecutive; this unit
+  // hands each accepted connection off to a long-lived TVDRX_IRCConnection
+  // (AdoptConnection-style, matching vdrx_websocket.pas) rather than handling the
   // protocol inline in HandleConnection.
-  TVRDX_IRCDExecutive = class(TVRDX_SocketListenerExecutive)
+  TVDRX_IRCDExecutive = class(TVDRX_SocketListenerExecutive)
   private
-    FConfig: TVRDX_Config;
-    FRegistry: TVRDX_Registry;
+    FConfig: TVDRX_Config;
+    FRegistry: TVDRX_Registry;
     FConnCounter: Integer;
     FTopicLock: TObject; // guards FTopics - declared TObject to avoid an extra uses dependency; cast at use
     FTopics: TStringList; // channel name -> topic string, shared across all connections
   protected
-    procedure HandleConnection(ATransport: TVRDX_Transport); override;
+    procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
-    constructor Create(ABus: TVRDX_MessageQueue; AConfig: TVRDX_Config; ARegistry: TVRDX_Registry); reintroduce;
+    constructor Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config; ARegistry: TVDRX_Registry); reintroduce;
     destructor Destroy; override;
-    property Config: TVRDX_Config read FConfig;
-    property Registry: TVRDX_Registry read FRegistry;
-    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    property Config: TVDRX_Config read FConfig;
+    property Registry: TVDRX_Registry read FRegistry;
+    procedure HandlePacket(const AMsg: TVDRX_Message); override;
     function NextConnID: string;
     function GetTopic(const AChannel: string): string;
     procedure SetTopic(const AChannel, ATopic: string);
@@ -81,9 +91,6 @@ type
   end;
 
 implementation
-
-uses
-  SyncObjs;
 
 function JEsc(const S: string): string;
 begin
@@ -141,18 +148,18 @@ begin
 end;
 
 type
-  // Same rationale as TVRDX_ListenerConnThread/TWSConnThread: a plain TThread
+  // Same rationale as TVDRX_ListenerConnThread/TWSConnThread: a plain TThread
   // wrapper rather than an anonymous closure over a loop-local connection value.
   TIRCConnThread = class(TThread)
   private
-    FConn: TVRDX_IRCConnection;
+    FConn: TVDRX_IRCConnection;
   protected
     procedure Execute; override;
   public
-    constructor Create(AConn: TVRDX_IRCConnection);
+    constructor Create(AConn: TVDRX_IRCConnection);
   end;
 
-constructor TIRCConnThread.Create(AConn: TVRDX_IRCConnection);
+constructor TIRCConnThread.Create(AConn: TVDRX_IRCConnection);
 begin
   inherited Create(True);
   FConn := AConn;
@@ -164,48 +171,56 @@ begin
   FConn.RunLoop;
 end;
 
-{ TVRDX_IRCConnection }
+{ TVDRX_IRCConnection }
 
-constructor TVRDX_IRCConnection.Create(ABus: TVRDX_MessageQueue; AListener: TVRDX_IRCDExecutive; ATransport: TVRDX_Transport);
+constructor TVDRX_IRCConnection.Create(ABus: TVDRX_MessageQueue; AListener: TVDRX_IRCDExecutive; ATransport: TVDRX_Transport);
 begin
   inherited Create(ABus);
   FListener := AListener;
   FTransport := ATransport;
+  FSendLock := TCriticalSection.Create;
   FNick := '*';
   FChannels := TStringList.Create;
   FChannels.CaseSensitive := False;
   FChannels.Duplicates := dupIgnore;
 end;
 
-destructor TVRDX_IRCConnection.Destroy;
+destructor TVDRX_IRCConnection.Destroy;
 begin
   FChannels.Free;
   FTransport.Free;
+  FSendLock.Free;
   inherited Destroy;
 end;
 
-function TVRDX_IRCConnection.HostMask: string;
+function TVDRX_IRCConnection.HostMask: string;
 begin
-  Result := FNick + '!' + LowerCase(FUser) + '@vrdx';
+  Result := FNick + '!' + LowerCase(FUser) + '@vdrx';
 end;
 
-procedure TVRDX_IRCConnection.SendLine(const S: string);
+procedure TVDRX_IRCConnection.SendLine(const S: string);
 var
   B: string;
 begin
   B := S + #13#10;
-  FTransport.Write(B[1], Length(B));
+  FSendLock.Enter;
+  try
+    FTransport.Write(B[1], Length(B));
+    Bus.Publish('log.TVDRX_IRCConnection.SendLine', S, ID);
+  finally
+    FSendLock.Leave;
+  end;
 end;
 
 // Numerics always look like ":server NNN nick <params>" - centralising this means
 // every reply below is one line instead of a hand-built Format call.
-procedure TVRDX_IRCConnection.SendNumeric(const ANumeric, AParams: string);
+procedure TVDRX_IRCConnection.SendNumeric(const ANumeric, AParams: string);
 begin
-  SendLine(':' + FListener.Config.GetString('executives.ircd.servername', 'vrdx') +
+  SendLine(':' + FListener.Config.GetString('executives.ircd.servername', 'vdrx') +
     ' ' + ANumeric + ' ' + FNick + ' ' + AParams);
 end;
 
-procedure TVRDX_IRCConnection.MaybeCompleteRegistration;
+procedure TVDRX_IRCConnection.MaybeCompleteRegistration;
 begin
   if FRegistered then Exit;
   if (FNick = '') or (FNick = '*') or (FUser = '') then Exit;
@@ -215,19 +230,19 @@ begin
   Bus.Publish('log.info', 'IRC client registered: ' + FNick, ID);
 end;
 
-procedure TVRDX_IRCConnection.SendWelcomeBurst;
+procedure TVDRX_IRCConnection.SendWelcomeBurst;
 var
   ServerName, Network: string;
 begin
-  ServerName := FListener.Config.GetString('executives.ircd.servername', 'vrdx');
+  ServerName := FListener.Config.GetString('executives.ircd.servername', 'vdrx');
   Network := FListener.Config.GetString('executives.ircd.network', 'VDRX');
   SendNumeric('001', ':Welcome to ' + Network + ', ' + FNick + '!' + HostMask);
   SendNumeric('002', ':Your host is ' + ServerName + ', running VDRX IRCD');
   SendNumeric('003', ':This server was started by VDRX');
-  SendNumeric('004', ServerName + ' vrdx-0.1 o o');
+  SendNumeric('004', ServerName + ' vdrx-0.1 o o');
 end;
 
-procedure TVRDX_IRCConnection.SendMotd;
+procedure TVDRX_IRCConnection.SendMotd;
 var
   Lines: TStringArray;
   i: Integer;
@@ -244,20 +259,20 @@ begin
   SendNumeric('376', ':End of /MOTD command.');
 end;
 
-procedure TVRDX_IRCConnection.SendNames(const AChannel: string);
+procedure TVDRX_IRCConnection.SendNames(const AChannel: string);
 var
-  Subscribers: TVRDX_ExecList;
-  Exec: TVRDX_Executive;
+  Subscribers: TVDRX_ExecList;
+  Exec: TVDRX_Executive;
   Names: string;
 begin
   Names := '';
   Subscribers := FListener.Registry.GetSubscribers(ChannelTopic(AChannel));
   try
     for Exec in Subscribers do
-      if Exec is TVRDX_IRCConnection then
+      if Exec is TVDRX_IRCConnection then
       begin
         if Names <> '' then Names := Names + ' ';
-        Names := Names + TVRDX_IRCConnection(Exec).Nick;
+        Names := Names + TVDRX_IRCConnection(Exec).Nick;
       end;
   finally
     Subscribers.Free;
@@ -266,7 +281,7 @@ begin
   SendNumeric('366', AChannel + ' :End of /NAMES list.');
 end;
 
-procedure TVRDX_IRCConnection.DoJoin(const AChannel: string);
+procedure TVDRX_IRCConnection.DoJoin(const AChannel: string);
 var
   Topic: string;
   Payload: string;
@@ -299,7 +314,7 @@ begin
   Bus.Publish(ChannelTopic(AChannel), Payload, ID);
 end;
 
-procedure TVRDX_IRCConnection.DoPart(const AChannel, AReason: string);
+procedure TVDRX_IRCConnection.DoPart(const AChannel, AReason: string);
 var
   Payload: string;
 begin
@@ -318,7 +333,7 @@ begin
   FChannels.Delete(FChannels.IndexOf(AChannel));
 end;
 
-procedure TVRDX_IRCConnection.DoPrivMsg(const ATarget, AText: string);
+procedure TVDRX_IRCConnection.DoPrivMsg(const ATarget, AText: string);
 var
   Payload: string;
 begin
@@ -338,7 +353,7 @@ begin
   Bus.Publish(ChannelTopic(ATarget), Payload, ID);
 end;
 
-procedure TVRDX_IRCConnection.DoTopic(const AChannel, ANewTopic: string; AHasNewTopic: Boolean);
+procedure TVDRX_IRCConnection.DoTopic(const AChannel, ANewTopic: string; AHasNewTopic: Boolean);
 var
   Payload: string;
 begin
@@ -361,7 +376,7 @@ begin
   Bus.Publish(ChannelTopic(AChannel), Payload, ID);
 end;
 
-procedure TVRDX_IRCConnection.DoQuitAllChannels(const AReason: string);
+procedure TVDRX_IRCConnection.DoQuitAllChannels(const AReason: string);
 var
   i: Integer;
   Payload: string;
@@ -371,16 +386,17 @@ begin
     Bus.Publish(ChannelTopic(FChannels[i]), Payload, ID);
 end;
 
-procedure TVRDX_IRCConnection.HandleLine(const ALine: string);
+procedure TVDRX_IRCConnection.HandleLine(const ALine: string);
 var
   Cmd: string;
   Params: TStringList;
   ServerName: string;
 begin
+  Bus.Publish('log.TVDRX_IRCConnection.HandleLine', ALine, ID);
   Params := TStringList.Create;
   try
     SplitIRCLine(ALine, Cmd, Params);
-    ServerName := FListener.Config.GetString('executives.ircd.servername', 'vrdx');
+    ServerName := FListener.Config.GetString('executives.ircd.servername', 'vdrx');
     if Cmd = 'CAP' then
     begin
       // Modern clients (HexChat included) probe capabilities before registering -
@@ -397,9 +413,14 @@ begin
     else if Cmd = 'PING' then
     begin
       if Params.Count > 0 then
-        SendLine('PONG :' + Params[0])
+        SendLine(':' + ServerName + ' PONG :' + Params[0])
       else
-        SendLine('PONG');
+        SendLine(':' + ServerName + ' PONG ' + ServerName);
+    end
+    else if Cmd = 'PONG' then
+    begin
+      FAwaitingPong := False;
+      FLastPingSent := Now;
     end
     else if Cmd = 'NICK' then
     begin
@@ -461,55 +482,108 @@ begin
   end;
 end;
 
-procedure TVRDX_IRCConnection.RunLoop;
+procedure TVDRX_IRCConnection.RunLoop;
 var
   Buf: array[0..4095] of Byte;
   Received: Integer;
   Acc, Line: string;
   NlPos: Integer;
+  PingToken: string;
+  PingCounter: Integer;
+const
+  PING_INTERVAL = 30.0; // Send server ping every 30 seconds
+  TIMEOUT_LIMIT = 90.0; // Give generous window before dropping
 begin
   Bus.Publish('log.info', 'IRC client connected', ID);
   Acc := '';
-  while True do
+  FLastPingSent := Now;
+  FLastActivity := Now;
+  FAwaitingPong := False;
+  PingCounter := 0;
+
+  while not TIRCConnThread(FThread).Terminated do
   begin
     Received := FTransport.Read(Buf[0], SizeOf(Buf));
-    if Received <= 0 then Break;
-    SetString(Line, PAnsiChar(@Buf[0]), Received);
-    Acc := Acc + Line;
-    repeat
-      NlPos := Pos(#10, Acc);
-      if NlPos > 0 then
-      begin
-        Line := TrimRight(Copy(Acc, 1, NlPos - 1));
-        Acc := Copy(Acc, NlPos + 1, Length(Acc));
-        if Line <> '' then
-          HandleLine(Line);
-      end;
-    until NlPos = 0;
+
+    if TIRCConnThread(FThread).Terminated then
+      Break;
+
+    if Received > 0 then
+    begin
+      FLastActivity := Now; // Any traffic proves connection is alive
+
+      SetString(Line, PAnsiChar(@Buf[0]), Received);
+      Acc := Acc + Line;
+
+      repeat
+        NlPos := Pos(#10, Acc);
+        if NlPos > 0 then
+        begin
+          Line := Copy(Acc, 1, NlPos - 1);
+          if (Length(Line) > 0) and (Line[Length(Line)] = #13) then
+            SetLength(Line, Length(Line) - 1);
+          Acc := Copy(Acc, NlPos + 1, Length(Acc));
+          Line := TrimRight(Line);
+          if Line <> '' then
+            HandleLine(Line);
+        end;
+      until NlPos = 0;
+
+    end
+    else if Received = 0 then
+    begin
+      Break; // Graceful disconnect
+    end
+    else
+    begin
+      // Read timed out (-1) - check timers below
+    end;
+
+    if TIRCConnThread(FThread).Terminated then
+      Break;
+
+    // Check if it's time to send a server-initiated ping
+    if not FAwaitingPong and ((Now - FLastPingSent) * 86400 >= PING_INTERVAL) then
+    begin
+      Inc(PingCounter);
+      PingToken := 'vdrxping' + IntToStr(PingCounter);
+      SendLine('PING :' + PingToken);
+      FLastPingSent := Now;
+      FAwaitingPong := True;
+    end;
+
+    // Check if the client timed out responding to our ping or sending activity
+    if FAwaitingPong and ((Now - FLastPingSent) * 86400 >= TIMEOUT_LIMIT) then
+    begin
+      Bus.Publish('log.info', 'IRC client ping timeout', ID);
+      Break;
+    end;
   end;
+
   if FRegistered then
     DoQuitAllChannels('Connection closed');
-  FListener.Registry.Unregister(ID); // drops all subscriptions and frees Self
+  FListener.Registry.Unregister(ID);
 end;
 
-procedure TVRDX_IRCConnection.Initialize;
+procedure TVDRX_IRCConnection.Initialize;
 begin
   FThread := TIRCConnThread.Create(Self);
   FThread.Start;
 end;
 
-procedure TVRDX_IRCConnection.Shutdown;
+procedure TVDRX_IRCConnection.Shutdown;
 begin
   FTransport.Close; // unblocks the blocking Read in RunLoop
   if Assigned(FThread) then
   begin
+    FThread.Terminate();
     FThread.WaitFor;
     FThread.Free;
     FThread := nil;
   end;
 end;
 
-procedure TVRDX_IRCConnection.HandlePacket(const AMsg: TVRDX_Message);
+procedure TVDRX_IRCConnection.HandlePacket(const AMsg: TVDRX_Message);
 var
   J: TJSONData;
   Obj: TJSONObject;
@@ -529,27 +603,27 @@ begin
     Kind := Obj.Get('kind', '');
     if Kind = 'privmsg' then
     begin
-      Mask := Obj.Get('from', '') + '!' + LowerCase(Obj.Get('user', '')) + '@vrdx';
+      Mask := Obj.Get('from', '') + '!' + LowerCase(Obj.Get('user', '')) + '@vdrx';
       SendLine(':' + Mask + ' PRIVMSG ' + Channel + ' :' + Obj.Get('text', ''));
     end
     else if Kind = 'join' then
     begin
-      Mask := Obj.Get('nick', '') + '!' + LowerCase(Obj.Get('user', '')) + '@vrdx';
+      Mask := Obj.Get('nick', '') + '!' + LowerCase(Obj.Get('user', '')) + '@vdrx';
       SendLine(':' + Mask + ' JOIN :' + Channel);
     end
     else if Kind = 'part' then
     begin
-      Mask := Obj.Get('nick', '') + '!' + LowerCase(Obj.Get('user', '')) + '@vrdx';
+      Mask := Obj.Get('nick', '') + '!' + LowerCase(Obj.Get('user', '')) + '@vdrx';
       SendLine(':' + Mask + ' PART ' + Channel + ' :' + Obj.Get('reason', ''));
     end
     else if Kind = 'quit' then
     begin
-      Mask := Obj.Get('nick', '') + '!' + LowerCase(Obj.Get('user', '')) + '@vrdx';
+      Mask := Obj.Get('nick', '') + '!' + LowerCase(Obj.Get('user', '')) + '@vdrx';
       SendLine(':' + Mask + ' QUIT :' + Obj.Get('reason', ''));
     end
     else if Kind = 'topic' then
     begin
-      Mask := Obj.Get('nick', '') + '!' + LowerCase(Obj.Get('user', '')) + '@vrdx';
+      Mask := Obj.Get('nick', '') + '!' + LowerCase(Obj.Get('user', '')) + '@vdrx';
       SendLine(':' + Mask + ' TOPIC ' + Channel + ' :' + Obj.Get('topic', ''));
     end;
   finally
@@ -557,9 +631,9 @@ begin
   end;
 end;
 
-{ TVRDX_IRCDExecutive }
+{ TVDRX_IRCDExecutive }
 
-constructor TVRDX_IRCDExecutive.Create(ABus: TVRDX_MessageQueue; AConfig: TVRDX_Config; ARegistry: TVRDX_Registry);
+constructor TVDRX_IRCDExecutive.Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config; ARegistry: TVDRX_Registry);
 begin
   inherited Create(ABus);
   FConfig := AConfig;
@@ -570,20 +644,20 @@ begin
   FTopics.CaseSensitive := False;
 end;
 
-destructor TVRDX_IRCDExecutive.Destroy;
+destructor TVDRX_IRCDExecutive.Destroy;
 begin
   FTopics.Free;
   FTopicLock.Free;
   inherited Destroy;
 end;
 
-function TVRDX_IRCDExecutive.NextConnID: string;
+function TVDRX_IRCDExecutive.NextConnID: string;
 begin
   Inc(FConnCounter);
   Result := 'ircd.conn.' + IntToStr(FConnCounter);
 end;
 
-function TVRDX_IRCDExecutive.GetTopic(const AChannel: string): string;
+function TVDRX_IRCDExecutive.GetTopic(const AChannel: string): string;
 var
   idx: Integer;
 begin
@@ -599,7 +673,7 @@ begin
   end;
 end;
 
-procedure TVRDX_IRCDExecutive.SetTopic(const AChannel, ATopic: string);
+procedure TVDRX_IRCDExecutive.SetTopic(const AChannel, ATopic: string);
 begin
   TCriticalSection(FTopicLock).Enter;
   try
@@ -609,25 +683,26 @@ begin
   end;
 end;
 
-procedure TVRDX_IRCDExecutive.HandleConnection(ATransport: TVRDX_Transport);
+procedure TVDRX_IRCDExecutive.HandleConnection(ATransport: TVDRX_Transport);
 var
-  Conn: TVRDX_IRCConnection;
+  Conn: TVDRX_IRCConnection;
 begin
-  Conn := TVRDX_IRCConnection.Create(Bus, Self, ATransport);
+  ATransport.SetReadTimeout(1000); // 1-second timeout so Read unblocks periodically for heartbeats
+  Conn := TVDRX_IRCConnection.Create(Bus, Self, ATransport);
   FRegistry.Register(Conn, NextConnID, 'sys.none'); // real channel filters added on JOIN
   Conn.Initialize;
 end;
 
-procedure TVRDX_IRCDExecutive.HandlePacket(const AMsg: TVRDX_Message);
+procedure TVDRX_IRCDExecutive.HandlePacket(const AMsg: TVDRX_Message);
 begin
-  // The listener itself isn't a message recipient - each TVRDX_IRCConnection is.
+  // The listener itself isn't a message recipient - each TVDRX_IRCConnection is.
 end;
 
 // Same restart-on-change pattern used for both the plain port and (new) TLS port -
-// Shutdown/Initialize (inherited from TVRDX_SocketListenerExecutive) already tear
+// Shutdown/Initialize (inherited from TVDRX_SocketListenerExecutive) already tear
 // down and rebind whichever of the two are configured, so reuse that rather than
 // duplicating low-level socket calls here.
-procedure TVRDX_IRCDExecutive.ApplyConfig;
+procedure TVDRX_IRCDExecutive.ApplyConfig;
 var
   NewPort, NewTLSPort: Integer;
   CertFile, KeyFile: string;

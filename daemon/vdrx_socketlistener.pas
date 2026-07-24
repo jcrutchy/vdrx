@@ -1,20 +1,20 @@
-unit vrdx_socketlistener;
+unit vdrx_socketlistener;
 
 {$mode ObjFPC}{$H+}
 
 interface
 
 uses
-  Classes, SysUtils, Sockets, vrdx_core, vrdx_transport;
+  Classes, SysUtils, Sockets, vdrx_core, vdrx_transport;
 
 type
 
   // Common accept-loop skeleton for every raw-socket listener executive (IRCD, HTTP,
   // WebSocket, and the combined HTTP/WS listener). Binds Port (plaintext) and/or
   // TLSPort (TLS, once ConfigureTLS is called with a loadable cert/key), accepts in
-  // a loop on whichever are configured, and spawns one TVRDX_ListenerConnThread per
+  // a loop on whichever are configured, and spawns one TVDRX_ListenerConnThread per
   // accepted connection which calls the descendant's HandleConnection with an
-  // already-ready TVRDX_Transport. Descendants only implement HandleConnection -
+  // already-ready TVDRX_Transport. Descendants only implement HandleConnection -
   // accept-loop plumbing, socket lifecycle, TLS handshaking, and thread teardown all
   // live here, and descendants never need to know or care which transport they got.
   //
@@ -23,13 +23,13 @@ type
   // dual plain+TLS listening in a later session (see WIRING.md) so a protocol can
   // be reachable either encrypted or not, client's choice, without the HTTP/WS/IRCD
   // layer needing separate encrypted/plaintext code paths of its own.
-  TVRDX_SocketListenerExecutive = class(TVRDX_Executive)
+  TVDRX_SocketListenerExecutive = class(TVDRX_Executive)
   private
     FPort: Word;             // 0 = plaintext listener disabled
     FTLSPort: Word;          // 0 = TLS listener disabled
     FTLSCertFile: string;
     FTLSKeyFile: string;
-    FTLSContext: TVRDX_TLSContext;
+    FTLSContext: TVDRX_TLSContext;
     FBacklog: Integer;
     FPlainSocket: TSocket;
     FTLSSocket: TSocket;
@@ -45,11 +45,11 @@ type
     // done by the time this is called). Implementations own it: read it, respond,
     // and Close+Free it themselves, or hand it off elsewhere (e.g. registering a
     // longer-lived executive that takes over the connection, as
-    // TVRDX_WebSocketExecutive.AdoptConnection and TVRDX_IRCDExecutive's connection
+    // TVDRX_WebSocketExecutive.AdoptConnection and TVDRX_IRCDExecutive's connection
     // hand-off do).
-    procedure HandleConnection(ATransport: TVRDX_Transport); virtual; abstract;
+    procedure HandleConnection(ATransport: TVDRX_Transport); virtual; abstract;
   public
-    constructor Create(ABus: TVRDX_MessageQueue); override;
+    constructor Create(ABus: TVDRX_MessageQueue); override;
     destructor Destroy; override;
     property Port: Word read FPort write FPort;
     property TLSPort: Word read FTLSPort;
@@ -73,17 +73,17 @@ type
 implementation
 
 type
-  TVRDX_ListenerConnThread = class(TThread)
+  TVDRX_ListenerConnThread = class(TThread)
   private
-    FOwner: TVRDX_SocketListenerExecutive;
-    FTransport: TVRDX_Transport;
+    FOwner: TVDRX_SocketListenerExecutive;
+    FTransport: TVDRX_Transport;
   protected
     procedure Execute; override;
   public
-    constructor Create(AOwner: TVRDX_SocketListenerExecutive; ATransport: TVRDX_Transport);
+    constructor Create(AOwner: TVDRX_SocketListenerExecutive; ATransport: TVDRX_Transport);
   end;
 
-constructor TVRDX_ListenerConnThread.Create(AOwner: TVRDX_SocketListenerExecutive; ATransport: TVRDX_Transport);
+constructor TVDRX_ListenerConnThread.Create(AOwner: TVDRX_SocketListenerExecutive; ATransport: TVDRX_Transport);
 begin
   inherited Create(True);
   FOwner := AOwner;
@@ -91,33 +91,33 @@ begin
   FreeOnTerminate := True; // fire-and-forget per-connection dispatch thread
 end;
 
-procedure TVRDX_ListenerConnThread.Execute;
+procedure TVDRX_ListenerConnThread.Execute;
 begin
   FOwner.HandleConnection(FTransport);
 end;
 
-{ TVRDX_SocketListenerExecutive }
+{ TVDRX_SocketListenerExecutive }
 
-constructor TVRDX_SocketListenerExecutive.Create(ABus: TVRDX_MessageQueue);
+constructor TVDRX_SocketListenerExecutive.Create(ABus: TVDRX_MessageQueue);
 begin
   inherited Create(ABus);
   FBacklog := 16;
 end;
 
-destructor TVRDX_SocketListenerExecutive.Destroy;
+destructor TVDRX_SocketListenerExecutive.Destroy;
 begin
   FTLSContext.Free;
   inherited Destroy;
 end;
 
-procedure TVRDX_SocketListenerExecutive.ConfigureTLS(ATLSPort: Word; const ACertFile, AKeyFile: string);
+procedure TVDRX_SocketListenerExecutive.ConfigureTLS(ATLSPort: Word; const ACertFile, AKeyFile: string);
 begin
   FTLSPort := ATLSPort;
   FTLSCertFile := ACertFile;
   FTLSKeyFile := AKeyFile;
 end;
 
-function TVRDX_SocketListenerExecutive.BindListenSocket(APort: Word): TSocket;
+function TVDRX_SocketListenerExecutive.BindListenSocket(APort: Word): TSocket;
 var
   Addr: TInetSockAddr;
   OptVal: LongInt;
@@ -133,7 +133,7 @@ begin
   fpListen(Result, FBacklog);
 end;
 
-procedure TVRDX_SocketListenerExecutive.AcceptLoopPlain;
+procedure TVDRX_SocketListenerExecutive.AcceptLoopPlain;
 var
   ClientAddr: TInetSockAddr;
   AddrLen: TSockLen;
@@ -146,17 +146,17 @@ begin
     ClientSock := fpAccept(FPlainSocket, @ClientAddr, @AddrLen);
     if ClientSock = -1 then
       Continue;
-    TVRDX_ListenerConnThread.Create(Self, TVRDX_PlainTransport.Create(ClientSock)).Start;
+    TVDRX_ListenerConnThread.Create(Self, TVDRX_PlainTransport.Create(ClientSock)).Start;
   end;
   CloseSocket(FPlainSocket);
 end;
 
-procedure TVRDX_SocketListenerExecutive.AcceptLoopTLS;
+procedure TVDRX_SocketListenerExecutive.AcceptLoopTLS;
 var
   ClientAddr: TInetSockAddr;
   AddrLen: TSockLen;
   ClientSock: TSocket;
-  Transport: TVRDX_TLSTransport;
+  Transport: TVDRX_TLSTransport;
 begin
   FTLSSocket := BindListenSocket(FTLSPort);
   while not FStopping do
@@ -165,37 +165,37 @@ begin
     ClientSock := fpAccept(FTLSSocket, @ClientAddr, @AddrLen);
     if ClientSock = -1 then
       Continue;
-    // Handshake happens inside TVRDX_TLSTransport.Create, on this connection's own
+    // Handshake happens inside TVDRX_TLSTransport.Create, on this connection's own
     // thread (spawned below) - no, actually inline here first so we can bail out
     // before spawning a thread for a connection whose handshake never completes.
-    Transport := TVRDX_TLSTransport.Create(ClientSock, FTLSContext.Ctx);
+    Transport := TVDRX_TLSTransport.Create(ClientSock, FTLSContext.Ctx);
     if not Transport.Handshook then
     begin
       Transport.Free; // bad client, wrong protocol on this port, etc - just drop it
       Continue;
     end;
-    TVRDX_ListenerConnThread.Create(Self, Transport).Start;
+    TVDRX_ListenerConnThread.Create(Self, Transport).Start;
   end;
   CloseSocket(FTLSSocket);
 end;
 
-function TVRDX_SocketListenerExecutive.TLSActive: Boolean;
+function TVDRX_SocketListenerExecutive.TLSActive: Boolean;
 begin
   Result := Assigned(FTLSThread);
 end;
 
-procedure TVRDX_SocketListenerExecutive.Initialize;
+procedure TVDRX_SocketListenerExecutive.Initialize;
 begin
   FStopping := False;
   if FPort <> 0 then
   begin
-    FPlainThread := TVRDX_WorkerThread.Create(@AcceptLoopPlain);
+    FPlainThread := TVDRX_WorkerThread.Create(@AcceptLoopPlain);
     FPlainThread.FreeOnTerminate := False;
     FPlainThread.Start;
   end;
   if FTLSPort <> 0 then
   begin
-    FTLSContext := TVRDX_TLSContext.Create(FTLSCertFile, FTLSKeyFile);
+    FTLSContext := TVDRX_TLSContext.Create(FTLSCertFile, FTLSKeyFile);
     if not FTLSContext.OK then
     begin
       FTLSContext.Free;
@@ -203,14 +203,14 @@ begin
     end
     else
     begin
-      FTLSThread := TVRDX_WorkerThread.Create(@AcceptLoopTLS);
+      FTLSThread := TVDRX_WorkerThread.Create(@AcceptLoopTLS);
       FTLSThread.FreeOnTerminate := False;
       FTLSThread.Start;
     end;
   end;
 end;
 
-procedure TVRDX_SocketListenerExecutive.Shutdown;
+procedure TVDRX_SocketListenerExecutive.Shutdown;
 begin
   FStopping := True;
   if FPlainSocket <> 0 then

@@ -1,41 +1,41 @@
-unit vrdx_http;
+unit vdrx_http;
 
 {$mode ObjFPC}{$H+}
 
 interface
 
 uses
-  Classes, SysUtils, Sockets, vrdx_core, vrdx_socketlistener, vrdx_transport,
-  vrdx_whiteboard, vrdx_config;
+  Classes, SysUtils, Sockets, vdrx_core, vdrx_socketlistener, vdrx_transport,
+  vdrx_whiteboard, vdrx_config;
 
 type
   // Request/response, synchronous - deliberately does NOT round-trip through the
-  // bus. Reads board state directly via TVRDX_WhiteboardExecutive.GetBoardSnapshot,
+  // bus. Reads board state directly via TVDRX_WhiteboardExecutive.GetBoardSnapshot,
   // so the client gets a full initial render with no flash-of-empty-board before its
   // WebSocket connection's live deltas start arriving. Accept loop, per-connection
   // threading, and plain-vs-TLS transport selection all come from
-  // TVRDX_SocketListenerExecutive.
-  TVRDX_HTTPExecutive = class(TVRDX_SocketListenerExecutive)
+  // TVDRX_SocketListenerExecutive.
+  TVDRX_HTTPExecutive = class(TVDRX_SocketListenerExecutive)
   private
-    FConfig: TVRDX_Config;
-    FWhiteboard: TVRDX_WhiteboardExecutive;
+    FConfig: TVDRX_Config;
+    FWhiteboard: TVDRX_WhiteboardExecutive;
   protected
-    procedure HandleConnection(ATransport: TVRDX_Transport); override;
+    procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
-    constructor Create(ABus: TVRDX_MessageQueue; AConfig: TVRDX_Config;
-      AWhiteboard: TVRDX_WhiteboardExecutive); reintroduce;
-    procedure HandlePacket(const AMsg: TVRDX_Message); override;
+    constructor Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config;
+      AWhiteboard: TVDRX_WhiteboardExecutive); reintroduce;
+    procedure HandlePacket(const AMsg: TVDRX_Message); override;
     procedure ApplyConfig; override;
     // Pure request -> response logic, reusable by anything that's already read the
     // initial bytes off the wire (e.g. the combined HTTP/WS listener) and doesn't
     // want a second Read on the same connection.
-    class function BuildResponse(const ARequest: string; AWhiteboard: TVRDX_WhiteboardExecutive): string;
+    class function BuildResponse(const ARequest: string; AWhiteboard: TVDRX_WhiteboardExecutive): string;
   end;
 
 implementation
 
-constructor TVRDX_HTTPExecutive.Create(ABus: TVRDX_MessageQueue; AConfig: TVRDX_Config;
-  AWhiteboard: TVRDX_WhiteboardExecutive);
+constructor TVDRX_HTTPExecutive.Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config;
+  AWhiteboard: TVDRX_WhiteboardExecutive);
 begin
   inherited Create(ABus);
   FConfig := AConfig;
@@ -43,7 +43,7 @@ begin
   Port := 8081;
 end;
 
-class function TVRDX_HTTPExecutive.BuildResponse(const ARequest: string; AWhiteboard: TVRDX_WhiteboardExecutive): string;
+class function TVDRX_HTTPExecutive.BuildResponse(const ARequest: string; AWhiteboard: TVDRX_WhiteboardExecutive): string;
 var
   Body, BoardJSON: string;
 begin
@@ -62,7 +62,7 @@ begin
     Result := 'HTTP/1.1 404 Not Found'#13#10#13#10;
 end;
 
-procedure TVRDX_HTTPExecutive.HandleConnection(ATransport: TVRDX_Transport);
+procedure TVDRX_HTTPExecutive.HandleConnection(ATransport: TVDRX_Transport);
 var
   Buf: array[0..1023] of Byte;
   Received: Integer;
@@ -79,16 +79,16 @@ begin
   ATransport.Free;
 end;
 
-procedure TVRDX_HTTPExecutive.HandlePacket(const AMsg: TVRDX_Message);
+procedure TVDRX_HTTPExecutive.HandlePacket(const AMsg: TVDRX_Message);
 begin
   // HTTP is request/response, not bus-driven - nothing to do here.
 end;
 
-// Same restart-on-change pattern as TVRDX_IRCDExecutive.ApplyConfig - Shutdown then
-// Initialize (inherited from TVRDX_SocketListenerExecutive) already handles tearing
+// Same restart-on-change pattern as TVDRX_IRCDExecutive.ApplyConfig - Shutdown then
+// Initialize (inherited from TVDRX_SocketListenerExecutive) already handles tearing
 // down and rebinding both the plain and TLS listeners cleanly, so reuse that rather
 // than duplicating socket-lifecycle logic here.
-procedure TVRDX_HTTPExecutive.ApplyConfig;
+procedure TVDRX_HTTPExecutive.ApplyConfig;
 var
   NewPort, NewTLSPort: Integer;
   CertFile, KeyFile: string;

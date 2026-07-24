@@ -1,4 +1,4 @@
-unit vrdx_transport;
+unit vdrx_transport;
 
 {$mode ObjFPC}{$H+}
 
@@ -14,14 +14,15 @@ type
   // blocking, synchronous style - no event-loop rewrite needed anywhere else; every
   // existing "one thread per connection" executive keeps working exactly as before,
   // just talking to ATransport instead of a raw TSocket.
-  TVRDX_Transport = class
+  TVDRX_Transport = class
   public
     function Read(var ABuf; ALen: Integer): Integer; virtual; abstract;
     function Write(const ABuf; ALen: Integer): Integer; virtual; abstract;
     procedure Close; virtual; abstract;
+    procedure SetReadTimeout(ATimeoutMs: Integer); virtual; abstract;
   end;
 
-  TVRDX_PlainTransport = class(TVRDX_Transport)
+  TVDRX_PlainTransport = class(TVDRX_Transport)
   private
     FSocket: TSocket;
   public
@@ -29,6 +30,7 @@ type
     function Read(var ABuf; ALen: Integer): Integer; override;
     function Write(const ABuf; ALen: Integer): Integer; override;
     procedure Close; override;
+    procedure SetReadTimeout(ATimeoutMs: Integer); override;
   end;
 
   // One shared SSL_CTX per listener (holds the loaded cert/key) hands out one SSL*
@@ -41,7 +43,7 @@ type
   // SslCtxNew, etc), NOT the raw C names (SSL_new, SSL_CTX_new). Every wrapper
   // function here lazily calls InitSSLInterface itself, so no explicit init call is
   // required - it'll just return failure/nil if libssl isn't found at runtime.
-  TVRDX_TLSTransport = class(TVRDX_Transport)
+  TVDRX_TLSTransport = class(TVDRX_Transport)
   private
     FSocket: TSocket;
     FSSL: PSSL;
@@ -53,13 +55,14 @@ type
     function Read(var ABuf; ALen: Integer): Integer; override;
     function Write(const ABuf; ALen: Integer): Integer; override;
     procedure Close; override;
+    procedure SetReadTimeout(ATimeoutMs: Integer); override;
   end;
 
   // One per TLS-enabled listener - loads the cert/key once at Initialize time and
-  // hands out the resulting context for TVRDX_TLSTransport to wrap each accepted
+  // hands out the resulting context for TVDRX_TLSTransport to wrap each accepted
   // connection in. Deliberately doesn't crash the daemon if the cert/key don't load
   // - check .OK and skip bringing the TLS listener up if false.
-  TVRDX_TLSContext = class
+  TVDRX_TLSContext = class
   private
     FCtx: PSSL_CTX;
     FOK: Boolean;
@@ -72,32 +75,51 @@ type
 
 implementation
 
-{ TVRDX_PlainTransport }
+{ TVDRX_PlainTransport }
 
-constructor TVRDX_PlainTransport.Create(ASocket: TSocket);
+constructor TVDRX_PlainTransport.Create(ASocket: TSocket);
 begin
   inherited Create;
   FSocket := ASocket;
 end;
 
-function TVRDX_PlainTransport.Read(var ABuf; ALen: Integer): Integer;
+function TVDRX_PlainTransport.Read(var ABuf; ALen: Integer): Integer;
 begin
   Result := fpRecv(FSocket, @ABuf, ALen, 0);
 end;
 
-function TVRDX_PlainTransport.Write(const ABuf; ALen: Integer): Integer;
+function TVDRX_PlainTransport.Write(const ABuf; ALen: Integer): Integer;
 begin
   Result := fpSend(FSocket, @ABuf, ALen, 0);
 end;
 
-procedure TVRDX_PlainTransport.Close;
+procedure TVDRX_PlainTransport.Close;
 begin
   CloseSocket(FSocket);
 end;
 
-{ TVRDX_TLSTransport }
+procedure TVDRX_PlainTransport.SetReadTimeout(ATimeoutMs: Integer);
+{$IFDEF UNIX}
+var
+  TV: TTimeVal;
+begin
+  TV.tv_sec := ATimeoutMs div 1000;
+  TV.tv_usec := (ATimeoutMs mod 1000) * 1000;
+  fpSetsockopt(FSocket, SOL_SOCKET, SO_RCVTIMEO, @TV, SizeOf(TV));
+end;
+{$ENDIF}
+{$IFDEF WINDOWS}
+var
+  Timeout: DWORD;
+begin
+  Timeout := ATimeoutMs;
+  fpSetsockopt(FSocket, SOL_SOCKET, SO_RCVTIMEO, @Timeout, SizeOf(Timeout));
+end;
+{$ENDIF}
 
-constructor TVRDX_TLSTransport.Create(ASocket: TSocket; ACtx: PSSL_CTX);
+{ TVDRX_TLSTransport }
+
+constructor TVDRX_TLSTransport.Create(ASocket: TSocket; ACtx: PSSL_CTX);
 begin
   inherited Create;
   FSocket := ASocket;
@@ -106,26 +128,26 @@ begin
   FOK := Assigned(FSSL) and (SslAccept(FSSL) = 1); // blocking - fine, runs on this connection's own thread
 end;
 
-destructor TVRDX_TLSTransport.Destroy;
+destructor TVDRX_TLSTransport.Destroy;
 begin
   if Assigned(FSSL) then
     SslFree(FSSL);
   inherited Destroy;
 end;
 
-function TVRDX_TLSTransport.Read(var ABuf; ALen: Integer): Integer;
+function TVDRX_TLSTransport.Read(var ABuf; ALen: Integer): Integer;
 begin
   if not FOK then Exit(-1);
   Result := SslRead(FSSL, @ABuf, ALen);
 end;
 
-function TVRDX_TLSTransport.Write(const ABuf; ALen: Integer): Integer;
+function TVDRX_TLSTransport.Write(const ABuf; ALen: Integer): Integer;
 begin
   if not FOK then Exit(-1);
   Result := SslWrite(FSSL, @ABuf, ALen);
 end;
 
-procedure TVRDX_TLSTransport.Close;
+procedure TVDRX_TLSTransport.Close;
 begin
   if Assigned(FSSL) then
     SslShutdown(FSSL);
@@ -133,9 +155,22 @@ begin
   CloseSocket(FSocket);
 end;
 
-{ TVRDX_TLSContext }
+procedure TVDRX_TLSTransport.SetReadTimeout(ATimeoutMs: Integer);
+var
+  PlainTemp: TVDRX_PlainTransport;
+begin
+  // Delegate socket timeout configuration to underlying socket via temporary plain wrapper or direct options
+  PlainTemp := TVDRX_PlainTransport.Create(FSocket);
+  try
+    PlainTemp.SetReadTimeout(ATimeoutMs);
+  finally
+    PlainTemp.Free;
+  end;
+end;
 
-constructor TVRDX_TLSContext.Create(const ACertFile, AKeyFile: string);
+{ TVDRX_TLSContext }
+
+constructor TVDRX_TLSContext.Create(const ACertFile, AKeyFile: string);
 begin
   inherited Create;
   // SslTLSMethod loads the 'TLS_method' symbol - the modern, version-negotiating
@@ -150,7 +185,7 @@ begin
     and (SslCtxUsePrivateKeyFile(FCtx, AKeyFile, SSL_FILETYPE_PEM) = 1);
 end;
 
-destructor TVRDX_TLSContext.Destroy;
+destructor TVDRX_TLSContext.Destroy;
 begin
   if Assigned(FCtx) then
     SslCtxFree(FCtx);

@@ -1,4 +1,4 @@
-unit vrdx_core;
+unit vdrx_core;
 
 {$mode ObjFPC}{$H+}
 
@@ -16,9 +16,9 @@ const
 
 type
 
-  TVRDX_Executive = class;
+  TVDRX_Executive = class;
 
-  TVRDX_Message = record
+  TVDRX_Message = record
     Topic: string;
     Payload: string;
     SourceID: string;
@@ -26,12 +26,12 @@ type
     Timestamp: TDateTime;
   end;
 
-  TVRDX_ExecList = specialize TList<TVRDX_Executive>;
-  TVRDX_ExecListDictionary = specialize TObjectDictionary<string, TVRDX_ExecList>;
-  TVRDX_ExecMasterMap = specialize TObjectDictionary<string, TVRDX_Executive>;
-  TVRDX_MessageList = specialize TList<TVRDX_Message>;
+  TVDRX_ExecList = specialize TList<TVDRX_Executive>;
+  TVDRX_ExecListDictionary = specialize TObjectDictionary<string, TVDRX_ExecList>;
+  TVDRX_ExecMasterMap = specialize TObjectDictionary<string, TVDRX_Executive>;
+  TVDRX_MessageList = specialize TList<TVDRX_Message>;
 
-  TVRDX_WorkerThread = class(TThread)
+  TVDRX_WorkerThread = class(TThread)
   private
     FExecuteMethod: TThreadMethod;
   protected
@@ -40,9 +40,9 @@ type
     constructor Create(AExecuteMethod: TThreadMethod);
   end;
 
-  TVRDX_MessageQueue = class
+  TVDRX_MessageQueue = class
   private
-    FList: TVRDX_MessageList;
+    FList: TVDRX_MessageList;
     FLock: TCriticalSection;
     FSignal: TEvent;
     FSeqCounter: Int64;
@@ -50,7 +50,7 @@ type
     constructor Create;
     destructor Destroy; override;
     procedure Publish(const ATopic, APayload, ASourceID: string);
-    function TryDequeue(out AMsg: TVRDX_Message; TimeoutMs: Cardinal = 500): Boolean;
+    function TryDequeue(out AMsg: TVDRX_Message; TimeoutMs: Cardinal = 500): Boolean;
   end;
 
   // Base for every executive - internal object, external-process Bridge, or socket
@@ -62,47 +62,47 @@ type
   // executives yet - deliberately waiting for three concrete, near-identical
   // examples before extracting one (see session notes).
 
-  { TVRDX_Executive }
+  { TVDRX_Executive }
 
-  TVRDX_Executive = class
+  TVDRX_Executive = class
   private
     FID: string;
-    FBus: TVRDX_MessageQueue;
+    FBus: TVDRX_MessageQueue;
   public
-    constructor Create(ABus: TVRDX_MessageQueue); virtual;
+    constructor Create(ABus: TVDRX_MessageQueue); virtual;
     property ID: string read FID write FID;
-    property Bus: TVRDX_MessageQueue read FBus;
+    property Bus: TVDRX_MessageQueue read FBus;
     procedure Initialize; virtual;
     procedure Shutdown; virtual;
-    procedure HandlePacket(const AMsg: TVRDX_Message); virtual; abstract;
+    procedure HandlePacket(const AMsg: TVDRX_Message); virtual; abstract;
     procedure ApplyConfig; virtual;
   end;
 
   // A single (Executive, Filter) routing entry. Filters now live here rather than on
   // the executive itself, so one executive can be registered under any number of
   // them - e.g. a Logger subscribed to both 'log.>' and 'irc.>'.
-  TVRDX_Subscription = class
+  TVDRX_Subscription = class
   public
-    Exec: TVRDX_Executive;
+    Exec: TVDRX_Executive;
     Filter: string;
-    constructor Create(AExec: TVRDX_Executive; const AFilter: string);
+    constructor Create(AExec: TVDRX_Executive; const AFilter: string);
   end;
 
-  TVRDX_SubList = specialize TObjectList<TVRDX_Subscription>; // owns its Subscriptions
-  TVRDX_SubListDictionary = specialize TObjectDictionary<string, TVRDX_SubList>;
+  TVDRX_SubList = specialize TObjectList<TVDRX_Subscription>; // owns its Subscriptions
+  TVDRX_SubListDictionary = specialize TObjectDictionary<string, TVDRX_SubList>;
 
   // MasterMap (owning, ID -> Executive) is still the single source of truth for
   // lifecycle and memory management - exactly one entry per AID, regardless of how
   // many filters that executive is subscribed under. LiteralSubs/WildcardSubs are
-  // reference-only routing indices of TVRDX_Subscription pairs; the same executive
+  // reference-only routing indices of TVDRX_Subscription pairs; the same executive
   // can appear in either or both, any number of times, under different filters.
-  TVRDX_Registry = class
+  TVDRX_Registry = class
   private
-    FMasterMap: TVRDX_ExecMasterMap;
-    FLiteralSubs: TVRDX_SubListDictionary;
-    FWildcardSubs: TVRDX_SubList;
+    FMasterMap: TVDRX_ExecMasterMap;
+    FLiteralSubs: TVDRX_SubListDictionary;
+    FWildcardSubs: TVDRX_SubList;
     FLock: TCriticalSection;
-    procedure RemoveSubscriptionsUnlocked(AExec: TVRDX_Executive);
+    procedure RemoveSubscriptionsUnlocked(AExec: TVDRX_Executive);
   public
     constructor Create;
     destructor Destroy; override;
@@ -110,7 +110,7 @@ type
     // registered, this also takes ownership of AExec (it'll be freed on
     // Unregister). Safe to call repeatedly with the same AID to add more filters to
     // an already-registered executive.
-    procedure Register(AExec: TVRDX_Executive; const AID, AFilter: string);
+    procedure Register(AExec: TVDRX_Executive; const AID, AFilter: string);
     // Drops every filter subscription for AID WITHOUT destroying the executive -
     // use this (then Register again) to replace an executive's subscriptions in
     // place, e.g. a WebSocket connection re-subscribing to a new topic.
@@ -123,18 +123,18 @@ type
     // Drops every filter subscription for AID AND destroys the executive (owning
     // map). Use when the executive itself is going away, not just its subscriptions.
     procedure Unregister(const AID: string);
-    function GetSubscribers(const ATopic: string): TVRDX_ExecList;
+    function GetSubscribers(const ATopic: string): TVDRX_ExecList;
     procedure InitializeAll;
     procedure ShutdownAll;
     procedure ApplyAllConfigs;
   end;
 
-  { TVRDX_Kernel }
+  { TVDRX_Kernel }
 
-  TVRDX_Kernel = class(TThread)
+  TVDRX_Kernel = class(TThread)
   private
-    FQueue: TVRDX_MessageQueue;
-    FRegistry: TVRDX_Registry;
+    FQueue: TVDRX_MessageQueue;
+    FRegistry: TVDRX_Registry;
   protected
     procedure Execute; override;
   public
@@ -142,8 +142,8 @@ type
     destructor Destroy; override;
     procedure Terminate;
   public
-    property Queue: TVRDX_MessageQueue read FQueue;
-    property Registry: TVRDX_Registry read FRegistry;
+    property Queue: TVDRX_MessageQueue read FQueue;
+    property Registry: TVDRX_Registry read FRegistry;
   end;
 
 implementation
@@ -167,16 +167,16 @@ begin
   Result := Length(fParts) = Length(tParts);
 end;
 
-{ TVRDX_WorkerThread }
+{ TVDRX_WorkerThread }
 
-constructor TVRDX_WorkerThread.Create(AExecuteMethod: TThreadMethod);
+constructor TVDRX_WorkerThread.Create(AExecuteMethod: TThreadMethod);
 begin
   inherited Create(True);
   FExecuteMethod := AExecuteMethod;
   FreeOnTerminate := False;
 end;
 
-procedure TVRDX_WorkerThread.Execute;
+procedure TVDRX_WorkerThread.Execute;
 begin
   if Assigned(FExecuteMethod) then
   begin
@@ -184,16 +184,16 @@ begin
   end;
 end;
 
-{ TVRDX_MessageQueue }
+{ TVDRX_MessageQueue }
 
-constructor TVRDX_MessageQueue.Create;
+constructor TVDRX_MessageQueue.Create;
 begin
-  FList := TVRDX_MessageList.Create;
+  FList := TVDRX_MessageList.Create;
   FLock := TCriticalSection.Create;
   FSignal := TEvent.Create(nil, False, False, '');
 end;
 
-destructor TVRDX_MessageQueue.Destroy;
+destructor TVDRX_MessageQueue.Destroy;
 begin
   FSignal.Free;
   FLock.Free;
@@ -201,9 +201,9 @@ begin
   inherited;
 end;
 
-procedure TVRDX_MessageQueue.Publish(const ATopic, APayload, ASourceID: string);
+procedure TVDRX_MessageQueue.Publish(const ATopic, APayload, ASourceID: string);
 var
-  Msg: TVRDX_Message;
+  Msg: TVDRX_Message;
 begin
   FLock.Enter;
   try
@@ -220,7 +220,7 @@ begin
   FSignal.SetEvent;
 end;
 
-function TVRDX_MessageQueue.TryDequeue(out AMsg: TVRDX_Message; TimeoutMs: Cardinal): Boolean;
+function TVDRX_MessageQueue.TryDequeue(out AMsg: TVDRX_Message; TimeoutMs: Cardinal): Boolean;
 begin
   Result := False;
   if FSignal.WaitFor(TimeoutMs) <> wrSignaled then
@@ -240,46 +240,46 @@ begin
   end;
 end;
 
-{ TVRDX_Executive }
+{ TVDRX_Executive }
 
-constructor TVRDX_Executive.Create(ABus: TVRDX_MessageQueue);
+constructor TVDRX_Executive.Create(ABus: TVDRX_MessageQueue);
 begin
   inherited Create;
   FBus := ABus;
 end;
 
-procedure TVRDX_Executive.Initialize;
+procedure TVDRX_Executive.Initialize;
 begin
 end;
 
-procedure TVRDX_Executive.Shutdown;
+procedure TVDRX_Executive.Shutdown;
 begin
 end;
 
-procedure TVRDX_Executive.ApplyConfig;
+procedure TVDRX_Executive.ApplyConfig;
 begin
 end;
 
-{ TVRDX_Subscription }
+{ TVDRX_Subscription }
 
-constructor TVRDX_Subscription.Create(AExec: TVRDX_Executive; const AFilter: string);
+constructor TVDRX_Subscription.Create(AExec: TVDRX_Executive; const AFilter: string);
 begin
   inherited Create;
   Exec := AExec;
   Filter := AFilter;
 end;
 
-{ TVRDX_Registry }
+{ TVDRX_Registry }
 
-constructor TVRDX_Registry.Create;
+constructor TVDRX_Registry.Create;
 begin
   FLock := TCriticalSection.Create;
-  FMasterMap := TVRDX_ExecMasterMap.Create([doOwnsValues]);
-  FLiteralSubs := TVRDX_SubListDictionary.Create([doOwnsValues]);
-  FWildcardSubs := TVRDX_SubList.Create; // owns its Subscriptions
+  FMasterMap := TVDRX_ExecMasterMap.Create([doOwnsValues]);
+  FLiteralSubs := TVDRX_SubListDictionary.Create([doOwnsValues]);
+  FWildcardSubs := TVDRX_SubList.Create; // owns its Subscriptions
 end;
 
-destructor TVRDX_Registry.Destroy;
+destructor TVDRX_Registry.Destroy;
 begin
   FWildcardSubs.Free;
   FLiteralSubs.Free;
@@ -294,10 +294,10 @@ end;
 // executive - this is what lets one executive be registered under any number of
 // filters, e.g. Register(Logger, 'logger', 'log.>') then
 // Register(Logger, 'logger', 'irc.>').
-procedure TVRDX_Registry.Register(AExec: TVRDX_Executive; const AID, AFilter: string);
+procedure TVDRX_Registry.Register(AExec: TVDRX_Executive; const AID, AFilter: string);
 var
-  List: TVRDX_SubList;
-  Sub: TVRDX_Subscription;
+  List: TVDRX_SubList;
+  Sub: TVDRX_Subscription;
 begin
   FLock.Enter;
   try
@@ -306,14 +306,14 @@ begin
       AExec.ID := AID;
       FMasterMap.Add(AID, AExec);
     end;
-    Sub := TVRDX_Subscription.Create(AExec, AFilter);
+    Sub := TVDRX_Subscription.Create(AExec, AFilter);
     if (Pos('*', AFilter) > 0) or (Pos('>', AFilter) > 0) then
       FWildcardSubs.Add(Sub)
     else
     begin
       if not FLiteralSubs.TryGetValue(AFilter, List) then
       begin
-        List := TVRDX_SubList.Create;
+        List := TVDRX_SubList.Create;
         FLiteralSubs.Add(AFilter, List);
       end;
       List.Add(Sub);
@@ -325,10 +325,10 @@ end;
 
 // Removes every Subscription that points at AExec, from both the wildcard list and
 // every literal-filter bucket, without touching the MasterMap. Caller holds FLock.
-procedure TVRDX_Registry.RemoveSubscriptionsUnlocked(AExec: TVRDX_Executive);
+procedure TVDRX_Registry.RemoveSubscriptionsUnlocked(AExec: TVDRX_Executive);
 var
   i: Integer;
-  List: TVRDX_SubList;
+  List: TVDRX_SubList;
 begin
   for i := FWildcardSubs.Count - 1 downto 0 do
     if FWildcardSubs[i].Exec = AExec then
@@ -340,9 +340,9 @@ begin
         List.Delete(i);
 end;
 
-procedure TVRDX_Registry.ClearFilters(const AID: string);
+procedure TVDRX_Registry.ClearFilters(const AID: string);
 var
-  Exec: TVRDX_Executive;
+  Exec: TVDRX_Executive;
 begin
   FLock.Enter;
   try
@@ -353,11 +353,11 @@ begin
   end;
 end;
 
-procedure TVRDX_Registry.UnregisterFilter(const AID, AFilter: string);
+procedure TVDRX_Registry.UnregisterFilter(const AID, AFilter: string);
 var
-  Exec: TVRDX_Executive;
+  Exec: TVDRX_Executive;
   i: Integer;
-  List: TVRDX_SubList;
+  List: TVDRX_SubList;
 begin
   FLock.Enter;
   try
@@ -375,9 +375,9 @@ begin
   end;
 end;
 
-procedure TVRDX_Registry.Unregister(const AID: string);
+procedure TVDRX_Registry.Unregister(const AID: string);
 var
-  Exec: TVRDX_Executive;
+  Exec: TVDRX_Executive;
 begin
   FLock.Enter;
   try
@@ -393,14 +393,14 @@ end;
 // Same executive can be reachable via more than one matching Subscription (e.g. two
 // overlapping wildcard filters, or a literal + a wildcard both matching ATopic) -
 // dedupe so HandlePacket is never called twice for one message.
-function TVRDX_Registry.GetSubscribers(const ATopic: string): TVRDX_ExecList;
+function TVDRX_Registry.GetSubscribers(const ATopic: string): TVDRX_ExecList;
 var
-  Sub: TVRDX_Subscription;
-  List: TVRDX_SubList;
+  Sub: TVDRX_Subscription;
+  List: TVDRX_SubList;
 begin
   FLock.Enter;
   try
-    Result := TVRDX_ExecList.Create;
+    Result := TVDRX_ExecList.Create;
     if FLiteralSubs.TryGetValue(ATopic, List) then
       for Sub in List do
         if Result.IndexOf(Sub.Exec) < 0 then
@@ -414,12 +414,12 @@ begin
   end;
 end;
 
-procedure TVRDX_Registry.InitializeAll;
+procedure TVDRX_Registry.InitializeAll;
 var
-  Snapshot: TVRDX_ExecList;
-  Exec: TVRDX_Executive;
+  Snapshot: TVDRX_ExecList;
+  Exec: TVDRX_Executive;
 begin
-  Snapshot := TVRDX_ExecList.Create;
+  Snapshot := TVDRX_ExecList.Create;
   try
     FLock.Enter;
     try
@@ -437,12 +437,12 @@ begin
   end;
 end;
 
-procedure TVRDX_Registry.ShutdownAll;
+procedure TVDRX_Registry.ShutdownAll;
 var
-  Snapshot: TVRDX_ExecList;
-  Exec: TVRDX_Executive;
+  Snapshot: TVDRX_ExecList;
+  Exec: TVDRX_Executive;
 begin
-  Snapshot := TVRDX_ExecList.Create;
+  Snapshot := TVDRX_ExecList.Create;
   try
     FLock.Enter;
     try
@@ -457,12 +457,12 @@ begin
   end;
 end;
 
-procedure TVRDX_Registry.ApplyAllConfigs;
+procedure TVDRX_Registry.ApplyAllConfigs;
 var
-  Snapshot: TVRDX_ExecList;
-  Exec: TVRDX_Executive;
+  Snapshot: TVDRX_ExecList;
+  Exec: TVDRX_Executive;
 begin
-  Snapshot := TVRDX_ExecList.Create;
+  Snapshot := TVDRX_ExecList.Create;
   try
     FLock.Enter;
     try
@@ -477,26 +477,26 @@ begin
   end;
 end;
 
-{ TVRDX_Kernel }
+{ TVDRX_Kernel }
 
-constructor TVRDX_Kernel.Create;
+constructor TVDRX_Kernel.Create;
 begin
   inherited Create(True);
   FreeOnTerminate := False;
-  FRegistry := TVRDX_Registry.Create;
-  FQueue := TVRDX_MessageQueue.Create;
+  FRegistry := TVDRX_Registry.Create;
+  FQueue := TVDRX_MessageQueue.Create;
 end;
 
-destructor TVRDX_Kernel.Destroy;
+destructor TVDRX_Kernel.Destroy;
 begin
   inherited;
 end;
 
-procedure TVRDX_Kernel.Execute;
+procedure TVDRX_Kernel.Execute;
 var
-  Msg: TVRDX_Message;
-  Subscribers: TVRDX_ExecList;
-  Exec: TVRDX_Executive;
+  Msg: TVDRX_Message;
+  Subscribers: TVDRX_ExecList;
+  Exec: TVDRX_Executive;
 begin
   FRegistry.InitializeAll;
   while not Terminated do
@@ -523,7 +523,7 @@ begin
   WriteLn('Dispatcher: Exited loop cleanly.');
 end;
 
-procedure TVRDX_Kernel.Terminate;
+procedure TVDRX_Kernel.Terminate;
 begin
   inherited Terminate;
   FQueue.Publish('kernel.shutdown', '', '');

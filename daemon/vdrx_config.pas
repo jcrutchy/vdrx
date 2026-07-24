@@ -1,4 +1,4 @@
-unit vrdx_config;
+unit vdrx_config;
 
 {$mode ObjFPC}{$H+}
 
@@ -8,7 +8,7 @@ uses
   Classes, SysUtils, fpjson, jsonparser, SyncObjs;
 
 type
-  TVRDX_Config = class
+  TVDRX_Config = class
   private
     FData: TJSONObject;
     FLock: TCriticalSection;
@@ -25,21 +25,21 @@ type
 
 implementation
 
-constructor TVRDX_Config.Create(const AFilePath: string);
+constructor TVDRX_Config.Create(const AFilePath: string);
 begin
   FFilePath := AFilePath;
   FLock := TCriticalSection.Create;
   Reload;
 end;
 
-destructor TVRDX_Config.Destroy;
+destructor TVDRX_Config.Destroy;
 begin
   FData.Free;
   FLock.Free;
   inherited;
 end;
 
-function TVRDX_Config.GetString(APath: string; ADefault: string): string;
+function TVDRX_Config.GetString(APath: string; ADefault: string): string;
 begin
   FLock.Enter;
   try
@@ -52,7 +52,7 @@ begin
   end;
 end;
 
-function TVRDX_Config.GetInteger(APath: string; ADefault: Integer): Integer;
+function TVDRX_Config.GetInteger(APath: string; ADefault: Integer): Integer;
 begin
   FLock.Enter;
   try
@@ -65,7 +65,7 @@ begin
   end;
 end;
 
-function TVRDX_Config.GetBoolean(APath: string; ADefault: Boolean): Boolean;
+function TVDRX_Config.GetBoolean(APath: string; ADefault: Boolean): Boolean;
 begin
   FLock.Enter;
   try
@@ -78,7 +78,7 @@ begin
   end;
 end;
 
-function TVRDX_Config.GetStringArray(APath: string): TStringArray;
+function TVDRX_Config.GetStringArray(APath: string): TStringArray;
 var
   Node: TJSONData;
   Arr: TJSONArray;
@@ -99,7 +99,7 @@ begin
   end;
 end;
 
-procedure TVRDX_Config.Reload;
+procedure TVDRX_Config.Reload;
 var
   JSONString: TStringList;
 begin
