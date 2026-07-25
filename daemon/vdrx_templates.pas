@@ -5,53 +5,74 @@ unit vdrx_templates;
 interface
 
 uses
-  Classes, SysUtils, StrUtils, SyncObjs, vdrx_config;
+  Classes, SysUtils, StrUtils, SyncObjs, Generics.Collections, vdrx_config;
 
 type
-  // Recursive template engine, modeled on webdb's PHP one (see Jared's webdb repo)
-  // but reimplemented here in Pascal so vdrx_http.pas (or anything else) can use it
-  // without a PHP dependency.
+  // One loop iteration's params (Name=Value, same shape as Fill's AParams).
+  TVDRX_TemplateRows = specialize TObjectList<TStringList>; // owns its rows
+  // Loop name -> its rows, passed into Fill alongside AParams.
+  TVDRX_TemplateNamedRows = specialize TObjectDictionary<string, TVDRX_TemplateRows>; // owns its TVDRX_TemplateRows
+
+  // Recursive template engine, modeled on webdb's PHP one but reimplemented in
+  // Pascal. Five placeholder kinds, resolved in this order for every
+  // template's raw text:
+  //   $$SETTING$$              -> TVDRX_Config, looked up as 'settings.<name>'
+  //   ??CONST??                -> app-registered constants (SetConstant)
+  //   @@child@@                -> another template's filled content, recursive
+  //   ##loop:name##...##endloop:name##
+  //                             -> repeats its body once per row in
+  //                                ARows['name'] (see Fill), with that row's
+  //                                Name=Value params merged OVER the caller's
+  //                                AParams (row wins on collision) and
+  //                                substituted into the body immediately -
+  //                                this has to happen before the final %%
+  //                                pass below, since two rows using the same
+  //                                %%field%% name need different values.
+  //                                Unknown/absent loop names render zero rows.
+  //   %%var%%                  -> caller-supplied per-call values (AParams),
+  //                                substituted exactly once, over the fully
+  //                                assembled result, after every level of
+  //                                child/loop recursion has resolved - the
+  //                                same "$params argument" behavior this was
+  //                                modeled on.
   //
-  // Four placeholder kinds, resolved in this order for every template's raw text:
-  //   $$SETTING$$   -> TVDRX_Config, looked up as 'settings.<name>'
-  //   ??CONST??     -> app-registered constants (SetConstant), not config-reloadable
-  //   @@child@@     -> another template's filled content, recursive
-  //   %%var%%       -> caller-supplied per-call values (the Fill AParams argument) -
-  //                    substituted exactly once, over the fully-assembled result,
-  //                    after every level of child recursion has already resolved -
-  //                    matching the "$params argument" behavior in the spec this
-  //                    was modeled on.
+  // Cycle prevention on @@children@@ is per-branch, not global - see
+  // ReplaceChildren. Loops don't recurse into themselves (a loop body isn't a
+  // named template), so they don't need the same guard.
   //
-  // Cycle prevention is per-branch, not global: FillRecursive tracks the chain of
-  // ancestor template names for the current recursion path and refuses to expand a
-  // child that's already an ancestor of itself (left as an unexpanded @@name@@
-  // rather than silently dropped, so a cycle is visible in the output instead of
-  // just vanishing). The same template name can still appear multiple times at one
-  // level, or independently in sibling branches - only actual self-inclusion is
-  // blocked.
+  // Templates are loaded from disk ON DEMAND and cached in memory from then
+  // on - Create/Reload never scan or read the whole directory up front, only
+  // Fill()'ing a given name for the first time touches disk for it. Template
+  // files are named '<name>.tpl' under ATemplateDir (flat, not recursive into
+  // subdirectories).
   TVDRX_TemplateStore = class
   private
     FLock: TCriticalSection;
-    FTemplates: TStringList; // Name=Content, loaded from FDir
+    FTemplates: TStringList; // Name=Value cache; Value = raw file content (or '' if the file didn't exist - cached too, so a bad name doesn't re-stat every request)
     FConstants: TStringList; // Name=Value, set via SetConstant
     FConfig: TVDRX_Config;
     FDir: string;
     function LookupSetting(const AName: string): string;
     function LookupConstant(const AName: string): string;
-    function ReplaceChildren(const S: string; AChain: TStringList): string;
+    function LoadTemplateCached(const AName: string): string;
+    function ReplaceChildren(const S: string; AChain: TStringList; AParams: TStringList; ARows: TVDRX_TemplateNamedRows): string;
+    function ReplaceLoops(const S: string; AParams: TStringList; ARows: TVDRX_TemplateNamedRows): string;
     function ReplaceParams(const S: string; AParams: TStringList): string;
-    function FillRecursive(const AName: string; AChain: TStringList): string;
+    function FillRecursive(const AName: string; AChain: TStringList; AParams: TStringList; ARows: TVDRX_TemplateNamedRows): string;
   public
     constructor Create(AConfig: TVDRX_Config; const ATemplateDir: string);
     destructor Destroy; override;
-    // (Re)loads every file directly under ATemplateDir - not recursive into
-    // subdirectories, matching "stored in the templates subdirectory" as a flat
-    // layout. Template name = filename without extension.
+    // Drops the whole in-memory cache - the next Fill() for any template name
+    // reloads it from disk on demand, picking up on-disk edits. This is what
+    // 'sys.reload' triggers (see vdrx_admin.pas) - it does NOT eagerly reload
+    // everything, just makes the next access per-name fresh again.
     procedure Reload;
     procedure SetConstant(const AName, AValue: string);
-    // AParams is an optional Name=Value TStringList (TStringList.Values[] shape),
-    // matching the $params argument this was modeled on. Caller keeps ownership.
-    function Fill(const ATemplateName: string; AParams: TStringList = nil): string;
+    // AParams is an optional Name=Value TStringList, matching the $params
+    // argument this was modeled on. ARows is an optional loop-name -> rows
+    // map for any ##loop:name## blocks anywhere in the template or its
+    // children. Caller keeps ownership of both.
+    function Fill(const ATemplateName: string; AParams: TStringList = nil; ARows: TVDRX_TemplateNamedRows = nil): string;
   end;
 
 implementation
@@ -100,7 +121,7 @@ begin
   FConstants := TStringList.Create;
   FConfig := AConfig;
   FDir := ATemplateDir;
-  Reload;
+  // Deliberately no directory scan/eager load here - see unit comment.
 end;
 
 destructor TVDRX_TemplateStore.Destroy;
@@ -112,33 +133,10 @@ begin
 end;
 
 procedure TVDRX_TemplateStore.Reload;
-var
-  SR: TSearchRec;
-  SL: TStringList;
-  Name: string;
 begin
   FLock.Enter;
   try
     FTemplates.Clear;
-    if not DirectoryExists(FDir) then Exit;
-    if FindFirst(IncludeTrailingPathDelimiter(FDir) + '*', faAnyFile, SR) = 0 then
-    begin
-      try
-        repeat
-          if (SR.Attr and faDirectory) <> 0 then Continue;
-          Name := ChangeFileExt(SR.Name, '');
-          SL := TStringList.Create;
-          try
-            SL.LoadFromFile(IncludeTrailingPathDelimiter(FDir) + SR.Name);
-            FTemplates.Values[Name] := SL.Text;
-          finally
-            SL.Free;
-          end;
-        until FindNext(SR) <> 0;
-      finally
-        FindClose(SR);
-      end;
-    end;
   finally
     FLock.Leave;
   end;
@@ -164,7 +162,52 @@ begin
   Result := FConstants.Values[AName];
 end;
 
-function TVDRX_TemplateStore.ReplaceChildren(const S: string; AChain: TStringList): string;
+function TVDRX_TemplateStore.LoadTemplateCached(const AName: string): string;
+var
+  SL: TStringList;
+  Path: string;
+  Idx: Integer;
+begin
+  FLock.Enter;
+  try
+    Idx := FTemplates.IndexOfName(AName);
+    if Idx >= 0 then
+      Exit(FTemplates.ValueFromIndex[Idx]); // already cached - served from memory, no disk touch
+  finally
+    FLock.Leave;
+  end;
+
+  // Not cached yet - read from disk now, outside the lock (file IO shouldn't
+  // block other requests' cache lookups), then cache it for next time.
+  Path := IncludeTrailingPathDelimiter(FDir) + AName + '.tpl';
+  Result := '';
+  if FileExists(Path) then
+  begin
+    SL := TStringList.Create;
+    try
+      SL.LoadFromFile(Path);
+      Result := SL.Text;
+    finally
+      SL.Free;
+    end;
+  end;
+
+  FLock.Enter;
+  try
+    Idx := FTemplates.IndexOfName(AName);
+    if Idx >= 0 then
+      Result := FTemplates.ValueFromIndex[Idx] // lost a race with another thread loading the same name - use theirs
+    else
+      FTemplates.Add(AName + '=' + Result); // Add() rather than Values[]'s setter - avoids that
+                                             // property's ini-style "empty value deletes/omits
+                                             // the entry" ambiguity, which would defeat caching
+                                             // a miss (empty Result for a nonexistent file)
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TVDRX_TemplateStore.ReplaceChildren(const S: string; AChain: TStringList; AParams: TStringList; ARows: TVDRX_TemplateNamedRows): string;
 var
   Pos1, Pos2, SearchFrom: Integer;
   ChildName: string;
@@ -189,11 +232,70 @@ begin
     Result := Result + Copy(S, SearchFrom, Pos1 - SearchFrom);
     if AChain.IndexOf(ChildName) >= 0 then
       Result := Result + '@@' + ChildName + '@@' // cycle - leave visible rather than recurse forever or vanish silently
-    else if FTemplates.IndexOfName(ChildName) >= 0 then
-      Result := Result + FillRecursive(ChildName, AChain)
+    else if LoadTemplateCached(ChildName) <> '' then
+      Result := Result + FillRecursive(ChildName, AChain, AParams, ARows)
     // else: unknown template name - drop silently, consistent with settings/constants misses
     ;
     SearchFrom := Pos2 + 2;
+  end;
+end;
+
+// Expands ##loop:name##body##endloop:name## blocks. Body is rendered once per
+// row in ARows[name], with that row's Name=Value params merged over AParams
+// (row wins) and substituted immediately via ReplaceParams - deliberately NOT
+// deferred to the final Fill-level %% pass, since different rows need
+// different values for the same %%field%% name. Text outside any loop block
+// is passed through untouched, so its own %%vars%% still resolve at the end
+// exactly as before.
+function TVDRX_TemplateStore.ReplaceLoops(const S: string; AParams: TStringList; ARows: TVDRX_TemplateNamedRows): string;
+var
+  Pos1, Pos2, EndTagPos, SearchFrom, i: Integer;
+  LoopName, Body, EndTag: string;
+  Rows: TVDRX_TemplateRows;
+  Row, Merged: TStringList;
+begin
+  Result := '';
+  SearchFrom := 1;
+  while True do
+  begin
+    Pos1 := PosEx('##loop:', S, SearchFrom);
+    if Pos1 = 0 then
+    begin
+      Result := Result + Copy(S, SearchFrom, Length(S));
+      Break;
+    end;
+    Pos2 := PosEx('##', S, Pos1 + 7); // closes the opening "##loop:NAME##" tag
+    if Pos2 = 0 then
+    begin
+      Result := Result + Copy(S, SearchFrom, Length(S));
+      Break;
+    end;
+    LoopName := Copy(S, Pos1 + 7, Pos2 - (Pos1 + 7));
+    EndTag := '##endloop:' + LoopName + '##';
+    EndTagPos := PosEx(EndTag, S, Pos2 + 2);
+    if EndTagPos = 0 then
+    begin
+      Result := Result + Copy(S, SearchFrom, Length(S)); // unclosed - leave the rest untouched
+      Break;
+    end;
+    Body := Copy(S, Pos2 + 2, EndTagPos - (Pos2 + 2));
+    Result := Result + Copy(S, SearchFrom, Pos1 - SearchFrom);
+
+    if Assigned(ARows) and ARows.TryGetValue(LoopName, Rows) then
+      for Row in Rows do
+      begin
+        Merged := TStringList.Create;
+        try
+          if Assigned(AParams) then Merged.Assign(AParams);
+          for i := 0 to Row.Count - 1 do
+            Merged.Values[Row.Names[i]] := Row.ValueFromIndex[i];
+          Result := Result + ReplaceParams(Body, Merged);
+        finally
+          Merged.Free;
+        end;
+      end;
+
+    SearchFrom := EndTagPos + Length(EndTag);
   end;
 end;
 
@@ -228,41 +330,37 @@ begin
   end;
 end;
 
-function TVDRX_TemplateStore.FillRecursive(const AName: string; AChain: TStringList): string;
+function TVDRX_TemplateStore.FillRecursive(const AName: string; AChain: TStringList; AParams: TStringList; ARows: TVDRX_TemplateNamedRows): string;
 var
   Raw: string;
   NewChain: TStringList;
 begin
-  Raw := FTemplates.Values[AName];
+  Raw := LoadTemplateCached(AName);
   Raw := ReplaceTags(Raw, '$$', '$$', @LookupSetting);
   Raw := ReplaceTags(Raw, '??', '??', @LookupConstant);
   NewChain := TStringList.Create;
   try
     NewChain.Assign(AChain);
     NewChain.Add(AName);
-    Result := ReplaceChildren(Raw, NewChain);
+    Result := ReplaceChildren(Raw, NewChain, AParams, ARows);
   finally
     NewChain.Free;
   end;
+  Result := ReplaceLoops(Result, AParams, ARows); // after children, so a child's own loop blocks (brought in by @@) get expanded too
 end;
 
-function TVDRX_TemplateStore.Fill(const ATemplateName: string; AParams: TStringList): string;
+function TVDRX_TemplateStore.Fill(const ATemplateName: string; AParams: TStringList; ARows: TVDRX_TemplateNamedRows): string;
 var
   Chain: TStringList;
 begin
-  FLock.Enter;
+  if LoadTemplateCached(ATemplateName) = '' then Exit('');
+  Chain := TStringList.Create;
   try
-    if FTemplates.IndexOfName(ATemplateName) < 0 then Exit('');
-    Chain := TStringList.Create;
-    try
-      Result := FillRecursive(ATemplateName, Chain);
-    finally
-      Chain.Free;
-    end;
+    Result := FillRecursive(ATemplateName, Chain, AParams, ARows);
   finally
-    FLock.Leave;
+    Chain.Free;
   end;
-  Result := ReplaceParams(Result, AParams); // outside FLock - doesn't touch shared state
+  Result := ReplaceParams(Result, AParams); // final outer-level %% pass - anything already consumed inside a loop body no longer contains %% by this point
 end;
 
 end.

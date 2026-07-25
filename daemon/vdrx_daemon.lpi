@@ -31,27 +31,22 @@
       <Unit>
         <Filename Value="vdrx_core.pas"/>
         <IsPartOfProject Value="True"/>
-        <UnitName Value="vdrx_core"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_irc.pas"/>
         <IsPartOfProject Value="True"/>
-        <UnitName Value="vdrx_irc"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_logger.pas"/>
         <IsPartOfProject Value="True"/>
-        <UnitName Value="vdrx_logger"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_config.pas"/>
         <IsPartOfProject Value="True"/>
-        <UnitName Value="vdrx_config"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_admin.pas"/>
         <IsPartOfProject Value="True"/>
-        <UnitName Value="vdrx_admin"/>
       </Unit>
     </Units>
   </ProjectOptions>

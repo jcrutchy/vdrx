@@ -1,5 +1,16 @@
 program vdrx_daemon;
 
+{
+  todo list:
+    1. serve http requests using templates
+    2. flesh out the whiteboard features and get it working properly
+    3. build a web page that makes ajax requests, has a websocket connection, and an irc connection, all via a single port to the daemon
+         (why? probably no practical reason, but will demonstrate features and flexibility of the daemon)
+    4. some more ircd features (built-in nickserv & chanserv)
+    5. simple multiplayer web-based plague inc game
+    6. web-based mud game
+}
+
 {$mode objfpc}{$H+}
 
 uses
@@ -33,6 +44,7 @@ var
   Whiteboard: TVDRX_WhiteboardExecutive;
   WS: TVDRX_WebSocketExecutive;
   HTTP: TVDRX_HTTPExecutive;
+  Templates: TVDRX_TemplateStore;
   ShutdownGraceMs: Integer;
   DoRestart: Boolean;
   NewProc: TProcess;
@@ -107,9 +119,11 @@ begin
     Kernel.Registry.Register(WS, 'ws', 'sys.none'); // each connection registers itself
   end;
 
+  Templates := TVDRX_TemplateStore.Create(Config, Config.GetString('template_dir', 'templates'));
   if Config.GetBoolean('executives.http.enabled', False) then
   begin
-    HTTP := TVDRX_HTTPExecutive.Create(Kernel.Queue, Config, Whiteboard);
+    HTTP := TVDRX_HTTPExecutive.Create(Kernel.Queue, Config, Whiteboard, Templates,
+      Config.GetString('static_dir', 'static'));
     HTTP.Port := Config.GetInteger('executives.http.port', 8081);
     HTTP.GracefulTimeoutMs := ShutdownGraceMs;
     ConfigureListenerTLS(HTTP, 'executives.http');
@@ -133,6 +147,7 @@ begin
                    // and ShutdownAll has finished tearing everything down cleanly
   DoRestart := Kernel.RestartRequested; // read before Free below
   Kernel.Free;
+  Templates.Free;
   Config.Free;
 
   WriteLn('Daemon stopped.');

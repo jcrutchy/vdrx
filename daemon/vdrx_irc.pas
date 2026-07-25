@@ -6,7 +6,7 @@ interface
 
 uses
   Classes, SysUtils, Sockets, SyncObjs, StrUtils, fpjson, jsonparser,
-  vdrx_core, vdrx_socketlistener, vdrx_transport, vdrx_config, vdrx_admincmd;
+  vdrx_core, vdrx_socketlistener, vdrx_transport, vdrx_config, vdrx_admincmd, vdrx_procutil;
 
 type
   TVDRX_IRCDExecutive = class;
@@ -567,7 +567,7 @@ begin
 
   if FRegistered then
     DoQuitAllChannels('Connection closed');
-  FListener.Registry.Unregister(ID);
+  FListener.Registry.UnregisterSelf(ID); // NOT Unregister - this is our own thread; see vdrx_core.pas's UnregisterSelf comment
 end;
 
 procedure TVDRX_IRCConnection.Initialize;
@@ -582,9 +582,14 @@ begin
   if Assigned(FThread) then
   begin
     FThread.Terminate();
-    FThread.WaitFor;
-    FThread.Free;
-    FThread := nil;
+    if WaitThreadOrTimeout(FThread, FListener.GracefulTimeoutMs) then
+    begin
+      FThread.Free;
+      FThread := nil;
+    end
+    else
+      // Same class of bug as TVDRX_WSConnection.Shutdown - see its comment.
+      Bus.Publish('log.warn', 'ircd ' + ID + ': connection thread did not exit in time - abandoning it', ID);
   end;
 end;
 

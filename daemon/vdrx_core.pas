@@ -135,6 +135,16 @@ type
     procedure InitializeAll;
     procedure ShutdownAll;
     procedure ApplyAllConfigs;
+    // Drops the AID entry WITHOUT calling Shutdown - for an executive's own
+    // thread to call on itself when it's exiting normally (e.g. a
+    // connection's RunLoop reaching its natural end after the client
+    // disconnects). Unregister (above) calls Shutdown first, which includes
+    // a WaitFor on that executive's own thread - fine when called from some
+    // OTHER thread (admin's sys.kill/sys.killall), but a thread can never
+    // WaitFor itself: that's an immediate, silent deadlock. This is the
+    // symptom that showed up as "'quit' does nothing after the dashboard's
+    // WebSocket connection has opened and closed once" - found this session.
+    procedure UnregisterSelf(const AID: string);
   end;
 
   { TVDRX_Kernel }
@@ -507,6 +517,21 @@ begin
       Exec.ApplyConfig;
   finally
     Snap.Free;
+  end;
+end;
+
+procedure TVDRX_Registry.UnregisterSelf(const AID: string);
+var
+  Exec: TVDRX_Executive;
+begin
+  FLock.Enter;
+  try
+    if not FMasterMap.TryGetValue(AID, Exec) then
+      Exit;
+    RemoveSubscriptionsUnlocked(Exec);
+    FMasterMap.Remove(AID); // owning map - frees Exec via its plain destructor, no Shutdown call
+  finally
+    FLock.Leave;
   end;
 end;
 

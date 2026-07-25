@@ -6,7 +6,7 @@ interface
 
 uses
   Classes, SysUtils, Sockets, SyncObjs, base64, sha1, fpjson, jsonparser,
-  vdrx_core, vdrx_socketlistener, vdrx_transport, vdrx_config;
+  vdrx_core, vdrx_socketlistener, vdrx_transport, vdrx_config, vdrx_procutil;
 
 const
   WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -301,7 +301,7 @@ begin
     if not ReadFrame(Payload, Opcode) then Break;
     if Opcode = 1 then HandleRPC(Payload);
   end;
-  FListener.Registry.Unregister(ID); // clean up on disconnect
+  FListener.Registry.UnregisterSelf(ID); // NOT Unregister - this is our own thread; see vdrx_core.pas's UnregisterSelf comment
 end;
 
 procedure TVDRX_WSConnection.Initialize;
@@ -315,9 +315,17 @@ begin
   FTransport.Close; // unblocks the blocking Read in RunLoop
   if Assigned(FThread) then
   begin
-    FThread.WaitFor;
-    FThread.Free;
-    FThread := nil;
+    if WaitThreadOrTimeout(FThread, FListener.GracefulTimeoutMs) then
+    begin
+      FThread.Free;
+      FThread := nil;
+    end
+    else
+      // Shouldn't happen now that natural disconnects go through
+      // UnregisterSelf instead of self-joining - kept as a bound rather than
+      // an unbounded WaitFor in case some other stall keeps the transport
+      // close from unblocking the read promptly.
+      Bus.Publish('log.warn', 'ws ' + ID + ': connection thread did not exit in time - abandoning it', ID);
   end;
 end;
 
