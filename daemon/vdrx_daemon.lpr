@@ -76,7 +76,7 @@ var
   Rows: TVDRX_ConfigRows;
   Row: TStringList;
   Bridge: TVDRX_BridgeExecutive;
-  n: Integer;
+  n, BridgeGraceMs: Integer;
 begin
   SetLength(ARoutes, 0);
   Rows := AConfig.GetObjectArray('proxy_bridges');
@@ -90,19 +90,25 @@ begin
       end;
       Bridge := TVDRX_BridgeExecutive.Create(Kernel.Queue);
       Bridge.Command := Row.Values['command'];
-      Bridge.GracefulTimeoutMs := AGracefulMs;
-      // 'sys.none' - this is a supervised child process, not a bus participant;
-      // it never gets bus messages piped into its stdin (unlike a Bridge used
-      // for the JSON-line protocol elsewhere) and doesn't need to be.
+      // Most simple dev web servers (php -S included) don't respond to a
+      // graceful-shutdown hint at all - SIGTERM does work on Unix, but
+      // there's genuinely no equivalent on Windows (see vdrx_procutil.pas's
+      // TryGracefulTerminate). Waiting the full shutdown_grace_ms on every
+      // quit/restart just to then force-kill it anyway wastes real time -
+      // override per-bridge via "graceful_timeout_ms" in its proxy_bridges
+      // entry; falls back to the daemon-wide default if not set.
+      BridgeGraceMs := StrToIntDef(Row.Values['graceful_timeout_ms'], AGracefulMs);
+      Bridge.GracefulTimeoutMs := BridgeGraceMs;
       ARegistry.Register(Bridge, Row.Values['id'], 'sys.none');
 
       n := Length(ARoutes);
       SetLength(ARoutes, n + 1);
       ARoutes[n].Prefix := Row.Values['prefix'];
-      ARoutes[n].Host := StrUtils.IfThen(Row.Values['host'] <> '', Row.Values['host'], '127.0.0.1');
+      ARoutes[n].Host := IfThen(Row.Values['host'] <> '', Row.Values['host'], '127.0.0.1');
       ARoutes[n].Port := StrToIntDef(Row.Values['port'], 0);
       WriteLn('  Proxy bridge "', Row.Values['id'], '": ', ARoutes[n].Prefix, ' -> ',
-        ARoutes[n].Host, ':', ARoutes[n].Port, ' (', Row.Values['command'], ')');
+        ARoutes[n].Host, ':', ARoutes[n].Port, ' (', Row.Values['command'],
+        ', graceful_timeout_ms=', BridgeGraceMs, ')');
     end;
   finally
     Rows.Free;

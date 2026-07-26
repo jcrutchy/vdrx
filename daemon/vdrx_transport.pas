@@ -83,22 +83,49 @@ function ConnectTCP(const AHost: string; APort: Word): TVDRX_Transport;
 
 implementation
 
+// Parses a plain "a.b.c.d" IPv4 address into the 4 bytes sockaddr_in.sin_addr
+// needs, in the correct (network) byte order - dotted-quad notation is
+// already MSB-first, so filling Bytes[0..3] in left-to-right reading order
+// and copying them straight into sin_addr is correct with no byte-swap step.
+// Deliberately hand-rolled rather than relying on the Sockets unit's own
+// string-to-address helper: an earlier version of this function used
+// StrToHostAddr and was never actually verified against this FPC version -
+// it silently produced the wrong address, which is why every connect()
+// attempt hung for ~21s (Windows' default SYN-retry timeout for a target
+// that never responds) instead of failing or succeeding immediately.
+function ParseIPv4(const AHost: string; out AAddr: Cardinal): Boolean;
+var
+  Parts: TStringArray;
+  i, b: Integer;
+  Bytes: array[0..3] of Byte;
+begin
+  Result := False;
+  Parts := AHost.Split(['.']);
+  if Length(Parts) <> 4 then Exit;
+  for i := 0 to 3 do
+  begin
+    if not TryStrToInt(Parts[i], b) then Exit;
+    if (b < 0) or (b > 255) then Exit;
+    Bytes[i] := Byte(b);
+  end;
+  Move(Bytes[0], AAddr, 4);
+  Result := True;
+end;
+
 function ConnectTCP(const AHost: string; APort: Word): TVDRX_Transport;
 var
   Sock: TSocket;
   Addr: TInetSockAddr;
-  HA: THostAddr;
+  IPBytes: Cardinal;
 begin
   Result := nil;
+  if not ParseIPv4(AHost, IPBytes) then Exit; // dotted-quad IPv4 only - matches the loopback-only proxy design, no DNS resolution needed
   Sock := fpSocket(AF_INET, SOCK_STREAM, 0);
   if Sock < 0 then Exit;
-  HA := StrToHostAddr(AHost); // NB: low confidence on this exact identifier across FPC versions -
-                               // if it doesn't compile, the Sockets unit's equivalent dotted-quad
-                               // parser is the fix; the Move() below only needs it to be a 4-byte value
   FillChar(Addr, SizeOf(Addr), 0);
   Addr.sin_family := AF_INET;
   Addr.sin_port := htons(APort);
-  Move(HA, Addr.sin_addr, SizeOf(Addr.sin_addr));
+  Move(IPBytes, Addr.sin_addr, SizeOf(Addr.sin_addr));
   if fpConnect(Sock, @Addr, SizeOf(Addr)) <> 0 then
   begin
     CloseSocket(Sock);

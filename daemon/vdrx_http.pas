@@ -295,16 +295,32 @@ end;
 
 function ProxyRequest(const ARequest: string; const ARoute: TVDRX_ProxyRoute;
   ABus: TVDRX_MessageQueue; const ASourceID: string): string;
+const
+  MAX_CONNECT_ATTEMPTS = 5;
+  RETRY_DELAY_MS = 150;
 var
   Transport: TVDRX_Transport;
   Buf: array[0..8191] of Byte;
-  Received: Integer;
+  Received, Attempt: Integer;
   Outgoing: string;
 begin
-  Transport := ConnectTCP(ARoute.Host, ARoute.Port);
+  Transport := nil;
+  for Attempt := 1 to MAX_CONNECT_ATTEMPTS do
+  begin
+    Transport := ConnectTCP(ARoute.Host, ARoute.Port);
+    if Assigned(Transport) then Break;
+    // The backend can take a moment to finish starting and bind its port
+    // after Bridge spawns it - a request landing in that window (most
+    // likely right after the daemon itself just started, or right after
+    // 'sys.restart') would otherwise get a spurious 502 on an
+    // otherwise-healthy setup. A few short retries covers that startup
+    // race without masking a genuinely-down backend for long.
+    if Attempt < MAX_CONNECT_ATTEMPTS then
+      Sleep(RETRY_DELAY_MS);
+  end;
   if not Assigned(Transport) then
   begin
-    ABus.Publish('log.error', Format('http proxy: could not connect to %s:%d - is the bridge process up? (check its own log lines above, and "kill <bridge-id>" / restart if it looks wedged)', [ARoute.Host, ARoute.Port]), ASourceID);
+    ABus.Publish('log.error', Format('http proxy: could not connect to %s:%d after %d attempt(s) - is the bridge process up? (check its own log lines above, and "kill <bridge-id>" to bounce it if it looks wedged)', [ARoute.Host, ARoute.Port, MAX_CONNECT_ATTEMPTS]), ASourceID);
     Exit(PlainResponse('502 Bad Gateway', 'text/plain', 'Upstream unavailable'));
   end;
 
