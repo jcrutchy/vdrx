@@ -16,12 +16,13 @@ type
     FTemplates: TVDRX_TemplateStore;
     FConfig: TVDRX_Config;
     FStaticDir: string;
+    FProxyRoutes: TVDRX_ProxyRoutes;
   protected
     procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
     constructor Create(ABus: TVDRX_MessageQueue; AWhiteboard: TVDRX_WhiteboardExecutive;
       AWebSocket: TVDRX_WebSocketExecutive; ATemplates: TVDRX_TemplateStore;
-      AConfig: TVDRX_Config; const AStaticDir: string); reintroduce;
+      AConfig: TVDRX_Config; const AStaticDir: string; const AProxyRoutes: TVDRX_ProxyRoutes); reintroduce;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
   end;
 
@@ -29,7 +30,8 @@ implementation
 
 constructor TVDRX_WebListenerExecutive.Create(ABus: TVDRX_MessageQueue;
   AWhiteboard: TVDRX_WhiteboardExecutive; AWebSocket: TVDRX_WebSocketExecutive;
-  ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string);
+  ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
+  const AProxyRoutes: TVDRX_ProxyRoutes);
 begin
   inherited Create(ABus);
   FWhiteboard := AWhiteboard;
@@ -37,6 +39,7 @@ begin
   FTemplates := ATemplates;
   FConfig := AConfig;
   FStaticDir := AStaticDir;
+  FProxyRoutes := AProxyRoutes;
   Port := 80;
 end;
 
@@ -59,7 +62,7 @@ begin
     FWebSocket.AdoptConnection(ATransport, Request)
   else
   begin
-    Response := TVDRX_HTTPExecutive.BuildResponse(Request, FWhiteboard, FTemplates, FConfig, FStaticDir, Bus, ID);
+    Response := TVDRX_HTTPExecutive.BuildResponse(Request, FWhiteboard, FTemplates, FConfig, FStaticDir, FProxyRoutes, Bus, ID);
     ATransport.Write(Response[1], Length(Response));
     ATransport.Close;
     ATransport.Free;
@@ -68,7 +71,7 @@ end;
 
 procedure TVDRX_WebListenerExecutive.HandlePacket(const AMsg: TVDRX_Message);
 begin
-  // Request/response + hand-off only - nothing to do on the bus-message path.
+  // Request/response + hand-off only.
 end;
 
 end.

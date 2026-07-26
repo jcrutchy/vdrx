@@ -5,9 +5,16 @@ unit vdrx_config;
 interface
 
 uses
-  Classes, SysUtils, fpjson, jsonparser, SyncObjs;
+  Classes, SysUtils, fpjson, jsonparser, SyncObjs, Generics.Collections;
 
 type
+  // One TStringList (Name=Value, scalar fields only - a nested object/array
+  // inside an entry is skipped) per object in a config array - same row
+  // shape as TVDRX_TemplateRows in vdrx_templates.pas, reused here for the
+  // same reason: it's a simple, generic "flat record" shape that's easy for
+  // any caller to consume without needing to know fpjson at all.
+  TVDRX_ConfigRows = specialize TObjectList<TStringList>; // owns its rows
+
   TVDRX_Config = class
   private
     FData: TJSONObject;
@@ -20,6 +27,14 @@ type
     function GetInteger(APath: string; ADefault: Integer): Integer;
     function GetBoolean(APath: string; ADefault: Boolean): Boolean;
     function GetStringArray(APath: string): TStringArray;
+    // Parses every object in the JSON array at APath into its own row.
+    // Deliberately builds the whole result INSIDE the lock and returns
+    // caller-owned copies (TStringLists), rather than handing back a raw
+    // TJSONArray reference - a reference into FData would dangle the moment
+    // a concurrent Reload() (triggered by 'sys.reload', on a different
+    // thread) frees and replaces it mid-iteration. Caller owns and frees
+    // the result.
+    function GetObjectArray(APath: string): TVDRX_ConfigRows;
     procedure Reload;
   end;
 
@@ -94,6 +109,36 @@ begin
     SetLength(Result, Arr.Count);
     for i := 0 to Arr.Count - 1 do
       Result[i] := Arr.Strings[i];
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TVDRX_Config.GetObjectArray(APath: string): TVDRX_ConfigRows;
+var
+  Node: TJSONData;
+  Arr: TJSONArray;
+  i, j: Integer;
+  Obj: TJSONObject;
+  Row: TStringList;
+begin
+  Result := TVDRX_ConfigRows.Create;
+  FLock.Enter;
+  try
+    if not Assigned(FData) then Exit;
+    Node := FData.FindPath(APath);
+    if not Assigned(Node) or not (Node is TJSONArray) then Exit;
+    Arr := TJSONArray(Node);
+    for i := 0 to Arr.Count - 1 do
+      if Arr[i] is TJSONObject then
+      begin
+        Obj := TJSONObject(Arr[i]);
+        Row := TStringList.Create;
+        for j := 0 to Obj.Count - 1 do
+          if Obj.Items[j].JSONType in [jtString, jtNumber, jtBoolean] then
+            Row.Values[Obj.Names[j]] := Obj.Items[j].AsString;
+        Result.Add(Row);
+      end;
   finally
     FLock.Leave;
   end;

@@ -5,7 +5,7 @@ unit vdrx_transport;
 interface
 
 uses
-  Classes, SysUtils, Sockets, openssl;
+  Classes, SysUtils, Sockets, openssl, resolve;
 
 type
   // Byte-stream abstraction over an accepted connection - lets every protocol
@@ -73,7 +73,39 @@ type
     property Ctx: PSSL_CTX read FCtx;
   end;
 
+// Opens a client TCP connection to AHost:APort - for reverse-proxying to a
+// locally-managed backend (see vdrx_http.pas's proxy_bridges). Returns nil
+// on failure. IPv4 dotted-quad host only (matches this whole codebase's
+// AF_INET-only assumption elsewhere) and plaintext only - nothing here
+// talks TLS as a CLIENT, which is fine since backends are loopback-only by
+// design (see vdrx_http.pas's ProxyRequest).
+function ConnectTCP(const AHost: string; APort: Word): TVDRX_Transport;
+
 implementation
+
+function ConnectTCP(const AHost: string; APort: Word): TVDRX_Transport;
+var
+  Sock: TSocket;
+  Addr: TInetSockAddr;
+  HA: THostAddr;
+begin
+  Result := nil;
+  Sock := fpSocket(AF_INET, SOCK_STREAM, 0);
+  if Sock < 0 then Exit;
+  HA := StrToHostAddr(AHost); // NB: low confidence on this exact identifier across FPC versions -
+                               // if it doesn't compile, the Sockets unit's equivalent dotted-quad
+                               // parser is the fix; the Move() below only needs it to be a 4-byte value
+  FillChar(Addr, SizeOf(Addr), 0);
+  Addr.sin_family := AF_INET;
+  Addr.sin_port := htons(APort);
+  Move(HA, Addr.sin_addr, SizeOf(Addr.sin_addr));
+  if fpConnect(Sock, @Addr, SizeOf(Addr)) <> 0 then
+  begin
+    CloseSocket(Sock);
+    Exit;
+  end;
+  Result := TVDRX_PlainTransport.Create(Sock);
+end;
 
 { TVDRX_PlainTransport }
 

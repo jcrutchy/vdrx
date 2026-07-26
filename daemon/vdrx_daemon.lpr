@@ -18,6 +18,7 @@ uses
   cthreads,
   {$ENDIF}
   Classes,
+  StrUtils,
   SysUtils,
   Process,
   vdrx_core,
@@ -45,6 +46,7 @@ var
   WS: TVDRX_WebSocketExecutive;
   HTTP: TVDRX_HTTPExecutive;
   Templates: TVDRX_TemplateStore;
+  ProxyRoutes: TVDRX_ProxyRoutes;
   ShutdownGraceMs: Integer;
   DoRestart: Boolean;
   NewProc: TProcess;
@@ -66,6 +68,45 @@ begin
   else if AListener.TLSPort <> 0 then
     WriteLn('  ', AName, ' TLS was configured (port ', AListener.TLSPort,
       ') but failed to come up - check tls_cert/tls_key and that libssl is loadable.');
+end;
+
+procedure SetupProxyBridges(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry;
+  AGracefulMs: Integer; out ARoutes: TVDRX_ProxyRoutes);
+var
+  Rows: TVDRX_ConfigRows;
+  Row: TStringList;
+  Bridge: TVDRX_BridgeExecutive;
+  n: Integer;
+begin
+  SetLength(ARoutes, 0);
+  Rows := AConfig.GetObjectArray('proxy_bridges');
+  try
+    for Row in Rows do
+    begin
+      if (Row.Values['id'] = '') or (Row.Values['command'] = '') or (Row.Values['prefix'] = '') then
+      begin
+        WriteLn('  Skipping proxy_bridges entry - needs id, prefix, and command.');
+        Continue;
+      end;
+      Bridge := TVDRX_BridgeExecutive.Create(Kernel.Queue);
+      Bridge.Command := Row.Values['command'];
+      Bridge.GracefulTimeoutMs := AGracefulMs;
+      // 'sys.none' - this is a supervised child process, not a bus participant;
+      // it never gets bus messages piped into its stdin (unlike a Bridge used
+      // for the JSON-line protocol elsewhere) and doesn't need to be.
+      ARegistry.Register(Bridge, Row.Values['id'], 'sys.none');
+
+      n := Length(ARoutes);
+      SetLength(ARoutes, n + 1);
+      ARoutes[n].Prefix := Row.Values['prefix'];
+      ARoutes[n].Host := StrUtils.IfThen(Row.Values['host'] <> '', Row.Values['host'], '127.0.0.1');
+      ARoutes[n].Port := StrToIntDef(Row.Values['port'], 0);
+      WriteLn('  Proxy bridge "', Row.Values['id'], '": ', ARoutes[n].Prefix, ' -> ',
+        ARoutes[n].Host, ':', ARoutes[n].Port, ' (', Row.Values['command'], ')');
+    end;
+  finally
+    Rows.Free;
+  end;
 end;
 
 begin
@@ -120,11 +161,12 @@ begin
     Kernel.Registry.Register(WS, 'ws', 'sys.none'); // each connection registers itself
   end;
 
+  SetupProxyBridges(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes);
   Templates := TVDRX_TemplateStore.Create(Config, Config.GetString('template_dir', 'templates'));
   if Config.GetBoolean('executives.http.enabled', False) then
   begin
     HTTP := TVDRX_HTTPExecutive.Create(Kernel.Queue, Config, Whiteboard, Templates,
-      Config.GetString('static_dir', 'static'));
+      Config.GetString('static_dir', 'static'), ProxyRoutes);
     HTTP.Port := Config.GetInteger('executives.http.port', 8081);
     HTTP.GracefulTimeoutMs := ShutdownGraceMs;
     ConfigureListenerTLS(HTTP, 'executives.http');
