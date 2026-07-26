@@ -78,8 +78,9 @@ begin
   // log.info/log.warn/log.error topic ends up here, colored on the console and
   // plain in vdrx_daemon.log.
   Logger := TVDRX_LoggerExecutive.Create(Kernel.Queue, 'vdrx_daemon.log', lvlINFO);
-  Kernel.Registry.Register(Logger, 'logger', 'log.>');
-  Kernel.Registry.Register(Logger, 'logger', 'irc.>');
+  //Kernel.Registry.Register(Logger, 'logger', 'log.>');
+  //Kernel.Registry.Register(Logger, 'logger', 'irc.>');
+  Kernel.Registry.Register(Logger, 'logger', '>');
 
   // Listens on 'sys.>' - reload/quit/restart/kill/killall. See vdrx_admin.pas
   // and vdrx_admincmd.pas for the full command set and who can trigger it

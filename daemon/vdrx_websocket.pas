@@ -14,14 +14,6 @@ const
 type
   TVDRX_WebSocketExecutive = class;
 
-  // One instance per live browser connection. Registers itself into the Registry
-  // once auth succeeds, and can hold any number of active filters at once (each
-  // 'subscribe' RPC adds one, 'unsubscribe'/'unsubscribe_all' drop one or all) -
-  // this is what lets the Dispatcher's ordinary routing deliver bus messages
-  // straight to the socket, with no separate broadcast path anywhere in the kernel.
-  // Deregisters itself on disconnect. Talks to FTransport rather than a raw socket,
-  // so it works identically whether the browser connected plain (ws://) or TLS
-  // (wss://) - see TVDRX_SocketListenerExecutive/vdrx_transport.pas.
   TVDRX_WSConnection = class(TVDRX_Executive)
   private
     FListener: TVDRX_WebSocketExecutive;
@@ -29,7 +21,7 @@ type
     FThread: TThread;
     FAuthenticated: Boolean;
     FSendLock: TCriticalSection;
-    FPendingRequest: string; // set via AdoptConnection when the handshake bytes were already read elsewhere
+    FPendingRequest: string;
     function DoHandshake: Boolean;
     function ReadFrame(out APayload: string; out AOpcode: Byte): Boolean;
     procedure SendFrame(const APayload: string; AOpcode: Byte = 1);
@@ -41,9 +33,7 @@ type
     procedure Initialize; override;
     procedure Shutdown; override;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
-    procedure RunLoop; // public: called from TWSConnThread below
-    // Used by the combined HTTP/WS listener to decide, from bytes it already read,
-    // whether a connection should be routed here instead of to plain HTTP.
+    procedure RunLoop;
     class function IsUpgradeRequest(const ARequest: string): Boolean;
   end;
 
@@ -60,11 +50,6 @@ type
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
     procedure ApplyConfig; override;
     function NextConnID: string;
-    // Constructs, registers, and launches a connection for a transport someone else
-    // already accepted (and, if TLS, already handshook). AInitialRequest carries any
-    // bytes already read off the wire (pass '' if none were - the connection will do
-    // its own Read for the handshake). Used by our own HandleConnection and,
-    // optionally, by a combined HTTP/WS listener sharing one port.
     procedure AdoptConnection(ATransport: TVDRX_Transport; const AInitialRequest: string);
   end;
 
@@ -88,9 +73,6 @@ begin
 end;
 
 type
-  // Same rationale as TVDRX_ListenerConnThread in vdrx_socketlistener.pas: a plain
-  // TThread wrapper rather than an anonymous closure over a loop-local connection
-  // value.
   TWSConnThread = class(TThread)
   private
     FConn: TVDRX_WSConnection;
@@ -132,8 +114,6 @@ end;
 
 class function TVDRX_WSConnection.IsUpgradeRequest(const ARequest: string): Boolean;
 begin
-  // Cheap header sniff, not a full parse - good enough to route on before either
-  // handler takes over the connection for real.
   Result := (Pos('Upgrade:', ARequest) > 0) and (Pos('websocket', LowerCase(ARequest)) > 0);
 end;
 
@@ -145,16 +125,24 @@ var
 begin
   Result := False;
   if FPendingRequest <> '' then
-    Request := FPendingRequest // handed to us already-read by AdoptConnection
+    Request := FPendingRequest
   else
   begin
     Received := FTransport.Read(Buf[0], SizeOf(Buf));
-    if Received <= 0 then Exit;
+    if Received <= 0 then
+    begin
+      Bus.Publish('log.warn', 'ws ' + ID + ': no bytes received for handshake', ID);
+      Exit;
+    end;
     SetString(Request, PAnsiChar(@Buf[0]), Received);
   end;
   i := Pos('Sec-WebSocket-Key:', Request);
-  if i = 0 then Exit;
-  tailLen := Pos(#13, Copy(Request, i, Length(Request))) - 20; // 'Sec-WebSocket-Key: ' is 20 chars
+  if i = 0 then
+  begin
+    Bus.Publish('log.warn', 'ws ' + ID + ': handshake request had no Sec-WebSocket-Key header', ID);
+    Exit;
+  end;
+  tailLen := Pos(#13, Copy(Request, i, Length(Request))) - 20;
   if tailLen < 1 then Exit;
   Key := Trim(Copy(Request, i + 19, tailLen));
   AcceptKey := ComputeAcceptKey(Key);
@@ -163,11 +151,10 @@ begin
             'Connection: Upgrade'#13#10 +
             'Sec-WebSocket-Accept: ' + AcceptKey + #13#10#13#10;
   FTransport.Write(Header[1], Length(Header));
+  Bus.Publish('log.info', 'ws ' + ID + ': handshake OK', ID);
   Result := True;
 end;
 
-// Unfragmented text frames only, up to 64KB payload - sufficient for the short
-// JSON-RPC control messages this bridge exchanges.
 function TVDRX_WSConnection.ReadFrame(out APayload: string; out AOpcode: Byte): Boolean;
 var
   Hdr: array[0..1] of Byte;
@@ -181,7 +168,7 @@ begin
   Result := False;
   if FTransport.Read(Hdr[0], 2) <> 2 then Exit;
   AOpcode := Hdr[0] and $0F;
-  if AOpcode = 8 then Exit; // close frame
+  if AOpcode = 8 then Exit;
   LenByte := Hdr[1] and $7F;
   Len := LenByte;
   if LenByte = 126 then
@@ -190,7 +177,7 @@ begin
     Len := (Ext[0] shl 8) or Ext[1];
   end
   else if LenByte = 127 then
-    Exit; // 64-bit lengths not needed for control-plane traffic
+    Exit;
   if (Hdr[1] and $80) <> 0 then
     FTransport.Read(Mask[0], 4)
   else
@@ -227,7 +214,7 @@ begin
       HdrLen := 4;
     end;
     SetString(Buf, PAnsiChar(@Hdr[0]), HdrLen);
-    Buf := Buf + APayload; // server->client frames sent unmasked, per spec
+    Buf := Buf + APayload;
     FTransport.Write(Buf[1], Length(Buf));
   finally
     FSendLock.Leave;
@@ -243,7 +230,8 @@ begin
   try
     J := GetJSON(ALine);
   except
-    Exit; // malformed JSON dropped, connection stays alive
+    Bus.Publish('log.warn', 'ws ' + ID + ': dropped malformed JSON RPC: ' + ALine, ID);
+    Exit;
   end;
   try
     if not (J is TJSONObject) then Exit;
@@ -254,37 +242,47 @@ begin
     begin
       Token := Obj.Get('token', '');
       Src := Obj.Get('source', ID);
-      FAuthenticated := Token <> ''; // stub - wire to real verification before this is untrusted-facing
+      FAuthenticated := Token <> '';
+      if FAuthenticated then
+        Bus.Publish('log.info', 'ws ' + ID + ': authenticated (stub - any nonempty token passes)', ID)
+      else
+        Bus.Publish('log.warn', 'ws ' + ID + ': sys.auth sent with an empty token, rejected', ID);
       SendFrame(Format('{"event":"auth.ok","source":%s}', [JEsc(Src)]));
       Exit;
     end;
 
-    if not FAuthenticated then Exit; // bus-level actions gated until sys.auth succeeds
+    if not FAuthenticated then
+    begin
+      Bus.Publish('log.warn', 'ws ' + ID + ': "' + Method + '" ignored - not authenticated yet', ID);
+      Exit;
+    end;
 
     if Method = 'subscribe' then
     begin
-      // Adds one more filter to this connection's set - repeat 'subscribe' calls
-      // accumulate rather than replace, so a client can listen to several topics
-      // at once (e.g. 'wb.board1.>' and 'irc.#general.>' concurrently).
       Topic := Obj.Get('filter', '');
+      Bus.Publish('log.info', 'ws ' + ID + ': subscribe "' + Topic + '"', ID);
       FListener.Registry.Register(Self, ID, Topic);
     end
     else if Method = 'unsubscribe' then
     begin
-      // Drops just this one filter, leaving any other active subscriptions alone.
       Topic := Obj.Get('filter', '');
+      Bus.Publish('log.info', 'ws ' + ID + ': unsubscribe "' + Topic + '"', ID);
       FListener.Registry.UnregisterFilter(ID, Topic);
     end
     else if Method = 'unsubscribe_all' then
-      // Drops every filter this connection currently holds, without destroying the
-      // connection itself - use before a fresh batch of 'subscribe' calls.
-      FListener.Registry.ClearFilters(ID)
+    begin
+      Bus.Publish('log.info', 'ws ' + ID + ': unsubscribe_all', ID);
+      FListener.Registry.ClearFilters(ID);
+    end
     else if Method = 'publish' then
     begin
       Topic := Obj.Get('topic', '');
       Payload := Obj.Get('payload', '{}');
+      Bus.Publish('log.info', 'ws ' + ID + ': publish "' + Topic + '" ' + Payload, ID);
       Bus.Publish(Topic, Payload, ID);
-    end;
+    end
+    else
+      Bus.Publish('log.warn', 'ws ' + ID + ': unrecognised RPC method "' + Method + '"', ID);
   finally
     J.Free;
   end;
@@ -295,13 +293,18 @@ var
   Payload: string;
   Opcode: Byte;
 begin
-  if not DoHandshake then Exit;
+  if not DoHandshake then
+  begin
+    Bus.Publish('log.warn', 'ws ' + ID + ': handshake failed, dropping connection', ID);
+    Exit;
+  end;
   while True do
   begin
     if not ReadFrame(Payload, Opcode) then Break;
     if Opcode = 1 then HandleRPC(Payload);
   end;
-  FListener.Registry.UnregisterSelf(ID); // NOT Unregister - this is our own thread; see vdrx_core.pas's UnregisterSelf comment
+  Bus.Publish('log.info', 'ws ' + ID + ': disconnected', ID);
+  FListener.Registry.UnregisterSelf(ID); // NOT Unregister - this is our own thread, see vdrx_core.pas's UnregisterSelf comment
 end;
 
 procedure TVDRX_WSConnection.Initialize;
@@ -312,7 +315,7 @@ end;
 
 procedure TVDRX_WSConnection.Shutdown;
 begin
-  FTransport.Close; // unblocks the blocking Read in RunLoop
+  FTransport.Close;
   if Assigned(FThread) then
   begin
     if WaitThreadOrTimeout(FThread, FListener.GracefulTimeoutMs) then
@@ -321,16 +324,13 @@ begin
       FThread := nil;
     end
     else
-      // Shouldn't happen now that natural disconnects go through
-      // UnregisterSelf instead of self-joining - kept as a bound rather than
-      // an unbounded WaitFor in case some other stall keeps the transport
-      // close from unblocking the read promptly.
       Bus.Publish('log.warn', 'ws ' + ID + ': connection thread did not exit in time - abandoning it', ID);
   end;
 end;
 
 procedure TVDRX_WSConnection.HandlePacket(const AMsg: TVDRX_Message);
 begin
+  Bus.Publish('log.info', 'ws ' + ID + ': -> "' + AMsg.Topic + '" ' + AMsg.Payload, ID);
   SendFrame(Format('{"topic":%s,"payload":%s,"source":%s,"seq":%d}',
     [JEsc(AMsg.Topic), AMsg.Payload, JEsc(AMsg.SourceID), AMsg.Seq]));
 end;
@@ -355,18 +355,19 @@ end;
 procedure TVDRX_WebSocketExecutive.AdoptConnection(ATransport: TVDRX_Transport; const AInitialRequest: string);
 var
   Conn: TVDRX_WSConnection;
+  NewID: string;
 begin
   Conn := TVDRX_WSConnection.Create(Bus, Self, ATransport);
   Conn.PendingRequest := AInitialRequest;
-  // Registered with a non-matching placeholder filter until the client's own
-  // 'subscribe' RPC re-registers it with something real.
-  FRegistry.Register(Conn, NextConnID, 'sys.none');
+  NewID := NextConnID;
+  Bus.Publish('log.info', 'ws: new connection ' + NewID, ID);
+  FRegistry.Register(Conn, NewID, 'sys.none');
   Conn.Initialize;
 end;
 
 procedure TVDRX_WebSocketExecutive.HandleConnection(ATransport: TVDRX_Transport);
 begin
-  AdoptConnection(ATransport, ''); // no bytes pre-read - the connection does its own Read
+  AdoptConnection(ATransport, '');
 end;
 
 procedure TVDRX_WebSocketExecutive.HandlePacket(const AMsg: TVDRX_Message);
@@ -374,7 +375,6 @@ begin
   // The listener itself isn't a message recipient - each TVDRX_WSConnection is.
 end;
 
-// Same restart-on-change pattern as TVDRX_IRCDExecutive.ApplyConfig.
 procedure TVDRX_WebSocketExecutive.ApplyConfig;
 var
   NewPort, NewTLSPort: Integer;

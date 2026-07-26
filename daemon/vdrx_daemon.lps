@@ -8,57 +8,60 @@
       <Unit>
         <Filename Value="vdrx_daemon.lpr"/>
         <IsPartOfProject Value="True"/>
-        <CursorPos X="27" Y="8"/>
-        <UsageCount Value="20"/>
+        <TopLine Value="59"/>
+        <CursorPos X="43" Y="85"/>
+        <UsageCount Value="24"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_core.pas"/>
         <IsPartOfProject Value="True"/>
         <EditorIndex Value="4"/>
-        <UsageCount Value="20"/>
+        <CursorPos X="32" Y="16"/>
+        <UsageCount Value="24"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_irc.pas"/>
         <IsPartOfProject Value="True"/>
         <EditorIndex Value="6"/>
-        <UsageCount Value="20"/>
+        <TopLine Value="252"/>
+        <CursorPos X="57" Y="253"/>
+        <UsageCount Value="24"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_logger.pas"/>
         <IsPartOfProject Value="True"/>
         <EditorIndex Value="7"/>
-        <UsageCount Value="20"/>
+        <UsageCount Value="24"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_config.pas"/>
         <IsPartOfProject Value="True"/>
         <EditorIndex Value="3"/>
-        <UsageCount Value="20"/>
+        <UsageCount Value="24"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_admin.pas"/>
         <IsPartOfProject Value="True"/>
         <EditorIndex Value="1"/>
-        <UsageCount Value="20"/>
+        <UsageCount Value="24"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_bridge.pas"/>
         <EditorIndex Value="2"/>
-        <UsageCount Value="10"/>
+        <UsageCount Value="12"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_http.pas"/>
-        <IsVisibleTab Value="True"/>
         <EditorIndex Value="5"/>
-        <CursorPos X="35" Y="15"/>
-        <UsageCount Value="10"/>
+        <CursorPos X="102" Y="4"/>
+        <UsageCount Value="12"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
@@ -66,62 +69,68 @@
         <EditorIndex Value="8"/>
         <TopLine Value="75"/>
         <CursorPos X="47" Y="83"/>
-        <UsageCount Value="10"/>
+        <UsageCount Value="12"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_templates.pas"/>
         <EditorIndex Value="12"/>
-        <UsageCount Value="10"/>
+        <UsageCount Value="12"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_transport.pas"/>
         <EditorIndex Value="13"/>
-        <UsageCount Value="10"/>
+        <TopLine Value="10"/>
+        <CursorPos X="105" Y="3"/>
+        <UsageCount Value="12"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_weblistener.pas"/>
         <EditorIndex Value="14"/>
-        <UsageCount Value="10"/>
+        <TopLine Value="41"/>
+        <CursorPos X="115" Y="62"/>
+        <UsageCount Value="12"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_websocket.pas"/>
         <EditorIndex Value="15"/>
-        <CursorPos X="51" Y="15"/>
-        <UsageCount Value="10"/>
+        <CursorPos X="96" Y="14"/>
+        <UsageCount Value="12"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_whiteboard.pas"/>
+        <IsVisibleTab Value="True"/>
         <EditorIndex Value="16"/>
-        <CursorPos X="82" Y="5"/>
-        <UsageCount Value="10"/>
+        <TopLine Value="118"/>
+        <CursorPos X="61" Y="137"/>
+        <UsageCount Value="12"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_admincmd.pas"/>
         <EditorIndex Value="10"/>
-        <UsageCount Value="10"/>
+        <UsageCount Value="12"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_procutil.pas"/>
         <EditorIndex Value="11"/>
         <CursorPos X="44" Y="16"/>
-        <UsageCount Value="10"/>
+        <UsageCount Value="12"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_stdin.pas"/>
         <EditorIndex Value="9"/>
-        <UsageCount Value="10"/>
+        <UsageCount Value="12"/>
         <Loaded Value="True"/>
       </Unit>
     </Units>
-    <JumpHistory HistoryIndex="2">
+    <JumpHistory HistoryIndex="11">
       <Position>
         <Filename Value="vdrx_socketlistener.pas"/>
         <Caret Line="87" Column="26" TopLine="76"/>
@@ -133,6 +142,42 @@
       <Position>
         <Filename Value="vdrx_http.pas"/>
         <Caret Line="158" Column="34" TopLine="140"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_irc.pas"/>
+        <Caret Line="44" Column="15" TopLine="29"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_irc.pas"/>
+        <Caret Line="217" Column="11" TopLine="198"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_http.pas"/>
+        <Caret Line="35" Column="15" TopLine="18"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_transport.pas"/>
+        <Caret Line="24" Column="33"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_http.pas"/>
+        <Caret Line="21" Column="31" TopLine="9"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_websocket.pas"/>
+        <Caret Line="14" Column="71"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_weblistener.pas"/>
+        <Caret Line="2" Column="10"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_weblistener.pas"/>
+        <Caret Line="62" Column="115" TopLine="41"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_core.pas"/>
+        <Caret Line="16" Column="32"/>
       </Position>
     </JumpHistory>
     <RunParams>

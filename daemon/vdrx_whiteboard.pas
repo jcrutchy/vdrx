@@ -120,49 +120,65 @@ begin
   FBoards.AddObject(ABoardName, Result);
 end;
 
+// Linear scan is fine here - boards are meant for a handful to a few dozen
+// widgets, not thousands; not worth a second id->index map for this.
+function FindWidgetIndex(AWidgets: TJSONArray; const AID: string): Integer;
+begin
+  for Result := 0 to AWidgets.Count - 1 do
+    if (AWidgets[Result] is TJSONObject) and (TJSONObject(AWidgets[Result]).Get('id', '') = AID) then
+      Exit;
+  Result := -1;
+end;
+
 procedure TVDRX_WhiteboardExecutive.ApplyDelta(const ABoardName: string; ADelta: TJSONObject);
 var
   Board: TJSONObject;
   Op, WidgetID: string;
   Arr: TJSONArray;
-  i: Integer;
-  Found: Boolean;
+  idx: Integer;
 begin
   Board := GetBoard(ABoardName);
   Op := ADelta.Get('op', '');
+  Arr := Board.Arrays['widgets'];
+
   if Op = 'add' then
-    Board.Arrays['widgets'].Add(TJSONObject(ADelta.Objects['widget'].Clone))
+    Arr.Add(TJSONObject(ADelta.Objects['widget'].Clone))
   else if Op = 'move' then
   begin
-    // CHANGED this session: updates the matching widget's x/y in place (by
-    // id) instead of appending the raw delta as a differently-shaped record
-    // into 'widgets' - that would've made 'widgets' an event log a client
-    // has to replay/reduce rather than a "current state" list it can render
-    // directly on a fresh page load. Delta shape:
-    // {"op":"move","id":"<widget id>","x":<num>,"y":<num>}. This path was
-    // unused before (dashboard.js didn't exist), so no wire-format migration
-    // needed - but delete any board*.json on disk from earlier manual
-    // testing with the old shape, since it may contain stray delta-shaped
-    // entries mixed into 'widgets'.
     WidgetID := ADelta.Get('id', '');
-    Arr := Board.Arrays['widgets'];
-    Found := False;
-    for i := 0 to Arr.Count - 1 do
-      if (Arr[i] is TJSONObject) and (TJSONObject(Arr[i]).Get('id', '') = WidgetID) then
-      begin
-        TJSONObject(Arr[i]).Floats['x'] := ADelta.Get('x', 0.0);
-        TJSONObject(Arr[i]).Floats['y'] := ADelta.Get('y', 0.0);
-        Found := True;
-        Break;
-      end;
-    if not Found then
+    idx := FindWidgetIndex(Arr, WidgetID);
+    if idx >= 0 then
+    begin
+      TJSONObject(Arr[idx]).Floats['x'] := ADelta.Get('x', 0.0);
+      TJSONObject(Arr[idx]).Floats['y'] := ADelta.Get('y', 0.0);
+    end
+    else
       Bus.Publish('log.warn', 'whiteboard: move delta for unknown widget id "' + WidgetID + '" on board ' + ABoardName, ID);
+  end
+  else if Op = 'edit' then
+  begin
+    // Sticky-note text edits - dashboard.js debounces while typing and always
+    // flushes on blur, so this fires a handful of times per editing session,
+    // not once per keystroke.
+    WidgetID := ADelta.Get('id', '');
+    idx := FindWidgetIndex(Arr, WidgetID);
+    if idx >= 0 then
+      TJSONObject(Arr[idx]).Strings['text'] := ADelta.Get('text', '')
+    else
+      Bus.Publish('log.warn', 'whiteboard: edit delta for unknown widget id "' + WidgetID + '" on board ' + ABoardName, ID);
+  end
+  else if Op = 'delete' then
+  begin
+    WidgetID := ADelta.Get('id', '');
+    idx := FindWidgetIndex(Arr, WidgetID);
+    if idx >= 0 then
+      Arr.Delete(idx)
+    else
+      Bus.Publish('log.warn', 'whiteboard: delete delta for unknown widget id "' + WidgetID + '" on board ' + ABoardName, ID);
   end
   else if Op = 'link' then
     Board.Arrays['links'].Add(TJSONObject(ADelta.Objects['link'].Clone));
-  // Persist before announcing - a '.synced' subscriber that immediately re-fetches
-  // via GetBoardSnapshot (or restarts the process right after) should never see
-  // state older than what was just broadcast.
+
   SaveBoardToDisk(ABoardName, Board);
 end;
 
