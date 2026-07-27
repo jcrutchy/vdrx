@@ -5,7 +5,8 @@ unit vdrx_transport;
 interface
 
 uses
-  Classes, SysUtils, Sockets, openssl, resolve;
+  Classes, SysUtils, Sockets, openssl, resolve
+  {$IFDEF UNIX}, BaseUnix{$ENDIF};
 
 type
   // Byte-stream abstraction over an accepted connection - lets every protocol
@@ -160,7 +161,7 @@ end;
 procedure TVDRX_PlainTransport.SetReadTimeout(ATimeoutMs: Integer);
 {$IFDEF UNIX}
 var
-  TV: TTimeVal;
+  TV: TimeVal;
 begin
   TV.tv_sec := ATimeoutMs div 1000;
   TV.tv_usec := (ATimeoutMs mod 1000) * 1000;
