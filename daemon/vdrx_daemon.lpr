@@ -30,6 +30,7 @@ uses
   vdrx_bridge,
   vdrx_websocket,
   vdrx_whiteboard,
+  vdrx_plague,
   vdrx_http,
   vdrx_socketlistener,
   vdrx_weblistener,
@@ -43,10 +44,12 @@ var
   Stdin: TVDRX_StdinExecutive;
   IRCD: TVDRX_IRCDExecutive;
   Whiteboard: TVDRX_WhiteboardExecutive;
+  Plague: TVDRX_PlagueExecutive;
   WS: TVDRX_WebSocketExecutive;
   HTTP: TVDRX_HTTPExecutive;
   Templates: TVDRX_TemplateStore;
   ProxyRoutes: TVDRX_ProxyRoutes;
+  CLIRoutes: TVDRX_CLIRoutes;
   ShutdownGraceMs: Integer;
   DoRestart: Boolean;
   NewProc: TProcess;
@@ -190,6 +193,10 @@ begin
     Whiteboard := TVDRX_WhiteboardExecutive.Create(Kernel.Queue,
       Config.GetString('executives.whiteboard.data_dir', 'vdrx_data' + PathDelim + 'whiteboard'));
     Kernel.Registry.Register(Whiteboard, 'whiteboard', 'wb.*.delta');
+
+    Plague := TVDRX_PlagueExecutive.Create(Kernel.Queue,
+      Config.GetString('executives.plague.data_dir', 'vdrx_data' + PathDelim + 'plague'), Config);
+    Kernel.Registry.Register(Plague, 'plague', 'plague.action');
   
     if Config.GetBoolean('executives.ws.enabled', False) then
     begin
@@ -206,7 +213,7 @@ begin
     Templates := TVDRX_TemplateStore.Create(Config, Config.GetString('template_dir', 'templates'));
     if Config.GetBoolean('executives.http.enabled', False) then
     begin
-      HTTP := TVDRX_HTTPExecutive.Create(Kernel.Queue, Config, Whiteboard, Templates,
+      HTTP := TVDRX_HTTPExecutive.Create(Kernel.Queue, Config, Whiteboard, Plague, Templates,
         Config.GetString('static_dir', 'static'), ProxyRoutes, CLIRoutes);
       HTTP.Port := Config.GetInteger('executives.http.port', 8081);
       HTTP.GracefulTimeoutMs := ShutdownGraceMs;
@@ -265,3 +272,4 @@ begin
   Kernel.WaitFor;
 
 end.
+

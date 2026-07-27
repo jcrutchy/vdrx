@@ -65,7 +65,14 @@ const
   // straight multiplication. Good enough for "basic game"; honest
   // epidemiology can come later as a deferred upgrade, same spirit as the
   // per-connection mailbox note in WIRING.md.
-  BaseSpreadRate = 0.02;        // fraction of susceptible pop newly infected per tick, at infectivity=100
+  // BUG FIX (found live-testing): the original formula scaled new infections
+  // off the whole susceptible population, independent of how many people
+  // actually carry the disease - with 1 case in a 331M-population country
+  // that computed ~650,000 new infections on the very first tick,
+  // regardless of infectivity. An epidemic's growth rate has to be driven
+  // by its current carrier count (classic SIR beta*I*S/N shape), not just
+  // by how many people are theoretically available to catch it.
+  ContactsPerInfectedPerTick = 15.0; // effective exposures one carrier generates per tick, at infectivity=100
   BaseDeathRate = 0.01;         // fraction of infected who die per tick, at lethality=100
   BaseCrossBorderChance = 0.05; // chance per tick an uninfected neighbor gets seeded, at infectivity=100
   BaseCureRatePerPoint = 0.5;   // cure_progress gained per invested point, before diminishing returns
@@ -111,6 +118,8 @@ procedure TVDRX_PlagueExecutive.LoadCountries(const AFilePath: string);
 var
   SL: TStringList;
   J: TJSONData;
+  Raw: TJSONObject;
+  i: Integer;
 begin
   FCountries := TJSONObject.Create;
   if not FileExists(AFilePath) then
@@ -125,8 +134,25 @@ begin
       J := GetJSON(SL.Text);
       if J is TJSONObject then
       begin
+        // Every downstream loop (DoTick, CheckWinConditions, ...) hard-casts
+        // FCountries.Items[i] straight to TJSONObject with no type check -
+        // fast and simple as long as that assumption holds. It doesn't hold
+        // for free-form caller-edited JSON: a stray non-object entry (a
+        // "_comment" string field, for instance) passes GetJSON fine but
+        // blows up the first time the tick thread indexes into it, and does
+        // so on every tick from then on since the file never changes. Filter
+        // once here, at the one place external data enters the process,
+        // instead of defending every consumer.
+        Raw := TJSONObject(J);
+        for i := Raw.Count - 1 downto 0 do
+          if not (Raw.Items[i] is TJSONObject) then
+          begin
+            Bus.Publish('log.warn', 'plague: countries file entry "' + Raw.Names[i] +
+              '" is not an object (got ' + Raw.Items[i].ClassName + ') - skipped', 'plague');
+            Raw.Delete(i);
+          end;
         FCountries.Free;
-        FCountries := TJSONObject(J);
+        FCountries := Raw;
       end
       else
       begin
@@ -235,8 +261,22 @@ begin
     if FStopping then Break;
     FLock.Enter;
     try
+      // TVDRX_WorkerThread.Execute (vdrx_core.pas) has no exception guard of
+      // its own - an unhandled exception here doesn't crash the daemon, it
+      // just silently kills this thread, and the game freezes forever with
+      // no error anywhere. Found that the hard way: a single non-object
+      // entry in a caller-supplied countries file (see LoadCountries) took
+      // the tick thread out on the very first tick with zero log output.
+      // Catching here means a bad tick gets logged and skipped instead of
+      // quietly ending the game.
       if FState.Get('status', '') = 'running' then
-        DoTick;
+        try
+          DoTick;
+        except
+          on E: Exception do
+            Bus.Publish('log.error', 'plague: DoTick raised ' + E.ClassName + ': ' + E.Message +
+              ' - this tick was skipped, simulation continues', ID);
+        end;
     finally
       FLock.Leave;
     end;
@@ -481,7 +521,6 @@ begin
       Pathogen.Booleans['eradicated'] := True;
       Continue;
     end;
-
     Infectivity := Pathogen.Floats['infectivity'];
     Lethality := Pathogen.Floats['lethality'];
     TotalInfectedWorldwide := 0;
@@ -492,7 +531,6 @@ begin
     SetLength(CountryIDs, Countries.Count);
     for j := 0 to Countries.Count - 1 do
       CountryIDs[j] := Countries.Names[j];
-
     for j := 0 to High(CountryIDs) do
     begin
       CountryID := CountryIDs[j];
@@ -500,18 +538,17 @@ begin
       if not Assigned(CountryState) then Continue; // shouldn't happen, defensive only
       PCounts := TJSONObject(TJSONObject(CountryState.Objects['pathogens']).Find(PathogenID));
       if not Assigned(PCounts) then Continue; // no cases of this pathogen here
-
       Infected := PCounts.Get('infected', Int64(0));
       Dead := PCounts.Get('dead', Int64(0));
       Immune := PCounts.Get('immune', Int64(0));
       if Infected <= 0 then Continue;
-
       Quarantine := CountryState.Get('quarantine', 0.0);
       Population := CountryPopulation(CountryID);
       Susceptible := Population - Infected - Dead - Immune;
       if Susceptible < 0 then Susceptible := 0;
 
-      NewInfections := Trunc(Susceptible * BaseSpreadRate * (Infectivity / TraitMax) * (1.0 - Quarantine / 100.0));
+      NewInfections := Trunc(Infected * ContactsPerInfectedPerTick * (Infectivity / TraitMax) *
+        (Susceptible / Max(Int64(1), Population)) * (1.0 - Quarantine / 100.0));
       if NewInfections > Susceptible then NewInfections := Susceptible;
       NewDeaths := Trunc(Infected * BaseDeathRate * (Lethality / TraitMax));
       if NewDeaths > Infected then NewDeaths := Infected;
@@ -519,7 +556,6 @@ begin
       Infected := Infected + NewInfections - NewDeaths;
       if Infected < 0 then Infected := 0;
       Dead := Dead + NewDeaths;
-
       PCounts.Int64s['infected'] := Infected;
       PCounts.Int64s['dead'] := Dead;
       PCounts.Int64s['immune'] := Immune;
@@ -553,11 +589,9 @@ begin
         end;
       end;
     end;
-
     Pathogen.Floats['evolution_points'] := Pathogen.Floats['evolution_points']
       + TotalInfectedWorldwide * EvolutionPointsPerInfected;
   end;
-
   CheckWinConditions;
   SaveStateToDisk;
   PublishDeltaLocked;
@@ -601,7 +635,6 @@ begin
       if Assigned(PCounts) then
         HitCount := HitCount + PCounts.Get('infected', Int64(0)) + PCounts.Get('dead', Int64(0));
     end;
-
     if (WorldPop > 0) and (HitCount / WorldPop >= FWinFraction) then
     begin
       FState.Strings['status'] := 'ended';
@@ -688,3 +721,4 @@ begin
 end;
 
 end.
+

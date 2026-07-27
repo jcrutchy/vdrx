@@ -6,12 +6,13 @@ interface
 
 uses
   Classes, SysUtils, Sockets, vdrx_core, vdrx_socketlistener, vdrx_transport,
-  vdrx_http, vdrx_websocket, vdrx_whiteboard, vdrx_config, vdrx_templates;
+  vdrx_http, vdrx_websocket, vdrx_whiteboard, vdrx_plague, vdrx_config, vdrx_templates;
 
 type
   TVDRX_WebListenerExecutive = class(TVDRX_SocketListenerExecutive)
   private
     FWhiteboard: TVDRX_WhiteboardExecutive;
+    FPlague: TVDRX_PlagueExecutive;
     FWebSocket: TVDRX_WebSocketExecutive;
     FTemplates: TVDRX_TemplateStore;
     FConfig: TVDRX_Config;
@@ -22,6 +23,7 @@ type
     procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
     constructor Create(ABus: TVDRX_MessageQueue; AWhiteboard: TVDRX_WhiteboardExecutive;
+      APlague: TVDRX_PlagueExecutive;
       AWebSocket: TVDRX_WebSocketExecutive; ATemplates: TVDRX_TemplateStore;
       AConfig: TVDRX_Config; const AStaticDir: string; const AProxyRoutes: TVDRX_ProxyRoutes;
       const ACLIRoutes: TVDRX_CLIRoutes); reintroduce;
@@ -31,12 +33,13 @@ type
 implementation
 
 constructor TVDRX_WebListenerExecutive.Create(ABus: TVDRX_MessageQueue;
-  AWhiteboard: TVDRX_WhiteboardExecutive; AWebSocket: TVDRX_WebSocketExecutive;
+  AWhiteboard: TVDRX_WhiteboardExecutive; APlague: TVDRX_PlagueExecutive; AWebSocket: TVDRX_WebSocketExecutive;
   ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
   const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes);
 begin
   inherited Create(ABus);
   FWhiteboard := AWhiteboard;
+  FPlague := APlague;
   FWebSocket := AWebSocket;
   FTemplates := ATemplates;
   FConfig := AConfig;
@@ -78,3 +81,4 @@ begin
 end;
 
 end.
+

@@ -17,7 +17,5 @@
   "australia": {"name": "Australia",  "population": 26000000,  "neighbors": []},
   "egypt":   {"name": "Egypt",         "population": 111000000, "neighbors": ["sudan"]},
   "sudan":   {"name": "Sudan",         "population": 46000000,  "neighbors": ["egypt", "nigeria"]},
-  "nigeria": {"name": "Nigeria",       "population": 223000000, "neighbors": ["sudan"]},
-
-  "_comment_points": "This is a minimal 19-country test world so the sim can be exercised right away. For the real game, replace this file with one entry per country/region matched to your high-res map image: keep name/population/neighbors as-is, and add a 'points' array (or however you derive region IDs from the image) - the server never reads it, it's passed straight through in the /plague/countries snapshot for the client to draw with."
+  "nigeria": {"name": "Nigeria",       "population": 223000000, "neighbors": ["sudan"]}
 }
