@@ -115,6 +115,37 @@ begin
   end;
 end;
 
+procedure SetupCLIBridges(AConfig: TVDRX_Config; out ARoutes: TVDRX_CLIRoutes);
+var
+  Rows: TVDRX_ConfigRows;
+  Row: TStringList;
+  n: Integer;
+begin
+  SetLength(ARoutes, 0);
+  Rows := AConfig.GetObjectArray('cli_bridges');
+  try
+    for Row in Rows do
+    begin
+      if (Row.Values['id'] = '') or (Row.Values['command'] = '') or (Row.Values['prefix'] = '') or (Row.Values['script_dir'] = '') then
+      begin
+        WriteLn('  Skipping cli_bridges entry - needs id, prefix, command, and script_dir.');
+        Continue;
+      end;
+      n := Length(ARoutes);
+      SetLength(ARoutes, n + 1);
+      ARoutes[n].Prefix := Row.Values['prefix'];
+      ARoutes[n].Command := Row.Values['command'];
+      ARoutes[n].ScriptDir := Row.Values['script_dir'];
+      ARoutes[n].TimeoutMs := StrToIntDef(Row.Values['timeout_ms'], 5000);
+      ARoutes[n].ContentType := IfThen(Row.Values['content_type'] <> '', Row.Values['content_type'], 'text/html');
+      WriteLn('  CLI bridge "', Row.Values['id'], '": ', ARoutes[n].Prefix, ' -> ',
+        ARoutes[n].Command, ' ', ARoutes[n].ScriptDir, '/* (timeout_ms=', ARoutes[n].TimeoutMs, ')');
+    end;
+  finally
+    Rows.Free;
+  end;
+end;
+
 begin
   Kernel := TVDRX_Kernel.Create;
 
@@ -168,11 +199,13 @@ begin
   end;
 
   SetupProxyBridges(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes);
+  SetupCLIBridges(Config, CLIRoutes);
+
   Templates := TVDRX_TemplateStore.Create(Config, Config.GetString('template_dir', 'templates'));
   if Config.GetBoolean('executives.http.enabled', False) then
   begin
     HTTP := TVDRX_HTTPExecutive.Create(Kernel.Queue, Config, Whiteboard, Templates,
-      Config.GetString('static_dir', 'static'), ProxyRoutes);
+      Config.GetString('static_dir', 'static'), ProxyRoutes, CLIRoutes);
     HTTP.Port := Config.GetInteger('executives.http.port', 8081);
     HTTP.GracefulTimeoutMs := ShutdownGraceMs;
     ConfigureListenerTLS(HTTP, 'executives.http');
