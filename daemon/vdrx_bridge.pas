@@ -87,7 +87,17 @@ begin
     FProcess := TProcess.Create(nil);
     FProcess.CommandLine := FCommand;
     FProcess.Options := [poUsePipes, poStderrToOutPut];
-    FProcess.Execute;
+    try
+      FProcess.Execute;
+    except
+      on E: Exception do
+      begin
+        FProcess.Free;
+        FProcess := nil;
+        raise Exception.CreateFmt('bridge "%s": failed to start command "%s" - %s',
+          [ID, FCommand, E.Message]);
+      end;
+    end;
   finally
     FProcessLock.Leave;
   end;

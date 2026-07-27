@@ -6,9 +6,13 @@ interface
 
 uses
   Classes, SysUtils, StrUtils, Sockets, Process, vdrx_core, vdrx_socketlistener,
-  vdrx_transport, vdrx_whiteboard, vdrx_config, vdrx_templates, vdrx_procutil, Generics.Collections;
+  vdrx_transport, vdrx_whiteboard, vdrx_plague, vdrx_config, vdrx_templates, vdrx_procutil, Generics.Collections;
 
 type
+  // One configured reverse-proxy target - see vdrx_daemon.conf's
+  // "proxy_bridges" and vdrx_daemon.lpr's SetupProxyBridges. Prefix match is
+  // longest-prefix-wins (like nginx location blocks), so overlapping
+  // prefixes (e.g. "/app/" and "/app/admin/") behave predictably.
   TVDRX_ProxyRoute = record
     Prefix: string;
     Host: string;
@@ -33,6 +37,7 @@ type
   private
     FConfig: TVDRX_Config;
     FWhiteboard: TVDRX_WhiteboardExecutive;
+    FPlague: TVDRX_PlagueExecutive;
     FTemplates: TVDRX_TemplateStore;
     FStaticDir: string;
     FProxyRoutes: TVDRX_ProxyRoutes;
@@ -41,12 +46,12 @@ type
     procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
     constructor Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config;
-      AWhiteboard: TVDRX_WhiteboardExecutive; ATemplates: TVDRX_TemplateStore;
+      AWhiteboard: TVDRX_WhiteboardExecutive; APlague: TVDRX_PlagueExecutive; ATemplates: TVDRX_TemplateStore;
       const AStaticDir: string; const AProxyRoutes: TVDRX_ProxyRoutes;
       const ACLIRoutes: TVDRX_CLIRoutes); reintroduce;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
     procedure ApplyConfig; override;
-    class function BuildResponse(const ARequest: string; AWhiteboard: TVDRX_WhiteboardExecutive;
+    class function BuildResponse(const ARequest: string; AWhiteboard: TVDRX_WhiteboardExecutive; APlague: TVDRX_PlagueExecutive;
       ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
       const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
       ABus: TVDRX_MessageQueue; const ASourceID: string): string;
@@ -56,7 +61,7 @@ implementation
 
 const
   MAX_HEADER_SIZE = 16384;
-  MAX_BODY_SIZE = 10 * 1024 * 1024;
+  MAX_BODY_SIZE = 10 * 1024 * 1024; // generous for dev/test form posts - not meant for large uploads
 
 type
   // Bounds RunCLIScript's wall-clock time WITHOUT blocking the read loop that
@@ -170,7 +175,7 @@ begin
   SL := TStringList.Create;
   try
     SL.Text := AHeaderBlock;
-    for i := 1 to SL.Count - 1 do
+    for i := 1 to SL.Count - 1 do // line 0 is the request line, not a header
     begin
       Colon := Pos(':', SL[i]);
       if (Colon > 0) and SameText(Trim(Copy(SL[i], 1, Colon - 1)), AName) then
@@ -181,6 +186,11 @@ begin
   end;
 end;
 
+// Reads a full request off the wire: headers (up to the blank line), then -
+// if a Content-Length header is present - exactly that many more body bytes.
+// Needed for the proxy path (a PHP app expects to see the whole POST body,
+// not the first ~1KB a single Read happened to return) but applies to every
+// request now, board/static included, since it's strictly more correct.
 function ReadFullRequest(ATransport: TVDRX_Transport): string;
 var
   Buf: array[0..4095] of Byte;
@@ -192,19 +202,19 @@ begin
   while (HeaderEnd = 0) and (Length(Result) < MAX_HEADER_SIZE) do
   begin
     Received := ATransport.Read(Buf[0], SizeOf(Buf));
-    if Received <= 0 then Exit(Result);
+    if Received <= 0 then Exit(Result); // closed before headers finished - hand back whatever we have
     SetLength(Result, Length(Result) + Received);
     Move(Buf[0], Result[Length(Result) - Received + 1], Received);
     HeaderEnd := Pos(#13#10#13#10, Result);
   end;
-  if HeaderEnd = 0 then Exit;
+  if HeaderEnd = 0 then Exit; // headers too large or never terminated - drop rather than hang
 
   HeaderBlock := Copy(Result, 1, HeaderEnd - 1);
   CLStr := ExtractHeaderValue(HeaderBlock, 'Content-Length');
   ContentLength := 0;
   if CLStr <> '' then
     ContentLength := StrToIntDef(Trim(CLStr), 0);
-  if ContentLength > MAX_BODY_SIZE then ContentLength := MAX_BODY_SIZE;
+  if ContentLength > MAX_BODY_SIZE then ContentLength := MAX_BODY_SIZE; // clamp rather than reject
 
   BodySoFar := Length(Result) - (HeaderEnd + 3);
   while BodySoFar < ContentLength do
@@ -212,7 +222,7 @@ begin
     ToRead := ContentLength - BodySoFar;
     if ToRead > SizeOf(Buf) then ToRead := SizeOf(Buf);
     Received := ATransport.Read(Buf[0], ToRead);
-    if Received <= 0 then Break;
+    if Received <= 0 then Break; // client stopped sending early - forward whatever we actually got
     SetLength(Result, Length(Result) + Received);
     Move(Buf[0], Result[Length(Result) - Received + 1], Received);
     Inc(BodySoFar, Received);
@@ -323,6 +333,38 @@ begin
   Result := PlainResponse('200 OK', 'text/html', Body);
 end;
 
+// Unlike RenderBoardPage there's no board_name/board list - one game, one
+// page. plague_map_image comes from settings (vdrx_daemon.conf ->
+// "settings":{"plague_map_image": "plague_map.png"}) via the templates
+// engine's existing $$setting$$ resolution, same as site_title - the client
+// JS fetches /plague/state and /plague/countries itself rather than having
+// them inlined here, so a page refresh mid-game doesn't need the template
+// re-filled with a fresh snapshot on every request.
+function RenderPlaguePage(ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config;
+  ABus: TVDRX_MessageQueue; const ASourceID: string): string;
+var
+  Body: string;
+  Params: TStringList;
+begin
+  Params := TStringList.Create;
+  try
+    Params.Values['ws_port'] := IntToStr(AConfig.GetInteger('executives.ws.port', 8082));
+    Params.Values['ws_host_json'] := '""';
+    Params.Values['ws_tls_json'] := IfThen(AConfig.GetInteger('executives.ws.tls_port', 0) <> 0, 'true', 'false');
+    Body := ATemplates.Fill('plague', Params, nil);
+  finally
+    Params.Free;
+  end;
+
+  if Body = '' then
+  begin
+    ABus.Publish('log.error', 'http: plague.tpl produced no output - check template_dir', ASourceID);
+    Exit(PlainResponse('500 Internal Server Error', 'text/plain',
+      'Missing template: plague.tpl (check template_dir in vdrx_daemon.conf)'));
+  end;
+  Result := PlainResponse('200 OK', 'text/html', Body);
+end;
+
 function MatchProxyRoute(const APath: string; const ARoutes: TVDRX_ProxyRoutes; out AMatch: TVDRX_ProxyRoute): Boolean;
 var
   i, bestLen: Integer;
@@ -338,13 +380,20 @@ begin
     end;
 end;
 
+// Strips any existing Connection header and forces 'Connection: close' -
+// without this, a keep-alive-capable backend (php -S included) would hold
+// the socket open waiting for a second request over the same connection,
+// and the "read until the backend closes" loop in ProxyRequest below would
+// then block forever on every single proxied request. Same shape of bug as
+// the WebSocket self-join deadlock from earlier in this project: a blocking
+// read with no other signal for "the response is actually done."
 function ForceConnectionClose(const ARequest: string): string;
 var
   HeaderEnd, i: Integer;
   OutLines: TStringList;
 begin
   HeaderEnd := Pos(#13#10#13#10, ARequest);
-  if HeaderEnd = 0 then Exit(ARequest);
+  if HeaderEnd = 0 then Exit(ARequest); // malformed - forward as-is rather than guess
   OutLines := TStringList.Create;
   try
     OutLines.Text := Copy(ARequest, 1, HeaderEnd - 1);
@@ -374,12 +423,18 @@ begin
   begin
     Transport := ConnectTCP(ARoute.Host, ARoute.Port);
     if Assigned(Transport) then Break;
+    // The backend can take a moment to finish starting and bind its port
+    // after Bridge spawns it - a request landing in that window (most
+    // likely right after the daemon itself just started, or right after
+    // 'sys.restart') would otherwise get a spurious 502 on an
+    // otherwise-healthy setup. A few short retries covers that startup
+    // race without masking a genuinely-down backend for long.
     if Attempt < MAX_CONNECT_ATTEMPTS then
       Sleep(RETRY_DELAY_MS);
   end;
   if not Assigned(Transport) then
   begin
-    ABus.Publish('log.error', Format('http proxy: could not connect to %s:%d after %d attempt(s) - is the bridge process up?', [ARoute.Host, ARoute.Port, MAX_CONNECT_ATTEMPTS]), ASourceID);
+    ABus.Publish('log.error', Format('http proxy: could not connect to %s:%d after %d attempt(s) - is the bridge process up? (check its own log lines above, and "kill <bridge-id>" to bounce it if it looks wedged)', [ARoute.Host, ARoute.Port, MAX_CONNECT_ATTEMPTS]), ASourceID);
     Exit(PlainResponse('502 Bad Gateway', 'text/plain', 'Upstream unavailable'));
   end;
 
@@ -516,12 +571,13 @@ begin
 end;
 
 constructor TVDRX_HTTPExecutive.Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config;
-  AWhiteboard: TVDRX_WhiteboardExecutive; ATemplates: TVDRX_TemplateStore;
+  AWhiteboard: TVDRX_WhiteboardExecutive; APlague: TVDRX_PlagueExecutive; ATemplates: TVDRX_TemplateStore;
   const AStaticDir: string; const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes);
 begin
   inherited Create(ABus);
   FConfig := AConfig;
   FWhiteboard := AWhiteboard;
+  FPlague := APlague;
   FTemplates := ATemplates;
   FStaticDir := AStaticDir;
   FProxyRoutes := AProxyRoutes;
@@ -529,21 +585,21 @@ begin
   Port := 8081;
 end;
 
-class function TVDRX_HTTPExecutive.BuildResponse(const ARequest: string; AWhiteboard: TVDRX_WhiteboardExecutive;
+class function TVDRX_HTTPExecutive.BuildResponse(const ARequest: string; AWhiteboard: TVDRX_WhiteboardExecutive; APlague: TVDRX_PlagueExecutive;
   ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
   const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
   ABus: TVDRX_MessageQueue; const ASourceID: string): string;
 var
   Method, Path, BoardName: string;
-  ProxyRoute: TVDRX_ProxyRoute;
+  Route: TVDRX_ProxyRoute;
   CLIRoute: TVDRX_CLIRoute;
 begin
   ParseRequestLine(ARequest, Method, Path);
 
-  if MatchProxyRoute(Path, AProxyRoutes, ProxyRoute) then
+  if MatchProxyRoute(Path, AProxyRoutes, Route) then
   begin
-    ABus.Publish('log.info', Format('http: %s %s -> proxy %s:%d', [Method, Path, ProxyRoute.Host, ProxyRoute.Port]), ASourceID);
-    Exit(ProxyRequest(ARequest, ProxyRoute, ABus, ASourceID));
+    ABus.Publish('log.info', Format('http: %s %s -> proxy %s:%d', [Method, Path, Route.Host, Route.Port]), ASourceID);
+    Exit(ProxyRequest(ARequest, Route, ABus, ASourceID));
   end;
 
   if MatchCLIRoute(Path, ACLIRoutes, CLIRoute) then
@@ -562,6 +618,21 @@ begin
     end;
     Result := RenderBoardPage(BoardName, AWhiteboard, ATemplates, AConfig, ABus, ASourceID);
   end
+  else if (Method = 'GET') and (Path = '/plague') then
+  begin
+    if not Assigned(APlague) then Exit(PlainResponse('404 Not Found', 'text/plain', 'Plague executive not wired up'));
+    Result := RenderPlaguePage(ATemplates, AConfig, ABus, ASourceID);
+  end
+  else if (Method = 'GET') and (Path = '/plague/state') then
+  begin
+    if not Assigned(APlague) then Exit(PlainResponse('404 Not Found', 'text/plain', 'Plague executive not wired up'));
+    Result := PlainResponse('200 OK', 'application/json', APlague.GetSnapshot);
+  end
+  else if (Method = 'GET') and (Path = '/plague/countries') then
+  begin
+    if not Assigned(APlague) then Exit(PlainResponse('404 Not Found', 'text/plain', 'Plague executive not wired up'));
+    Result := PlainResponse('200 OK', 'application/json', APlague.GetCountriesJSON);
+  end
   else if Method = 'GET' then
     Result := ServeStaticFile(Path, AStaticDir, ABus, ASourceID)
   else
@@ -579,7 +650,7 @@ begin
   if Request <> '' then
   begin
     ParseRequestLine(Request, Method, Path);
-    Response := BuildResponse(Request, FWhiteboard, FTemplates, FConfig, FStaticDir, FProxyRoutes, FCLIRoutes, Bus, ID);
+    Response := BuildResponse(Request, FWhiteboard, FPlague, FTemplates, FConfig, FStaticDir, FProxyRoutes, FCLIRoutes, Bus, ID);
     Bus.Publish('log.info', Format('http: %s %s -> %s', [Method, Path, StatusOf(Response)]), ID);
     ATransport.Write(Response[1], Length(Response));
   end
@@ -611,8 +682,10 @@ begin
     ConfigureTLS(NewTLSPort, CertFile, KeyFile);
     Initialize;
   end;
-  // Proxy/CLI routes are still startup-only, same note as before - not
-  // rebuilt on 'sys.reload'.
+  // NB: FProxyRoutes is NOT rebuilt here yet - proxy_bridges is only read at
+  // startup (see vdrx_daemon.lpr's SetupProxyBridges). A 'sys.reload' picks
+  // up template/board-nav/port changes live but not new/changed proxy
+  // routes - restart the daemon (or 'sys.restart') for those.
 end;
 
 end.

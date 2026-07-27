@@ -65,7 +65,7 @@ begin
     FWebSocket.AdoptConnection(ATransport, Request)
   else
   begin
-    Response := TVDRX_HTTPExecutive.BuildResponse(Request, FWhiteboard, FTemplates, FConfig, FStaticDir, FProxyRoutes, FCLIRoutes, Bus, ID);
+    Response := TVDRX_HTTPExecutive.BuildResponse(Request, FWhiteboard, FPlague, FTemplates, FConfig, FStaticDir, FProxyRoutes, FCLIRoutes, Bus, ID);
     ATransport.Write(Response[1], Length(Response));
     ATransport.Close;
     ATransport.Free;

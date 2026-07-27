@@ -1,0 +1,23 @@
+{
+  "usa":     {"name": "United States", "population": 331000000, "neighbors": ["canada", "mexico"]},
+  "canada":  {"name": "Canada",        "population": 38000000,  "neighbors": ["usa"]},
+  "mexico":  {"name": "Mexico",        "population": 128000000, "neighbors": ["usa", "guatemala"]},
+  "guatemala": {"name": "Guatemala",   "population": 17000000,  "neighbors": ["mexico"]},
+  "brazil":  {"name": "Brazil",        "population": 214000000, "neighbors": ["argentina"]},
+  "argentina": {"name": "Argentina",   "population": 45000000,  "neighbors": ["brazil"]},
+  "uk":      {"name": "United Kingdom", "population": 67000000, "neighbors": ["france"]},
+  "france":  {"name": "France",        "population": 65000000,  "neighbors": ["uk", "germany", "spain"]},
+  "germany": {"name": "Germany",       "population": 83000000,  "neighbors": ["france", "poland"]},
+  "spain":   {"name": "Spain",         "population": 47000000,  "neighbors": ["france"]},
+  "poland":  {"name": "Poland",        "population": 38000000,  "neighbors": ["germany", "russia"]},
+  "russia":  {"name": "Russia",        "population": 144000000, "neighbors": ["poland", "china"]},
+  "china":   {"name": "China",         "population": 1412000000, "neighbors": ["russia", "india"]},
+  "india":   {"name": "India",         "population": 1408000000, "neighbors": ["china"]},
+  "japan":   {"name": "Japan",         "population": 125000000, "neighbors": []},
+  "australia": {"name": "Australia",  "population": 26000000,  "neighbors": []},
+  "egypt":   {"name": "Egypt",         "population": 111000000, "neighbors": ["sudan"]},
+  "sudan":   {"name": "Sudan",         "population": 46000000,  "neighbors": ["egypt", "nigeria"]},
+  "nigeria": {"name": "Nigeria",       "population": 223000000, "neighbors": ["sudan"]},
+
+  "_comment_points": "This is a minimal 19-country test world so the sim can be exercised right away. For the real game, replace this file with one entry per country/region matched to your high-res map image: keep name/population/neighbors as-is, and add a 'points' array (or however you derive region IDs from the image) - the server never reads it, it's passed straight through in the /plague/countries snapshot for the client to draw with."
+}

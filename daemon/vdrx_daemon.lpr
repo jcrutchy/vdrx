@@ -147,108 +147,121 @@ begin
 end;
 
 begin
-  Kernel := TVDRX_Kernel.Create;
 
-  Config := TVDRX_Config.Create('vdrx_daemon.conf');
-  ShutdownGraceMs := Config.GetInteger('shutdown_grace_ms', 5000);
+  try
+    Kernel := TVDRX_Kernel.Create;
+    Config := TVDRX_Config.Create('vdrx_daemon.conf');
 
-  // Subscribes to everything under log.* - any executive's Bus.Publish of a
-  // log.info/log.warn/log.error topic ends up here, colored on the console and
-  // plain in vdrx_daemon.log.
-  Logger := TVDRX_LoggerExecutive.Create(Kernel.Queue, 'vdrx_daemon.log', lvlINFO);
-  //Kernel.Registry.Register(Logger, 'logger', 'log.>');
-  //Kernel.Registry.Register(Logger, 'logger', 'irc.>');
-  Kernel.Registry.Register(Logger, 'logger', '>');
+    ShutdownGraceMs := Config.GetInteger('shutdown_grace_ms', 5000);
+  
+    // Subscribes to everything under log.* - any executive's Bus.Publish of a
+    // log.info/log.warn/log.error topic ends up here, colored on the console and
+    // plain in vdrx_daemon.log.
+    Logger := TVDRX_LoggerExecutive.Create(Kernel.Queue, 'vdrx_daemon.log', lvlINFO);
+    //Kernel.Registry.Register(Logger, 'logger', 'log.>');
+    //Kernel.Registry.Register(Logger, 'logger', 'irc.>');
+    Kernel.Registry.Register(Logger, 'logger', '>');
+  
+    // Listens on 'sys.>' - reload/quit/restart/kill/killall. See vdrx_admin.pas
+    // and vdrx_admincmd.pas for the full command set and who can trigger it
+    // (stdin below, and IRC "!" commands in vdrx_irc.pas's DoPrivMsg).
+    Admin := TVDRX_AdminExecutive.Create(Kernel.Queue, Config, Kernel.Registry, Kernel);
+    Kernel.Registry.Register(Admin, 'admin', 'sys.>');
+  
+    // Reads quit/restart/reload/kill/killall commands typed at the console.
+    // Replaces the old "press ENTER to stop" main-thread ReadLn.
+    if Config.GetBoolean('stdin_admin_enabled', True) then
+    begin
+      Stdin := TVDRX_StdinExecutive.Create(Kernel.Queue);
+      Kernel.Registry.Register(Stdin, 'stdin', 'sys.none'); // doesn't consume bus messages, only publishes
+    end;
+  
+    if Config.GetBoolean('executives.ircd.enabled', True) then
+    begin
+      IRCD := TVDRX_IRCDExecutive.Create(Kernel.Queue, Config, Kernel.Registry);
+      IRCD.Port := Config.GetInteger('executives.ircd.port', 6667);
+      IRCD.GracefulTimeoutMs := ShutdownGraceMs;
+      ConfigureListenerTLS(IRCD, 'executives.ircd');
+      Kernel.Registry.Register(IRCD, 'ircd', 'sys.none'); // doesn't consume bus messages itself
+    end;
+  
+    // In-memory board state (persisted under data_dir) - registered before HTTP/WS
+    // since both reference it directly.
+    Whiteboard := TVDRX_WhiteboardExecutive.Create(Kernel.Queue,
+      Config.GetString('executives.whiteboard.data_dir', 'vdrx_data' + PathDelim + 'whiteboard'));
+    Kernel.Registry.Register(Whiteboard, 'whiteboard', 'wb.*.delta');
+  
+    if Config.GetBoolean('executives.ws.enabled', False) then
+    begin
+      WS := TVDRX_WebSocketExecutive.Create(Kernel.Queue, Config, Kernel.Registry);
+      WS.Port := Config.GetInteger('executives.ws.port', 8082);
+      WS.GracefulTimeoutMs := ShutdownGraceMs;
+      ConfigureListenerTLS(WS, 'executives.ws');
+      Kernel.Registry.Register(WS, 'ws', 'sys.none'); // each connection registers itself
+    end;
+  
+    SetupProxyBridges(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes);
+    SetupCLIBridges(Config, CLIRoutes);
+  
+    Templates := TVDRX_TemplateStore.Create(Config, Config.GetString('template_dir', 'templates'));
+    if Config.GetBoolean('executives.http.enabled', False) then
+    begin
+      HTTP := TVDRX_HTTPExecutive.Create(Kernel.Queue, Config, Whiteboard, Templates,
+        Config.GetString('static_dir', 'static'), ProxyRoutes, CLIRoutes);
+      HTTP.Port := Config.GetInteger('executives.http.port', 8081);
+      HTTP.GracefulTimeoutMs := ShutdownGraceMs;
+      ConfigureListenerTLS(HTTP, 'executives.http');
+      Kernel.Registry.Register(HTTP, 'http', 'sys.none');
+    end;
+  
+    Kernel.Start; // Execute() calls Registry.InitializeAll - this is what actually
+                  // binds every listener's socket(s) and starts its accept thread(s)
+  
+    WriteLn('VDRX daemon running.');
+    if Assigned(IRCD) then ReportListener(IRCD, 'IRCD');
+    if Assigned(WS) then ReportListener(WS, 'WebSocket');
+    if Assigned(HTTP) then ReportListener(HTTP, 'HTTP');
+    WriteLn('  Whiteboard persisting to ', Config.GetString('executives.whiteboard.data_dir', 'vdrx_data' + PathDelim + 'whiteboard'), '.');
+    WriteLn('  Logger writing to vdrx_daemon.log (console threshold: INFO).');
+    if Assigned(Stdin) then
+      WriteLn('  Type quit / restart / reload / kill <pid-or-id> / killall [type] and press Enter to control the daemon.');
+    WriteLn('  Shutdown grace period: ', ShutdownGraceMs, 'ms before hung threads/processes are force-killed.');
+  
+    Kernel.WaitFor; // returns once sys.quit/sys.restart has driven Kernel.Terminate
+                     // and ShutdownAll has finished tearing everything down cleanly
+    DoRestart := Kernel.RestartRequested; // read before Free below
+    Kernel.Free;
+    Templates.Free;
+    Config.Free;
+  
+    WriteLn('Daemon stopped.');
+  
+    if DoRestart then
+    begin
+      WriteLn('Respawning...');
+      NewProc := TProcess.Create(nil);
+      try
+        NewProc.Executable := ParamStr(0);
+        for i := 1 to ParamCount do
+          NewProc.Parameters.Add(ParamStr(i));
+        NewProc.CurrentDirectory := GetCurrentDir;
+        NewProc.Options := []; // detached - don't wait, don't inherit our pipes;
+                                // the new instance keeps running independently
+                                // once Execute returns
+        NewProc.Execute;
+      finally
+        NewProc.Free; // doesn't own/stop the spawned OS process
+      end;
+    end;
 
-  // Listens on 'sys.>' - reload/quit/restart/kill/killall. See vdrx_admin.pas
-  // and vdrx_admincmd.pas for the full command set and who can trigger it
-  // (stdin below, and IRC "!" commands in vdrx_irc.pas's DoPrivMsg).
-  Admin := TVDRX_AdminExecutive.Create(Kernel.Queue, Config, Kernel.Registry, Kernel);
-  Kernel.Registry.Register(Admin, 'admin', 'sys.>');
-
-  // Reads quit/restart/reload/kill/killall commands typed at the console.
-  // Replaces the old "press ENTER to stop" main-thread ReadLn.
-  if Config.GetBoolean('stdin_admin_enabled', True) then
-  begin
-    Stdin := TVDRX_StdinExecutive.Create(Kernel.Queue);
-    Kernel.Registry.Register(Stdin, 'stdin', 'sys.none'); // doesn't consume bus messages, only publishes
-  end;
-
-  if Config.GetBoolean('executives.ircd.enabled', True) then
-  begin
-    IRCD := TVDRX_IRCDExecutive.Create(Kernel.Queue, Config, Kernel.Registry);
-    IRCD.Port := Config.GetInteger('executives.ircd.port', 6667);
-    IRCD.GracefulTimeoutMs := ShutdownGraceMs;
-    ConfigureListenerTLS(IRCD, 'executives.ircd');
-    Kernel.Registry.Register(IRCD, 'ircd', 'sys.none'); // doesn't consume bus messages itself
-  end;
-
-  // In-memory board state (persisted under data_dir) - registered before HTTP/WS
-  // since both reference it directly.
-  Whiteboard := TVDRX_WhiteboardExecutive.Create(Kernel.Queue,
-    Config.GetString('executives.whiteboard.data_dir', 'vdrx_data' + PathDelim + 'whiteboard'));
-  Kernel.Registry.Register(Whiteboard, 'whiteboard', 'wb.*.delta');
-
-  if Config.GetBoolean('executives.ws.enabled', False) then
-  begin
-    WS := TVDRX_WebSocketExecutive.Create(Kernel.Queue, Config, Kernel.Registry);
-    WS.Port := Config.GetInteger('executives.ws.port', 8082);
-    WS.GracefulTimeoutMs := ShutdownGraceMs;
-    ConfigureListenerTLS(WS, 'executives.ws');
-    Kernel.Registry.Register(WS, 'ws', 'sys.none'); // each connection registers itself
-  end;
-
-  SetupProxyBridges(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes);
-  SetupCLIBridges(Config, CLIRoutes);
-
-  Templates := TVDRX_TemplateStore.Create(Config, Config.GetString('template_dir', 'templates'));
-  if Config.GetBoolean('executives.http.enabled', False) then
-  begin
-    HTTP := TVDRX_HTTPExecutive.Create(Kernel.Queue, Config, Whiteboard, Templates,
-      Config.GetString('static_dir', 'static'), ProxyRoutes, CLIRoutes);
-    HTTP.Port := Config.GetInteger('executives.http.port', 8081);
-    HTTP.GracefulTimeoutMs := ShutdownGraceMs;
-    ConfigureListenerTLS(HTTP, 'executives.http');
-    Kernel.Registry.Register(HTTP, 'http', 'sys.none');
-  end;
-
-  Kernel.Start; // Execute() calls Registry.InitializeAll - this is what actually
-                // binds every listener's socket(s) and starts its accept thread(s)
-
-  WriteLn('VDRX daemon running.');
-  if Assigned(IRCD) then ReportListener(IRCD, 'IRCD');
-  if Assigned(WS) then ReportListener(WS, 'WebSocket');
-  if Assigned(HTTP) then ReportListener(HTTP, 'HTTP');
-  WriteLn('  Whiteboard persisting to ', Config.GetString('executives.whiteboard.data_dir', 'vdrx_data' + PathDelim + 'whiteboard'), '.');
-  WriteLn('  Logger writing to vdrx_daemon.log (console threshold: INFO).');
-  if Assigned(Stdin) then
-    WriteLn('  Type quit / restart / reload / kill <pid-or-id> / killall [type] and press Enter to control the daemon.');
-  WriteLn('  Shutdown grace period: ', ShutdownGraceMs, 'ms before hung threads/processes are force-killed.');
-
-  Kernel.WaitFor; // returns once sys.quit/sys.restart has driven Kernel.Terminate
-                   // and ShutdownAll has finished tearing everything down cleanly
-  DoRestart := Kernel.RestartRequested; // read before Free below
-  Kernel.Free;
-  Templates.Free;
-  Config.Free;
-
-  WriteLn('Daemon stopped.');
-
-  if DoRestart then
-  begin
-    WriteLn('Respawning...');
-    NewProc := TProcess.Create(nil);
-    try
-      NewProc.Executable := ParamStr(0);
-      for i := 1 to ParamCount do
-        NewProc.Parameters.Add(ParamStr(i));
-      NewProc.CurrentDirectory := GetCurrentDir;
-      NewProc.Options := []; // detached - don't wait, don't inherit our pipes;
-                              // the new instance keeps running independently
-                              // once Execute returns
-      NewProc.Execute;
-    finally
-      NewProc.Free; // doesn't own/stop the spawned OS process
+  except
+    on E: Exception do
+    begin
+      WriteLn('FATAL: daemon failed to start - ', E.ClassName, ': ', E.Message);
+      Halt(1);
     end;
   end;
+  
+  Kernel.WaitFor;
+
 end.
