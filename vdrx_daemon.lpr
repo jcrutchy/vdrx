@@ -56,7 +56,18 @@ begin
       ') but failed to come up - check tls_cert/tls_key and that libssl is loadable.');
 end;
 
-procedure SetupProxyBridges(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry;
+// Generalized from the old SetupProxyBridges: every entry in "processes" gets
+// a supervised TVDRX_BridgeExecutive (spawn, restart-on-crash, graceful-then-
+// force shutdown - see vdrx_bridge.pas) regardless of what it's for. prefix/
+// host/port are now OPTIONAL - give them and the process also gets an HTTP
+// reverse-proxy route (same as the old proxy_bridges did); omit them for a
+// bare supervised background process with no HTTP surface at all (a SOMA
+// worker, a future Cartographica island process, etc). id and command are the
+// only two required fields. Deliberately NOT merged with cli_bridges below -
+// that's a genuinely different mechanism (invoke-per-request script
+// execution, no persistent process, no Bridge involved), not another flavour
+// of this one.
+procedure SetupProcesses(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry;
   AGracefulMs: Integer; out ARoutes: TVDRX_ProxyRoutes);
 var
   Rows: TVDRX_ConfigRows;
@@ -65,13 +76,13 @@ var
   n, BridgeGraceMs: Integer;
 begin
   SetLength(ARoutes, 0);
-  Rows := AConfig.GetObjectArray('proxy_bridges');
+  Rows := AConfig.GetObjectArray('processes');
   try
     for Row in Rows do
     begin
-      if (Row.Values['id'] = '') or (Row.Values['command'] = '') or (Row.Values['prefix'] = '') then
+      if (Row.Values['id'] = '') or (Row.Values['command'] = '') then
       begin
-        WriteLn('  Skipping proxy_bridges entry - needs id, prefix, and command.');
+        WriteLn('  Skipping processes entry - needs at least id and command.');
         Continue;
       end;
       Bridge := TVDRX_BridgeExecutive.Create(Kernel.Queue);
@@ -81,20 +92,26 @@ begin
       // there's genuinely no equivalent on Windows (see vdrx_procutil.pas's
       // TryGracefulTerminate). Waiting the full shutdown_grace_ms on every
       // quit/restart just to then force-kill it anyway wastes real time -
-      // override per-bridge via "graceful_timeout_ms" in its proxy_bridges
+      // override per-process via "graceful_timeout_ms" in its processes
       // entry; falls back to the daemon-wide default if not set.
       BridgeGraceMs := StrToIntDef(Row.Values['graceful_timeout_ms'], AGracefulMs);
       Bridge.GracefulTimeoutMs := BridgeGraceMs;
       ARegistry.Register(Bridge, Row.Values['id'], 'sys.none');
 
-      n := Length(ARoutes);
-      SetLength(ARoutes, n + 1);
-      ARoutes[n].Prefix := Row.Values['prefix'];
-      ARoutes[n].Host := IfThen(Row.Values['host'] <> '', Row.Values['host'], '127.0.0.1');
-      ARoutes[n].Port := StrToIntDef(Row.Values['port'], 0);
-      WriteLn('  Proxy bridge "', Row.Values['id'], '": ', ARoutes[n].Prefix, ' -> ',
-        ARoutes[n].Host, ':', ARoutes[n].Port, ' (', Row.Values['command'],
-        ', graceful_timeout_ms=', BridgeGraceMs, ')');
+      if Row.Values['prefix'] <> '' then
+      begin
+        n := Length(ARoutes);
+        SetLength(ARoutes, n + 1);
+        ARoutes[n].Prefix := Row.Values['prefix'];
+        ARoutes[n].Host := IfThen(Row.Values['host'] <> '', Row.Values['host'], '127.0.0.1');
+        ARoutes[n].Port := StrToIntDef(Row.Values['port'], 0);
+        WriteLn('  Process "', Row.Values['id'], '" (proxied): ', ARoutes[n].Prefix, ' -> ',
+          ARoutes[n].Host, ':', ARoutes[n].Port, ' (', Row.Values['command'],
+          ', graceful_timeout_ms=', BridgeGraceMs, ')');
+      end
+      else
+        WriteLn('  Process "', Row.Values['id'], '" (', Row.Values['command'],
+          ', graceful_timeout_ms=', BridgeGraceMs, ')');
     end;
   finally
     Rows.Free;
@@ -150,7 +167,9 @@ begin
   
     // Listens on 'sys.>' - reload/quit/restart/kill/killall. See vdrx_admin.pas
     // and vdrx_admincmd.pas for the full command set and who can trigger it
-    // (stdin below, and IRC "!" commands in vdrx_irc.pas's DoPrivMsg).
+    // (stdin below is the only source right now; DispatchAdminCommandLine in
+    // vdrx_admincmd.pas is written to be reusable by any future text-command
+    // source the same way).
     Admin := TVDRX_AdminExecutive.Create(Kernel.Queue, Config, Kernel.Registry, Kernel);
     Kernel.Registry.Register(Admin, 'admin', 'sys.>');
   
@@ -171,7 +190,7 @@ begin
       Kernel.Registry.Register(WS, 'ws', 'sys.none'); // each connection registers itself
     end;
   
-    SetupProxyBridges(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes);
+    SetupProcesses(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes);
     SetupCLIBridges(Config, CLIRoutes);
   
     Templates := TVDRX_TemplateStore.Create(Config, Config.GetString('template_dir', 'templates'));
@@ -230,7 +249,5 @@ begin
       Halt(1);
     end;
   end;
-  
-  Kernel.WaitFor;
 
 end.

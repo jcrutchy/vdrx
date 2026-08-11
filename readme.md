@@ -1,16 +1,11 @@
-# VDRX — Visual Data Relay Executive
+# VDRX
 
-VDRX is a modular, event-driven message-routing daemon written in Object
-Pascal / Free Pascal. At its core it's a small in-process pub/sub bus (the
-"executive bus") that anything running inside the daemon — an IRC server, a
-WebSocket bridge, an external process, a config-reload handler — can publish
-to and subscribe from, using the same handful of primitives no matter what
-the thing on the other end actually is.
-
-The name comes from the founding idea: **executives** are independent units
-of work (an IRC connection, a listener, a spawned child process) that relay
-**visual/structured data** to each other and to clients through one shared
-**data relay**.
+VDRX is a small, boring, Unix-philosophy daemon written in Object Pascal /
+Free Pascal. Its whole job is two things: an in-process pub/sub message bus
+that anything running inside it can publish to and subscribe from, and
+supervision of external processes (spawn, restart-on-crash, graceful-then-
+forced shutdown). Everything else — HTTP, WebSocket, whatever gets built on
+top of it later — is a consumer of those two things, not part of the core.
 
 No external Pascal dependencies — everything here is vanilla Free Pascal
 plus the OS's own OpenSSL library for TLS. That's a deliberate project
@@ -39,32 +34,30 @@ choice, not an oversight.
                        ▼
         ┌───────────────────────────────────────────┐
         │  every TVDRX_Executive descendant:          │
-        │  Logger · Admin · IRCD (+ per-connection)   │
-        │  WebSocket (+ per-connection) · HTTP         │
-        │  Whiteboard · Bridge (external process)      │
+        │  Logger · Admin · Stdin · WebSocket          │
+        │  HTTP · Bridge (any external process)        │
         └───────────────────────────────────────────┘
 ```
 
 Everything is an **executive** — a small class with an `ID`, a reference to
 the bus, and a `HandlePacket(AMsg)` method. Executives don't call each other
 directly; they publish onto a topic and let the Registry figure out who's
-listening. That's the whole trick, and it's why wildly different things
-(a spawned `bash` script, a browser's WebSocket, an IRC channel, a config
-reload) can all interoperate without knowing about each other.
+listening. That's the whole trick, and it's why wildly different things (a
+spawned process, a browser's WebSocket, a config reload, a future SOMA
+worker) can all interoperate without knowing about each other.
 
 ## Key concepts
 
 ### Topics and filters
 
-Topics are dot-delimited strings (`irc.#general.event`, `log.warn`,
-`wb.board1.delta`). Filters use the same shape with two wildcards:
+Topics are dot-delimited strings (`log.warn`, `<bridge-id>.out`,
+`sys.reload`). Filters use the same shape with two wildcards:
 
 - `*` matches exactly one segment
 - `>` matches the rest of the topic, however many segments remain
 
-So `log.>` catches `log.info`, `log.warn`, `log.error`, ...; `irc.>` catches
-every channel's events; `irc.#general.event` (no wildcard) matches that one
-topic literally.
+So `log.>` catches `log.info`, `log.warn`, `log.error`, ...; `sys.>` catches
+every admin command; a literal topic with no wildcard matches only itself.
 
 ### Subscriptions are multi-filter
 
@@ -77,52 +70,65 @@ just add routing entries. `UnregisterFilter` drops one filter without
 touching the others; `ClearFilters` drops all of them without destroying the
 executive; `Unregister` does both — drops everything and frees it.
 
-This is the mechanism behind, for example, an IRC connection subscribing to
-several channels at once, or pointing the `Logger` at a second firehose
-(`irc.>`) just to eavesdrop on something while testing — see "Extending"
-below.
-
 ### The registry doubles as the executive lifecycle manager
 
 `InitializeAll` / `ShutdownAll` / `ApplyAllConfigs` walk every registered
 executive and call its `Initialize` / `Shutdown` / `ApplyConfig`. Most
-executives (Logger, Whiteboard, Admin) leave these as no-ops; anything that
-owns a socket or an external process overrides them to actually bind/spawn
-on `Initialize` and tear down cleanly on `Shutdown`.
+executives (Logger, Admin) leave these as no-ops; anything that owns a
+socket or an external process overrides them to actually bind/spawn on
+`Initialize` and tear down cleanly on `Shutdown`.
 
 ### Transport is separate from protocol
 
 Every socket-owning executive descends from `TVDRX_SocketListenerExecutive`,
-which owns the accept loop(s), thread-per-connection dispatch, and — as of
-this session — **plain TCP and TLS at the same time**, on two independently
-configurable ports. Protocol code (HTTP, WebSocket, IRCD) talks to a
-`TVDRX_Transport` abstraction (`Read`/`Write`/`Close`) instead of a raw
-socket, so none of it knows or cares whether the client connected encrypted
-or not.
+which owns the accept loop(s), thread-per-connection dispatch, and plain TCP
+and TLS at the same time, on two independently configurable ports. Protocol
+code (HTTP, WebSocket) talks to a `TVDRX_Transport` abstraction
+(`Read`/`Write`/`Close`) instead of a raw socket, so none of it knows or
+cares whether the client connected encrypted or not.
+
+### Process supervision (Bridge)
+
+`TVDRX_BridgeExecutive` is a generic external-process supervisor — spawn,
+monitor, restart-on-crash with exponential backoff, graceful-then-forced
+shutdown. It's an executive like any other: the Registry manages it exactly
+the same way, with no special-casing. Every line the child process writes to
+stdout is republished onto the bus as `<id>.out`; every bus message matching
+its subscription is written to the child's stdin as a JSON line
+(`{"topic":...,"payload":...,"source":...}`). A child process doesn't need
+to know anything about VDRX's bus API — it just reads/writes JSON lines.
+
+This is the "systemd-lite" layer: the `processes` config array (see below)
+turns any command into a supervised entry with zero new Pascal per program
+you want VDRX to babysit.
 
 ## The executives
 
 | Unit | What it is |
 |---|---|
 | `vdrx_core.pas` | `TVDRX_Executive`, `TVDRX_MessageQueue`, `TVDRX_Registry`, `TVDRX_Kernel` — the bus itself, no protocol knowledge |
-| `vdrx_config.pas` | JSON config file wrapper (`GetString`/`GetInteger`/`GetStringArray`/`Reload`) |
-| `vdrx_admin.pas` | Listens on `sys.reload`; reloads the config file and calls `ApplyAllConfigs` on everything |
-| `vdrx_logger.pas` | Listens on `log.>`; colored console output + plain file (`vdrx_daemon.log`) |
+| `vdrx_config.pas` | JSON config file wrapper (`GetString`/`GetInteger`/`GetBoolean`/`GetStringArray`/`GetObjectArray`/`Reload`) |
+| `vdrx_admin.pas` | Listens on `sys.>` — `sys.reload`/`sys.quit`/`sys.restart`/`sys.kill`/`sys.killall`. The daemon's whole operator-control surface |
+| `vdrx_admincmd.pas` | Shared line-command parser (`quit`/`restart`/`reload`/`kill <target>`/`killall [type]`) that turns typed text into `sys.*` bus messages — used by Stdin today, reusable by any future text-command source |
+| `vdrx_stdin.pas` | Reads admin commands one per line from the console, on its own thread |
+| `vdrx_logger.pas` | Listens on `log.>` (registered on `>` in `main`, i.e. everything); colored console output + plain file (`vdrx_daemon.log`) |
+| `vdrx_procutil.pas` | Cross-platform process helpers: bounded thread/process wait, graceful terminate (SIGTERM on Unix), force-kill (SIGKILL / `taskkill /T /F`) |
+| `vdrx_bridge.pas` | `TVDRX_BridgeExecutive` — spawns and supervises one external process (see "Process supervision" above) |
 | `vdrx_transport.pas` | `TVDRX_Transport` / `TVDRX_PlainTransport` / `TVDRX_TLSTransport` / `TVDRX_TLSContext` — the plaintext-vs-TLS abstraction everything else builds on |
 | `vdrx_socketlistener.pas` | `TVDRX_SocketListenerExecutive` — shared accept-loop/threading/dual-transport base class |
-| `vdrx_irc.pas` | A real (if minimal) IRCD: registration handshake, MOTD, multi-channel JOIN/PART/TOPIC/NAMES, cross-client chat relay over the bus. Each connection is its own registered executive |
 | `vdrx_websocket.pas` | Browser-facing WS bridge: JSON-RPC (`subscribe`/`unsubscribe`/`unsubscribe_all`/`publish`) over a WebSocket, each connection a registered executive |
-| `vdrx_http.pas` | Minimal request/response HTTP server, currently serving one whiteboard snapshot route |
+| `vdrx_http.pas` | Request/response HTTP server: static file serving, reverse-proxy routing to `processes` entries that declare a `prefix`, and CLI-bridge routing (see below) |
 | `vdrx_weblistener.pas` | Optional: HTTP + WS multiplexed on one port (sniffs the `Upgrade` header) |
-| `vdrx_whiteboard.pas` | In-memory collaborative-board state (`wb.<board>.delta` in, `.synced` out); no persistence yet |
-| `vdrx_bridge.pas` | Spawns and supervises one external process, feeds it bus messages as JSON lines on stdin, republishes its stdout lines back onto the bus |
+| `vdrx_templates.pas` | Recursive placeholder template engine (`$$setting$$` / `??const??` / `%%var%%` / `@@loop@@`) used by HTTP's rendered pages |
 
 ## What's actually running right now
 
-`vdrx_daemon.lpr` wires up **Logger, Admin, and IRCD** by default. HTTP, WS,
-Whiteboard, Bridge, and the combined WebListener are fully implemented and
-compiled in, but not yet instantiated in `main` — they're ready to wire up
-when you need them (see `WIRING.md` for worked examples of each).
+`vdrx_daemon.lpr` wires up **Logger, Admin, and Stdin** unconditionally.
+WebSocket and HTTP are wired up if enabled in config (`executives.ws.enabled`
+/ `executives.http.enabled`). Any entry in the `processes` config array gets
+a supervised Bridge; any entry in `cli_bridges` gets a routed CLI script
+(no persistent process). See `WIRING.md` for the session-by-session design
+log.
 
 ## Building
 
@@ -155,45 +161,67 @@ cd daemon
 ./vdrx_daemon
 ```
 
-Reads `vdrx_daemon.conf` from the working directory, binds IRCD's plain port
-(and TLS port, if configured), and writes to `vdrx_daemon.log`. Press ENTER
-to stop cleanly.
-
-### Testing with an IRC client
-
-Point HexChat (or any IRC client) at `<host>:6667` — no auth required.
-Multi-channel JOIN, NAMES, TOPIC, and cross-client chat all work; open two
-clients and JOIN the same channel to see them talk to each other.
+Reads `vdrx_daemon.conf` from the working directory and writes to
+`vdrx_daemon.log`. Type `quit`, `restart`, `reload`, `kill <pid-or-id>`, or
+`killall [type]` at the console and press Enter — see `vdrx_admincmd.pas`.
 
 ## Config file (`vdrx_daemon.conf`)
 
 ```json
 {
-  "executives": {
-    "ircd": {
-      "enabled": true,
-      "port": 6667,
-      "tls_port": 0,
-      "tls_cert": "",
-      "tls_key": "",
-      "servername": "vdrx",
-      "network": "VDRX",
-      "motd": ["one line per MOTD entry"]
+  "shutdown_grace_ms": 5000,
+  "stdin_admin_enabled": true,
+  "template_dir": "templates",
+  "static_dir": "static",
+  "settings": { "site_title": "VDRX" },
+  "processes": [
+    {
+      "id": "phpapp1",
+      "command": "c:/php/php -S 127.0.0.1:9101 -t phpapp",
+      "graceful_timeout_ms": 300,
+      "prefix": "/app/",
+      "host": "127.0.0.1",
+      "port": 9101
     },
+    {
+      "id": "somaworker",
+      "command": "./soma_worker"
+    }
+  ],
+  "cli_bridges": [
+    {
+      "id": "phpcli1",
+      "prefix": "/cli/",
+      "command": "c:/php/php",
+      "script_dir": "phpcli",
+      "timeout_ms": 5000,
+      "content_type": "text/html"
+    }
+  ],
+  "executives": {
     "http": { "enabled": false, "port": 8081, "tls_port": 0, "tls_cert": "", "tls_key": "" },
     "ws":   { "enabled": false, "port": 8082, "tls_port": 0, "tls_cert": "", "tls_key": "" }
   }
 }
 ```
 
-`tls_port: 0` means "TLS disabled for this executive." `tls_cert`/`tls_key`
-should be absolute paths to PEM files. `http`/`ws` support the same keys and
-already have working `ApplyConfig` methods — they're just not instantiated
-in `vdrx_daemon.lpr` yet.
+**`processes`** — every entry gets a supervised `TVDRX_BridgeExecutive`.
+Only `id` and `command` are required. Add `prefix`/`host`/`port` and it also
+gets an HTTP reverse-proxy route (needs `executives.http.enabled: true`);
+omit them for a bare supervised background process with no HTTP surface —
+e.g. a SOMA worker or anything else you just want VDRX to keep alive.
 
-Publishing `sys.reload` on the bus (once something exists to trigger it —
-nothing does yet, by design) re-reads this file and re-applies it to every
-registered executive live, including rebinding ports if they changed.
+**`cli_bridges`** — a genuinely different mechanism: each request to
+`prefix` invokes `command` fresh against a script under `script_dir` and
+returns its output, rather than talking to a long-running process. No
+Bridge executive involved.
+
+`tls_port: 0` means "TLS disabled for this executive." `tls_cert`/`tls_key`
+should be absolute paths to PEM files.
+
+Publishing `sys.reload` on the bus (or typing `reload` at the console)
+re-reads this file and re-applies it to every registered executive live,
+including rebinding ports if they changed.
 
 ### Testing TLS
 
@@ -212,33 +240,32 @@ No special registration process — any executive already in the daemon can
 pick up an additional filter with one more `Register` call:
 
 ```pascal
-Kernel.Registry.Register(Logger, 'logger', 'irc.>');
+Kernel.Registry.Register(Logger, 'logger', 'some.new.topic.>');
 ```
 
-That alone makes every IRC channel event show up in the log — a fast way to
-confirm wiring before writing a purpose-built consumer. A real consumer
-would `Register` the same way, then in `HandlePacket` parse the topic/JSON
-payload and act on it — see `vdrx_irc.pas`'s own `HandlePacket` for the
-pattern (check the payload's `"kind"` field; IRC events all share one topic
-per channel, `irc.<channel>.event`, distinguished only by payload shape).
+A real consumer would `Register` the same way, then in `HandlePacket` parse
+the topic/JSON payload and act on it.
 
 ## Known gaps (deliberately deferred, not forgotten)
 
-- **IRC**: no per-nick `PRIVMSG` routing (channel messages only), no
-  WHO/WHOIS/LIST, no persistent nick registration/auth
 - **WebSocket**: `sys.auth` is a stub — any non-empty token is accepted
-- **Whiteboard**: in-memory only, no disk persistence (`BucketStore`) yet
-- **Bridge → IRC**: nothing currently relays a Bridge process's stdout back
-  into an IRC channel automatically — you'd wire a small adapter for that
 - **Shutdown**: per-connection threads are fire-and-forget
   (`FreeOnTerminate`), not individually tracked/joined — fine for a dev
   daemon, not yet a clean production shutdown
-- **HTTP/WS/Whiteboard/Bridge/WebListener**: implemented, not yet wired into
-  `vdrx_daemon.lpr`'s `main`
+- **No authentication** anywhere on the `sys.*` admin surface — anything
+  that can reach stdin (or, later, any other admin-command source) can
+  quit/restart/kill the daemon. Deliberate for now; revisit if this ever
+  runs somewhere multi-tenant
+- **Buckets**: no namespace/persistence-policy layer above raw topics yet —
+  under consideration for grouping related topics (logs vs. world-state vs.
+  control) and deciding what gets written to disk
+- **IRC**: no longer part of this repo — see the standalone IRCD project
+  (`hogircd`), which can be wired in as a `processes` entry like anything
+  else once it's ready to be supervised that way
 
 ## Further reading
 
-`daemon/WIRING.md` has the session-by-session design log: why each piece is
-shaped the way it is, worked examples for wiring up the not-yet-instantiated
-executives, and notes on things that were tried, verified, or fixed along
-the way (including the TLS binding story above, in more detail).
+`WIRING.md` has the session-by-session design log: why each piece is shaped
+the way it is, worked examples, and notes on things that were tried,
+verified, or fixed along the way (including the TLS binding story above, in
+more detail).
