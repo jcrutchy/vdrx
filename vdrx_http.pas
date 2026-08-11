@@ -6,7 +6,7 @@ interface
 
 uses
   Classes, SysUtils, StrUtils, Sockets, Process, vdrx_core, vdrx_socketlistener,
-  vdrx_transport, vdrx_whiteboard, vdrx_plague, vdrx_config, vdrx_templates, vdrx_procutil, Generics.Collections;
+  vdrx_transport, vdrx_config, vdrx_templates, vdrx_procutil, Generics.Collections;
 
 type
   // One configured reverse-proxy target - see vdrx_daemon.conf's
@@ -36,8 +36,6 @@ type
   TVDRX_HTTPExecutive = class(TVDRX_SocketListenerExecutive)
   private
     FConfig: TVDRX_Config;
-    FWhiteboard: TVDRX_WhiteboardExecutive;
-    FPlague: TVDRX_PlagueExecutive;
     FTemplates: TVDRX_TemplateStore;
     FStaticDir: string;
     FProxyRoutes: TVDRX_ProxyRoutes;
@@ -46,12 +44,12 @@ type
     procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
     constructor Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config;
-      AWhiteboard: TVDRX_WhiteboardExecutive; APlague: TVDRX_PlagueExecutive; ATemplates: TVDRX_TemplateStore;
+      ATemplates: TVDRX_TemplateStore;
       const AStaticDir: string; const AProxyRoutes: TVDRX_ProxyRoutes;
       const ACLIRoutes: TVDRX_CLIRoutes); reintroduce;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
     procedure ApplyConfig; override;
-    class function BuildResponse(const ARequest: string; AWhiteboard: TVDRX_WhiteboardExecutive; APlague: TVDRX_PlagueExecutive;
+    class function BuildResponse(const ARequest: string;
       ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
       const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
       ABus: TVDRX_MessageQueue; const ASourceID: string): string;
@@ -279,58 +277,6 @@ begin
   end;
   ABus.Publish('log.info', Format('http: served static %s (%d bytes)', [FilePath, Length(Body)]), ASourceID);
   Result := PlainResponse('200 OK', GuessContentType(APath), Body);
-end;
-
-function RenderBoardPage(const ABoardName: string; AWhiteboard: TVDRX_WhiteboardExecutive;
-  ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; ABus: TVDRX_MessageQueue; const ASourceID: string): string;
-var
-  BoardJSON, Body: string;
-  Params: TStringList;
-  Rows: TVDRX_TemplateNamedRows;
-  BoardRows: TVDRX_TemplateRows;
-  Names: TStringArray;
-  i: Integer;
-  Row: TStringList;
-begin
-  BoardJSON := AWhiteboard.GetBoardSnapshot(ABoardName);
-  ABus.Publish('log.info', Format('http: board "%s" snapshot is %d bytes', [ABoardName, Length(BoardJSON)]), ASourceID);
-
-  Params := TStringList.Create;
-  try
-    Params.Values['board_name'] := ABoardName;
-    Params.Values['board_json'] := BoardJSON;
-    Params.Values['ws_port'] := IntToStr(AConfig.GetInteger('executives.ws.port', 8082));
-    Params.Values['ws_host_json'] := '""';
-    Params.Values['ws_tls_json'] := IfThen(AConfig.GetInteger('executives.ws.tls_port', 0) <> 0, 'true', 'false');
-
-    Rows := TVDRX_TemplateNamedRows.Create([doOwnsValues]);
-    try
-      BoardRows := TVDRX_TemplateRows.Create;
-      Names := AWhiteboard.ListBoardNames;
-      for i := 0 to High(Names) do
-      begin
-        Row := TStringList.Create;
-        Row.Values['name'] := Names[i];
-        Row.Values['active_class'] := IfThen(Names[i] = ABoardName, 'active', '');
-        BoardRows.Add(Row);
-      end;
-      Rows.Add('boards', BoardRows);
-
-      Body := ATemplates.Fill('dashboard', Params, Rows);
-    finally
-      Rows.Free;
-    end;
-  finally
-    Params.Free;
-  end;
-
-  if Body = '' then
-  begin
-    ABus.Publish('log.error', 'http: dashboard.tpl produced no output - check template_dir', ASourceID);
-    Exit(PlainResponse('500 Internal Server Error', 'text/plain',
-      'Missing template: dashboard.tpl (check template_dir in vdrx_daemon.conf)'));
-  end;
-  Result := PlainResponse('200 OK', 'text/html', Body);
 end;
 
 // Unlike RenderBoardPage there's no board_name/board list - one game, one
@@ -570,14 +516,11 @@ begin
   Result := PlainResponse('200 OK', ARoute.ContentType, Output);
 end;
 
-constructor TVDRX_HTTPExecutive.Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config;
-  AWhiteboard: TVDRX_WhiteboardExecutive; APlague: TVDRX_PlagueExecutive; ATemplates: TVDRX_TemplateStore;
+constructor TVDRX_HTTPExecutive.Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config; ATemplates: TVDRX_TemplateStore;
   const AStaticDir: string; const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes);
 begin
   inherited Create(ABus);
   FConfig := AConfig;
-  FWhiteboard := AWhiteboard;
-  FPlague := APlague;
   FTemplates := ATemplates;
   FStaticDir := AStaticDir;
   FProxyRoutes := AProxyRoutes;
@@ -585,7 +528,7 @@ begin
   Port := 8081;
 end;
 
-class function TVDRX_HTTPExecutive.BuildResponse(const ARequest: string; AWhiteboard: TVDRX_WhiteboardExecutive; APlague: TVDRX_PlagueExecutive;
+class function TVDRX_HTTPExecutive.BuildResponse(const ARequest: string;
   ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
   const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
   ABus: TVDRX_MessageQueue; const ASourceID: string): string;
@@ -608,32 +551,7 @@ begin
     Exit(RunCLIScript(ARequest, CLIRoute, ABus, ASourceID));
   end;
 
-  if (Method = 'GET') and (Copy(Path, 1, 7) = '/board/') then
-  begin
-    BoardName := Copy(Path, 8, MaxInt);
-    if not IsValidBoardName(BoardName) then
-    begin
-      ABus.Publish('log.warn', 'http: rejected invalid board name "' + BoardName + '"', ASourceID);
-      Exit(PlainResponse('400 Bad Request', 'text/plain', 'Invalid board name'));
-    end;
-    Result := RenderBoardPage(BoardName, AWhiteboard, ATemplates, AConfig, ABus, ASourceID);
-  end
-  else if (Method = 'GET') and (Path = '/plague') then
-  begin
-    if not Assigned(APlague) then Exit(PlainResponse('404 Not Found', 'text/plain', 'Plague executive not wired up'));
-    Result := RenderPlaguePage(ATemplates, AConfig, ABus, ASourceID);
-  end
-  else if (Method = 'GET') and (Path = '/plague/state') then
-  begin
-    if not Assigned(APlague) then Exit(PlainResponse('404 Not Found', 'text/plain', 'Plague executive not wired up'));
-    Result := PlainResponse('200 OK', 'application/json', APlague.GetSnapshot);
-  end
-  else if (Method = 'GET') and (Path = '/plague/countries') then
-  begin
-    if not Assigned(APlague) then Exit(PlainResponse('404 Not Found', 'text/plain', 'Plague executive not wired up'));
-    Result := PlainResponse('200 OK', 'application/json', APlague.GetCountriesJSON);
-  end
-  else if Method = 'GET' then
+  if Method = 'GET' then
     Result := ServeStaticFile(Path, AStaticDir, ABus, ASourceID)
   else
   begin
@@ -650,7 +568,7 @@ begin
   if Request <> '' then
   begin
     ParseRequestLine(Request, Method, Path);
-    Response := BuildResponse(Request, FWhiteboard, FPlague, FTemplates, FConfig, FStaticDir, FProxyRoutes, FCLIRoutes, Bus, ID);
+    Response := BuildResponse(Request, FTemplates, FConfig, FStaticDir, FProxyRoutes, FCLIRoutes, Bus, ID);
     Bus.Publish('log.info', Format('http: %s %s -> %s', [Method, Path, StatusOf(Response)]), ID);
     ATransport.Write(Response[1], Length(Response));
   end

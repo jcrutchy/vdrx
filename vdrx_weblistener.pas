@@ -6,13 +6,11 @@ interface
 
 uses
   Classes, SysUtils, Sockets, vdrx_core, vdrx_socketlistener, vdrx_transport,
-  vdrx_http, vdrx_websocket, vdrx_whiteboard, vdrx_plague, vdrx_config, vdrx_templates;
+  vdrx_http, vdrx_websocket, vdrx_config, vdrx_templates;
 
 type
   TVDRX_WebListenerExecutive = class(TVDRX_SocketListenerExecutive)
   private
-    FWhiteboard: TVDRX_WhiteboardExecutive;
-    FPlague: TVDRX_PlagueExecutive;
     FWebSocket: TVDRX_WebSocketExecutive;
     FTemplates: TVDRX_TemplateStore;
     FConfig: TVDRX_Config;
@@ -22,8 +20,7 @@ type
   protected
     procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
-    constructor Create(ABus: TVDRX_MessageQueue; AWhiteboard: TVDRX_WhiteboardExecutive;
-      APlague: TVDRX_PlagueExecutive;
+    constructor Create(ABus: TVDRX_MessageQueue;
       AWebSocket: TVDRX_WebSocketExecutive; ATemplates: TVDRX_TemplateStore;
       AConfig: TVDRX_Config; const AStaticDir: string; const AProxyRoutes: TVDRX_ProxyRoutes;
       const ACLIRoutes: TVDRX_CLIRoutes); reintroduce;
@@ -32,14 +29,11 @@ type
 
 implementation
 
-constructor TVDRX_WebListenerExecutive.Create(ABus: TVDRX_MessageQueue;
-  AWhiteboard: TVDRX_WhiteboardExecutive; APlague: TVDRX_PlagueExecutive; AWebSocket: TVDRX_WebSocketExecutive;
+constructor TVDRX_WebListenerExecutive.Create(ABus: TVDRX_MessageQueue; AWebSocket: TVDRX_WebSocketExecutive;
   ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
   const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes);
 begin
   inherited Create(ABus);
-  FWhiteboard := AWhiteboard;
-  FPlague := APlague;
   FWebSocket := AWebSocket;
   FTemplates := ATemplates;
   FConfig := AConfig;
@@ -68,7 +62,7 @@ begin
     FWebSocket.AdoptConnection(ATransport, Request)
   else
   begin
-    Response := TVDRX_HTTPExecutive.BuildResponse(Request, FWhiteboard, FPlague, FTemplates, FConfig, FStaticDir, FProxyRoutes, FCLIRoutes, Bus, ID);
+    Response := TVDRX_HTTPExecutive.BuildResponse(Request, FTemplates, FConfig, FStaticDir, FProxyRoutes, FCLIRoutes, Bus, ID);
     ATransport.Write(Response[1], Length(Response));
     ATransport.Close;
     ATransport.Free;
