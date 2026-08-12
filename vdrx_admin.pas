@@ -20,8 +20,12 @@ type
   //   sys.killall  - payload is optional; empty kills every non-core
   //                  executive, or a substring matched against class names
   //                  (e.g. "bridge") to kill just executives of that kind
+  //   sys.list     - payload ignored. Lists every registered executive (ID,
+  //                  class) - Bridges additionally show pid/running state
+  //                  and restart policy.
   // Not authenticated - see vdrx_admincmd.pas for what feeds these topics
-  // (stdin, IRC "!" commands) and why that's deliberate for now.
+  // (stdin today; written to be reusable by any future text-command
+  // source) and why that's deliberate for now.
   TVDRX_AdminExecutive = class(TVDRX_Executive)
   private
     FConfig: TVDRX_Config;
@@ -30,6 +34,7 @@ type
     function IsProtected(const AID: string): Boolean;
     procedure DoKill(const ATarget: string);
     procedure DoKillAll(const ATypeFilter: string);
+    procedure DoList;
   public
     constructor Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config;
       ARegistry: TVDRX_Registry; AKernel: TVDRX_Kernel); reintroduce;
@@ -135,6 +140,34 @@ begin
     FRegistry.Unregister(Targets[i]);
 end;
 
+procedure TVDRX_AdminExecutive.DoList;
+var
+  Snap: TVDRX_ExecList;
+  Exec: TVDRX_Executive;
+  Line: string;
+begin
+  Snap := FRegistry.Snapshot;
+  try
+    Bus.Publish('log.info', Format('admin: %d executive(s) registered:', [Snap.Count]), ID);
+    for Exec in Snap do
+    begin
+      Line := Format('  %s (%s)', [Exec.ID, Exec.ClassName]);
+      if Exec is TVDRX_BridgeExecutive then
+      begin
+        if TVDRX_BridgeExecutive(Exec).CurrentPID <> 0 then
+          Line := Line + Format(' - running, pid %d, restart=%s',
+            [TVDRX_BridgeExecutive(Exec).CurrentPID, TVDRX_BridgeExecutive(Exec).RestartPolicy])
+        else
+          Line := Line + Format(' - not running, restart=%s',
+            [TVDRX_BridgeExecutive(Exec).RestartPolicy]);
+      end;
+      Bus.Publish('log.info', Line, ID);
+    end;
+  finally
+    Snap.Free;
+  end;
+end;
+
 procedure TVDRX_AdminExecutive.HandlePacket(const AMsg: TVDRX_Message);
 begin
   if AMsg.Topic = 'sys.reload' then
@@ -157,7 +190,9 @@ begin
   else if AMsg.Topic = 'sys.kill' then
     DoKill(AMsg.Payload)
   else if AMsg.Topic = 'sys.killall' then
-    DoKillAll(AMsg.Payload);
+    DoKillAll(AMsg.Payload)
+  else if AMsg.Topic = 'sys.list' then
+    DoList;
 end;
 
 end.

@@ -8,9 +8,9 @@ uses
   Classes, SysUtils, vdrx_core;
 
 // Shared line-command parser used by anything that lets an operator type
-// admin commands at VDRX - stdin (vdrx_stdin.pas) today, IRC "!" commands
-// (vdrx_irc.pas's DoPrivMsg) too. Not authenticated in any way yet
-// (deliberate, matches the rest of the daemon at this stage) - anything
+// admin commands at VDRX - stdin (vdrx_stdin.pas) today, written to be
+// reusable by any future text-command source. Not authenticated in any way
+// yet (deliberate, matches the rest of the daemon at this stage) - anything
 // that can reach this can quit/restart/kill the daemon.
 //
 // Recognised commands (case-insensitive), one per line:
@@ -25,6 +25,8 @@ uses
 //   killall [type]         - kill everything (or, if [type] is given, only
 //                            executives whose class name contains it, e.g.
 //                            "killall bridge")
+//   list                   - list every registered executive; Bridges show
+//                            pid/running state and restart policy too
 procedure DispatchAdminCommandLine(ABus: TVDRX_MessageQueue; const ASourceID, ALine: string);
 
 implementation
@@ -63,6 +65,8 @@ begin
   end
   else if Cmd = 'killall' then
     ABus.Publish('sys.killall', Rest, ASourceID)
+  else if Cmd = 'list' then
+    ABus.Publish('sys.list', '', ASourceID)
   else
     ABus.Publish('log.warn', 'admin: unrecognised command "' + Cmd + '"', ASourceID);
 end;

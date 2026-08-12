@@ -112,6 +112,11 @@ begin
       end;
       Bridge.RestartPolicy := RestartRaw;
 
+      // "publish": ["topic.filter", ...] - see PublishPatterns in
+      // vdrx_bridge.pas. Omit it (the default) and this process can never
+      // override <id>.out, no matter what its stdout looks like.
+      Bridge.PublishPatterns := Row.Values['publish'];
+
       // "subscribe": ["topic.filter", ...] - GetObjectArray comma-joins the
       // JSON array into one string (see vdrx_config.pas), split back out here.
       // Each filter is registered so matching bus messages are written to the

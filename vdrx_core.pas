@@ -169,6 +169,14 @@ type
     property RestartRequested: Boolean read FRestartRequested write FRestartRequested;
   end;
 
+// Topic/filter wildcard matching - '*' matches exactly one dot-delimited
+// segment, '>' matches the rest of the topic however many segments remain.
+// Used internally by TVDRX_Registry's dispatch, and exported here so any
+// other unit that needs the same "does this topic satisfy this filter"
+// question (e.g. vdrx_bridge.pas validating a process's declared publish
+// patterns) reuses this instead of growing its own copy that could drift.
+function TopicMatches(const Filter, Topic: string): Boolean;
+
 implementation
 
 function TopicMatches(const Filter, Topic: string): Boolean;

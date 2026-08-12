@@ -5,7 +5,7 @@ unit vdrx_bridge;
 interface
 
 uses
-  Classes, SysUtils, SyncObjs, Process, fpjson, vdrx_core, vdrx_procutil;
+  Classes, SysUtils, SyncObjs, Process, fpjson, jsonparser, vdrx_core, vdrx_procutil;
 
 type
 
@@ -26,6 +26,10 @@ type
                                   // before escalating to a forced kill
     FStopping: Boolean;
     FRestartPolicy: string; // 'always' (default) | 'on-failure' | 'never'
+    FPublishPatterns: string; // comma-joined topic filters, '' = structured
+                               // publish disabled entirely (deny by default)
+    function IsPublishAllowed(const ATopic: string): Boolean;
+    function TryParseStructuredLine(const ALine: string; out ATopic, APayload: string): Boolean;
     procedure StartProcess;
     procedure StopProcess;
     procedure ReaderLoop;
@@ -41,6 +45,18 @@ type
     //                (0) exit is treated as done-on-purpose and left stopped.
     // "never"      - one-shot: never restart it, regardless of exit code.
     property RestartPolicy: string read FRestartPolicy write FRestartPolicy;
+    // Comma-joined list of topic filters (same wildcard syntax as any bus
+    // subscription - see TopicMatches in vdrx_core.pas) this process is
+    // allowed to publish on directly. '' (the default) means "not allowed at
+    // all" - every stdout line, however it's formatted, publishes as plain
+    // text to <id>.out. Set this and a line that parses as
+    // {"topic":"...","payload":"..."} publishes on that topic INSTEAD of
+    // <id>.out, but only if the topic matches one of these patterns; a line
+    // that doesn't parse as JSON, or whose topic isn't covered, still falls
+    // back to the plain <id>.out publish (with a log.warn in the "declared
+    // but didn't match" case) - so a child that only ever prints plain text
+    // is completely unaffected by this property either way.
+    property PublishPatterns: string read FPublishPatterns write FPublishPatterns;
     // How long to wait for the child to exit cleanly (after CloseInput + SIGTERM
     // on Unix) before force-killing it. Defaults to 5000ms; set from
     // vdrx_daemon.conf's top-level "shutdown_grace_ms" in vdrx_daemon.lpr.
@@ -72,6 +88,7 @@ begin
   FGracefulTimeoutMs := 5000;
   FStopping := False;
   FRestartPolicy := 'always';
+  FPublishPatterns := '';
 end;
 
 destructor TVDRX_BridgeExecutive.Destroy;
@@ -168,9 +185,65 @@ end;
 // Blocking char-by-char read, buffered until newline. Deliberately not using
 // NumBytesAvailable - not reliably present across FPC versions; a plain blocking
 // Read is simpler and fully portable.
+function TVDRX_BridgeExecutive.IsPublishAllowed(const ATopic: string): Boolean;
+var
+  Patterns: TStringList;
+  i: Integer;
+begin
+  Result := False;
+  if FPublishPatterns = '' then
+    Exit; // deny by default - nothing declared, nothing overrides <id>.out
+  Patterns := TStringList.Create;
+  try
+    Patterns.Delimiter := ',';
+    Patterns.StrictDelimiter := True;
+    Patterns.DelimitedText := FPublishPatterns;
+    for i := 0 to Patterns.Count - 1 do
+      if TopicMatches(Trim(Patterns[i]), ATopic) then
+        Exit(True);
+  finally
+    Patterns.Free;
+  end;
+end;
+
+// A structured line is a JSON object with a string "topic" field; "payload"
+// is optional (defaults to ''). Anything else - malformed JSON, a JSON value
+// that isn't an object, a missing/non-string "topic" - is treated as plain
+// text, exactly like every line was before this existed. This is a parse
+// attempt, not a protocol a child MUST speak: a process that just prints
+// plain lines is completely unaffected.
+function TVDRX_BridgeExecutive.TryParseStructuredLine(const ALine: string; out ATopic, APayload: string): Boolean;
+var
+  Data: TJSONData;
+begin
+  Result := False;
+  ATopic := '';
+  APayload := '';
+  if (ALine = '') or (ALine[1] <> '{') then
+    Exit; // cheap check before bothering the parser - stdout is plain text
+          // the overwhelming majority of the time
+  try
+    Data := GetJSON(ALine);
+  except
+    Exit; // not valid JSON - treat as plain text, same as always
+  end;
+  try
+    if (Data.JSONType = jtObject) and (TJSONObject(Data).Find('topic') <> nil)
+      and (TJSONObject(Data).Find('topic').JSONType = jtString) then
+    begin
+      ATopic := TJSONObject(Data).Strings['topic'];
+      if (TJSONObject(Data).Find('payload') <> nil) and (TJSONObject(Data).Find('payload').JSONType = jtString) then
+        APayload := TJSONObject(Data).Strings['payload'];
+      Result := ATopic <> '';
+    end;
+  finally
+    Data.Free;
+  end;
+end;
+
 procedure TVDRX_BridgeExecutive.ReaderLoop;
 var
-  Line, Buf: string;
+  Line, Buf, StructTopic, StructPayload: string;
   Ch: Char;
   Proc: TProcess;
 begin
@@ -187,7 +260,22 @@ begin
         Line := Trim(Buf);
         Buf := '';
         if Line <> '' then
-          Bus.Publish(ID + '.out', Line, ID); // process output re-enters the bus, namespaced by this executive's ID
+        begin
+          if TryParseStructuredLine(Line, StructTopic, StructPayload) then
+          begin
+            if IsPublishAllowed(StructTopic) then
+              Bus.Publish(StructTopic, StructPayload, ID)
+            else
+            begin
+              Bus.Publish('log.warn', Format(
+                'bridge %s: rejected publish to "%s" - not covered by its publish patterns, falling back to %s.out',
+                [ID, StructTopic, ID]), ID);
+              Bus.Publish(ID + '.out', Line, ID);
+            end;
+          end
+          else
+            Bus.Publish(ID + '.out', Line, ID); // plain text - process output re-enters the bus, namespaced by this executive's ID
+        end;
       end
       else if Ch <> #13 then
         Buf := Buf + Ch;
