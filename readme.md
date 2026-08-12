@@ -98,6 +98,17 @@ its subscription is written to the child's stdin as a JSON line
 (`{"topic":...,"payload":...,"source":...}`). A child process doesn't need
 to know anything about VDRX's bus API — it just reads/writes JSON lines.
 
+Each Bridge has a `RestartPolicy`:
+
+- **`always`** (default) — restart no matter how the process exited.
+- **`on-failure`** — restart only on a nonzero exit code; a clean (`0`) exit
+  is treated as done-on-purpose and left stopped.
+- **`never`** — one-shot: run it once, never restart it, regardless of exit
+  code.
+
+Once a policy decides not to respawn, the Bridge's monitor thread actually
+terminates rather than idling forever with nothing left to supervise.
+
 This is the "systemd-lite" layer: the `processes` config array (see below)
 turns any command into a supervised entry with zero new Pascal per program
 you want VDRX to babysit.
@@ -127,8 +138,7 @@ you want VDRX to babysit.
 WebSocket and HTTP are wired up if enabled in config (`executives.ws.enabled`
 / `executives.http.enabled`). Any entry in the `processes` config array gets
 a supervised Bridge; any entry in `cli_bridges` gets a routed CLI script
-(no persistent process). See `WIRING.md` for the session-by-session design
-log.
+(no persistent process).
 
 ## Building
 
@@ -143,8 +153,7 @@ against OpenSSL headers — FPC's `openssl` unit `dlopen`s the OpenSSL shared
 library by its **unversioned** name at runtime, and on Debian/Ubuntu that
 symlink only exists once `libssl-dev` is installed (the runtime-only
 `libssl3` package ships just the versioned `.so.3`). Without it, TLS quietly
-never comes up — no crash, just a plain-only listener. See `WIRING.md` for
-the full story.
+never comes up — no crash, just a plain-only listener.
 
 The `openssl` unit itself typically isn't on FPC's default search path;
 point the compiler (or your `.lpi`'s search paths) at wherever your
@@ -157,7 +166,6 @@ fpc -Mobjfpc -Sh -Fu/usr/lib/x86_64-linux-gnu/fpc/<ver>/units/x86_64-linux/opens
 ## Running
 
 ```bash
-cd daemon
 ./vdrx_daemon
 ```
 
@@ -178,6 +186,7 @@ Reads `vdrx_daemon.conf` from the working directory and writes to
     {
       "id": "phpapp1",
       "command": "c:/php/php -S 127.0.0.1:9101 -t phpapp",
+      "restart": "always",
       "graceful_timeout_ms": 300,
       "prefix": "/app/",
       "host": "127.0.0.1",
@@ -185,7 +194,9 @@ Reads `vdrx_daemon.conf` from the working directory and writes to
     },
     {
       "id": "somaworker",
-      "command": "./soma_worker"
+      "command": "./soma_worker",
+      "restart": "on-failure",
+      "subscribe": ["control.somaworker.*", "world.broadcast"]
     }
   ],
   "cli_bridges": [
@@ -206,10 +217,21 @@ Reads `vdrx_daemon.conf` from the working directory and writes to
 ```
 
 **`processes`** — every entry gets a supervised `TVDRX_BridgeExecutive`.
-Only `id` and `command` are required. Add `prefix`/`host`/`port` and it also
-gets an HTTP reverse-proxy route (needs `executives.http.enabled: true`);
-omit them for a bare supervised background process with no HTTP surface —
-e.g. a SOMA worker or anything else you just want VDRX to keep alive.
+Only `id` and `command` are required.
+
+- `restart`: `"always"` (default) | `"on-failure"` | `"never"` — see
+  "Process supervision" above. An unrecognized value falls back to
+  `"always"` with a startup warning.
+- `prefix`/`host`/`port`: optional — add them and the process also gets an
+  HTTP reverse-proxy route (needs `executives.http.enabled: true`); omit
+  them for a bare supervised background process with no HTTP surface at
+  all, e.g. a SOMA worker.
+- `subscribe`: optional array of topic filters. Matching bus messages are
+  written to the child's stdin as a JSON line. Omit it and the process is
+  publish-only (its stdout still goes to `<id>.out`, same as always).
+- `graceful_timeout_ms`: per-process override of `shutdown_grace_ms`, for
+  children (like most dev web servers) that don't respond to a
+  graceful-shutdown hint at all.
 
 **`cli_bridges`** — a genuinely different mechanism: each request to
 `prefix` invokes `command` fresh against a script under `script_dir` and
@@ -262,10 +284,3 @@ the topic/JSON payload and act on it.
 - **IRC**: no longer part of this repo — see the standalone IRCD project
   (`hogircd`), which can be wired in as a `processes` entry like anything
   else once it's ready to be supervised that way
-
-## Further reading
-
-`WIRING.md` has the session-by-session design log: why each piece is shaped
-the way it is, worked examples, and notes on things that were tried,
-verified, or fixed along the way (including the TLS binding story above, in
-more detail).

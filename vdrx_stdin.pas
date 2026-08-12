@@ -12,7 +12,7 @@ type
   // vdrx_admincmd.pas) one per line from the console. Replaces the daemon's
   // old "press ENTER to stop" main-thread ReadLn: that blocked the main
   // thread and only understood one gesture; this runs on its own thread,
-  // doesn't consume the bus (registered on 'sys.none' like IRCD/WS), and
+  // doesn't consume the bus (registered on 'sys.none' like WS), and
   // understands the full command set.
   //
   // Caveat: ReadLn blocks on the OS's stdin read, which can't be portably

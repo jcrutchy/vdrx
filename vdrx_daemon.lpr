@@ -73,7 +73,9 @@ var
   Rows: TVDRX_ConfigRows;
   Row: TStringList;
   Bridge: TVDRX_BridgeExecutive;
-  n, BridgeGraceMs: Integer;
+  n, BridgeGraceMs, i: Integer;
+  RestartRaw: string;
+  Filters: TStringArray;
 begin
   SetLength(ARoutes, 0);
   Rows := AConfig.GetObjectArray('processes');
@@ -96,7 +98,36 @@ begin
       // entry; falls back to the daemon-wide default if not set.
       BridgeGraceMs := StrToIntDef(Row.Values['graceful_timeout_ms'], AGracefulMs);
       Bridge.GracefulTimeoutMs := BridgeGraceMs;
-      ARegistry.Register(Bridge, Row.Values['id'], 'sys.none');
+
+      // "restart": "always" (default) | "on-failure" | "never" - see
+      // TVDRX_BridgeExecutive.RestartPolicy in vdrx_bridge.pas. An unrecognized
+      // value falls back to "always" with a warning, rather than silently
+      // guessing wrong about how badly this one wants to keep running.
+      RestartRaw := Row.Values['restart'];
+      if RestartRaw = '' then RestartRaw := 'always';
+      if (RestartRaw <> 'always') and (RestartRaw <> 'on-failure') and (RestartRaw <> 'never') then
+      begin
+        WriteLn('  Process "', Row.Values['id'], '": unrecognized restart "', RestartRaw, '" - using "always".');
+        RestartRaw := 'always';
+      end;
+      Bridge.RestartPolicy := RestartRaw;
+
+      // "subscribe": ["topic.filter", ...] - GetObjectArray comma-joins the
+      // JSON array into one string (see vdrx_config.pas), split back out here.
+      // Each filter is registered so matching bus messages are written to the
+      // child's stdin (TVDRX_BridgeExecutive.HandlePacket already does this -
+      // it just never had a real subscription routed to it before). No
+      // subscribe entries at all keeps the old behaviour: registered on
+      // 'sys.none', i.e. publish-only.
+      if Row.Values['subscribe'] <> '' then
+      begin
+        Filters := SplitString(Row.Values['subscribe'], ',');
+        ARegistry.Register(Bridge, Row.Values['id'], Trim(Filters[0]));
+        for i := 1 to High(Filters) do
+          ARegistry.Register(Bridge, Row.Values['id'], Trim(Filters[i]));
+      end
+      else
+        ARegistry.Register(Bridge, Row.Values['id'], 'sys.none');
 
       if Row.Values['prefix'] <> '' then
       begin
@@ -107,11 +138,11 @@ begin
         ARoutes[n].Port := StrToIntDef(Row.Values['port'], 0);
         WriteLn('  Process "', Row.Values['id'], '" (proxied): ', ARoutes[n].Prefix, ' -> ',
           ARoutes[n].Host, ':', ARoutes[n].Port, ' (', Row.Values['command'],
-          ', graceful_timeout_ms=', BridgeGraceMs, ')');
+          ', restart=', RestartRaw, ', graceful_timeout_ms=', BridgeGraceMs, ')');
       end
       else
         WriteLn('  Process "', Row.Values['id'], '" (', Row.Values['command'],
-          ', graceful_timeout_ms=', BridgeGraceMs, ')');
+          ', restart=', RestartRaw, ', graceful_timeout_ms=', BridgeGraceMs, ')');
     end;
   finally
     Rows.Free;

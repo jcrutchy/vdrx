@@ -25,6 +25,7 @@ type
     FGracefulTimeoutMs: Integer; // how long StopProcess waits for a clean exit
                                   // before escalating to a forced kill
     FStopping: Boolean;
+    FRestartPolicy: string; // 'always' (default) | 'on-failure' | 'never'
     procedure StartProcess;
     procedure StopProcess;
     procedure ReaderLoop;
@@ -33,6 +34,13 @@ type
     constructor Create(ABus: TVDRX_MessageQueue); override;
     destructor Destroy; override;
     property Command: string read FCommand write FCommand;
+    // "always"     - restart no matter how the process exited (the original,
+    //                only-ever behaviour). Default, so existing callers that
+    //                never set this are unaffected.
+    // "on-failure" - restart only if it exited with a nonzero code; a clean
+    //                (0) exit is treated as done-on-purpose and left stopped.
+    // "never"      - one-shot: never restart it, regardless of exit code.
+    property RestartPolicy: string read FRestartPolicy write FRestartPolicy;
     // How long to wait for the child to exit cleanly (after CloseInput + SIGTERM
     // on Unix) before force-killing it. Defaults to 5000ms; set from
     // vdrx_daemon.conf's top-level "shutdown_grace_ms" in vdrx_daemon.lpr.
@@ -63,6 +71,7 @@ begin
   FMaxRestartDelayMs := 30000;
   FGracefulTimeoutMs := 5000;
   FStopping := False;
+  FRestartPolicy := 'always';
 end;
 
 destructor TVDRX_BridgeExecutive.Destroy;
@@ -190,7 +199,8 @@ end;
 
 procedure TVDRX_BridgeExecutive.MonitorLoop;
 var
-  NeedsRestart: Boolean;
+  ProcAssigned, StillRunning, DoRestart: Boolean;
+  ExitCode: Integer;
 begin
   while not FStopping do
   begin
@@ -198,11 +208,44 @@ begin
     if FStopping then
       Break;
     FProcessLock.Enter;
-    NeedsRestart := (not Assigned(FProcess)) or (not FProcess.Running);
+    ProcAssigned := Assigned(FProcess);
+    StillRunning := ProcAssigned and FProcess.Running;
+    if ProcAssigned and (not StillRunning) then
+      ExitCode := FProcess.ExitStatus // grab this now, inside the lock, while
+                                       // FProcess is still assigned - StopProcess
+                                       // below nils (and eventually frees) it
+    else
+      ExitCode := 0;
     FProcessLock.Leave;
-    if NeedsRestart and (not FStopping) then
+
+    if (not StillRunning) and (not FStopping) then
     begin
+      if ProcAssigned then
+        // Died on its own - apply the configured policy against how it exited.
+        case FRestartPolicy of
+          'never':      DoRestart := False;
+          'on-failure': DoRestart := (ExitCode <> 0);
+        else
+          DoRestart := True; // 'always', or an unrecognized value - fail open
+        end
+      else
+        // FProcess was already nil - something else (KillCurrentProcess, i.e.
+        // an operator's sys.kill) called StopProcess before we got here. That's
+        // an explicit "bounce it" action, not a policy-governed exit, so it
+        // always restarts regardless of RestartPolicy.
+        DoRestart := True;
+
       StopProcess;
+
+      if not DoRestart then
+      begin
+        Bus.Publish('log.info', Format(
+          'bridge %s: exited (code %d), restart policy "%s" - leaving it stopped',
+          [ID, ExitCode, FRestartPolicy]), ID);
+        Exit; // done for good - let this thread terminate now rather than
+              // looping indefinitely with nothing left to supervise
+      end;
+
       Sleep(FRestartDelayMs);
       if FRestartDelayMs < FMaxRestartDelayMs then
         FRestartDelayMs := FRestartDelayMs * 2; // exponential backoff on a crash loop

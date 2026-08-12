@@ -56,7 +56,7 @@ type
   // Base for every executive - internal object, external-process Bridge, or socket
   // listener. Holds a Bus reference so descendants can Publish from Initialize,
   // reader threads, or HandlePacket alike. Initialize/Shutdown are virtual with an
-  // empty default so most executives (Logger, Whiteboard) can ignore them entirely;
+  // empty default so most executives (Logger, Admin) can ignore them entirely;
   // Bridge and the socket listeners override both to spawn/bind on startup and tear
   // down cleanly on shutdown. No intermediate base class for "threaded" or "socket"
   // executives yet - deliberately waiting for three concrete, near-identical

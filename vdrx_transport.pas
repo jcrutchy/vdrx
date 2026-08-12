@@ -10,7 +10,7 @@ uses
 
 type
   // Byte-stream abstraction over an accepted connection - lets every protocol
-  // executive (HTTP, WebSocket, IRCD) do its reads/writes without caring whether
+  // executive (HTTP, WebSocket) do its reads/writes without caring whether
   // the underlying socket is plaintext or TLS. Deliberately mirrors fpRecv/fpSend's
   // blocking, synchronous style - no event-loop rewrite needed anywhere else; every
   // existing "one thread per connection" executive keeps working exactly as before,

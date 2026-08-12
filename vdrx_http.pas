@@ -279,38 +279,6 @@ begin
   Result := PlainResponse('200 OK', GuessContentType(APath), Body);
 end;
 
-// Unlike RenderBoardPage there's no board_name/board list - one game, one
-// page. plague_map_image comes from settings (vdrx_daemon.conf ->
-// "settings":{"plague_map_image": "plague_map.png"}) via the templates
-// engine's existing $$setting$$ resolution, same as site_title - the client
-// JS fetches /plague/state and /plague/countries itself rather than having
-// them inlined here, so a page refresh mid-game doesn't need the template
-// re-filled with a fresh snapshot on every request.
-function RenderPlaguePage(ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config;
-  ABus: TVDRX_MessageQueue; const ASourceID: string): string;
-var
-  Body: string;
-  Params: TStringList;
-begin
-  Params := TStringList.Create;
-  try
-    Params.Values['ws_port'] := IntToStr(AConfig.GetInteger('executives.ws.port', 8082));
-    Params.Values['ws_host_json'] := '""';
-    Params.Values['ws_tls_json'] := IfThen(AConfig.GetInteger('executives.ws.tls_port', 0) <> 0, 'true', 'false');
-    Body := ATemplates.Fill('plague', Params, nil);
-  finally
-    Params.Free;
-  end;
-
-  if Body = '' then
-  begin
-    ABus.Publish('log.error', 'http: plague.tpl produced no output - check template_dir', ASourceID);
-    Exit(PlainResponse('500 Internal Server Error', 'text/plain',
-      'Missing template: plague.tpl (check template_dir in vdrx_daemon.conf)'));
-  end;
-  Result := PlainResponse('200 OK', 'text/html', Body);
-end;
-
 function MatchProxyRoute(const APath: string; const ARoutes: TVDRX_ProxyRoutes; out AMatch: TVDRX_ProxyRoute): Boolean;
 var
   i, bestLen: Integer;
