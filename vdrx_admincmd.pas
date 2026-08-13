@@ -27,6 +27,8 @@ uses
 //                            "killall bridge")
 //   list                   - list every registered executive; Bridges show
 //                            pid/running state and restart policy too
+//   history <bucket> [n]   - show the last n (default 20) entries from a
+//                            bucket's history file
 procedure DispatchAdminCommandLine(ABus: TVDRX_MessageQueue; const ASourceID, ALine: string);
 
 implementation
@@ -67,6 +69,13 @@ begin
     ABus.Publish('sys.killall', Rest, ASourceID)
   else if Cmd = 'list' then
     ABus.Publish('sys.list', '', ASourceID)
+  else if Cmd = 'history' then
+  begin
+    if Rest = '' then
+      ABus.Publish('log.warn', 'admin: "history" needs a bucket name, e.g. "history world"', ASourceID)
+    else
+      ABus.Publish('sys.history', Rest, ASourceID);
+  end
   else
     ABus.Publish('log.warn', 'admin: unrecognised command "' + Cmd + '"', ASourceID);
 end;

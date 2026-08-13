@@ -16,6 +16,7 @@ uses
   vdrx_logger,
   vdrx_stdin,
   vdrx_bridge,
+  vdrx_bucket,
   vdrx_websocket,
   vdrx_http,
   vdrx_socketlistener,
@@ -185,6 +186,46 @@ begin
   end;
 end;
 
+// One TVDRX_BucketExecutive per "buckets" config entry, registered on
+// whatever topic filter(s) it declares - same comma-joined-array pattern as
+// "processes"' subscribe field. Every matching message gets appended to
+// that bucket's own history file (default bucket_<name>.jsonl, override with
+// "file"). See vdrx_bucket.pas for why this is full history rather than
+// latest-value-per-topic, and vdrx_admin.pas's DoHistory for how it's read
+// back (the "history" console command - there's no automatic replay).
+procedure SetupBuckets(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry);
+var
+  Rows: TVDRX_ConfigRows;
+  Row: TStringList;
+  Bucket: TVDRX_BucketExecutive;
+  Filters: TStringArray;
+  FilePath: string;
+  i: Integer;
+begin
+  Rows := AConfig.GetObjectArray('buckets');
+  try
+    for Row in Rows do
+    begin
+      if (Row.Values['name'] = '') or (Row.Values['topics'] = '') then
+      begin
+        WriteLn('  Skipping buckets entry - needs at least name and topics.');
+        Continue;
+      end;
+      FilePath := IfThen(Row.Values['file'] <> '', Row.Values['file'],
+        'bucket_' + Row.Values['name'] + '.jsonl');
+      Bucket := TVDRX_BucketExecutive.Create(Kernel.Queue, FilePath);
+      Filters := SplitString(Row.Values['topics'], ',');
+      ARegistry.Register(Bucket, Row.Values['name'], Trim(Filters[0]));
+      for i := 1 to High(Filters) do
+        ARegistry.Register(Bucket, Row.Values['name'], Trim(Filters[i]));
+      WriteLn('  Bucket "', Row.Values['name'], '": ', Row.Values['topics'],
+        ' -> ', FilePath);
+    end;
+  finally
+    Rows.Free;
+  end;
+end;
+
 begin
 
   try
@@ -228,6 +269,7 @@ begin
   
     SetupProcesses(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes);
     SetupCLIBridges(Config, CLIRoutes);
+    SetupBuckets(Config, Kernel.Registry);
   
     Templates := TVDRX_TemplateStore.Create(Config, Config.GetString('template_dir', 'templates'));
     if Config.GetBoolean('executives.http.enabled', False) then

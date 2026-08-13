@@ -5,7 +5,7 @@ unit vdrx_admin;
 interface
 
 uses
-  Classes, SysUtils, vdrx_core, vdrx_config, vdrx_bridge;
+  Classes, SysUtils, Math, vdrx_core, vdrx_config, vdrx_bridge, vdrx_bucket;
 
 type
 
@@ -23,6 +23,9 @@ type
   //   sys.list     - payload ignored. Lists every registered executive (ID,
   //                  class) - Bridges additionally show pid/running state
   //                  and restart policy.
+  //   sys.history  - payload is "<bucket name> [count]" (count defaults to
+  //                  20). Prints the last <count> entries from that
+  //                  bucket's history file - see vdrx_bucket.pas.
   // Not authenticated - see vdrx_admincmd.pas for what feeds these topics
   // (stdin today; written to be reusable by any future text-command
   // source) and why that's deliberate for now.
@@ -35,6 +38,7 @@ type
     procedure DoKill(const ATarget: string);
     procedure DoKillAll(const ATypeFilter: string);
     procedure DoList;
+    procedure DoHistory(const AArgs: string);
   public
     constructor Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config;
       ARegistry: TVDRX_Registry; AKernel: TVDRX_Kernel); reintroduce;
@@ -168,6 +172,66 @@ begin
   end;
 end;
 
+procedure TVDRX_AdminExecutive.DoHistory(const AArgs: string);
+var
+  Snap: TVDRX_ExecList;
+  Exec: TVDRX_Executive;
+  Bucket: TVDRX_BucketExecutive;
+  Parts: TStringList;
+  BucketName: string;
+  Count, i: Integer;
+  Lines: TStringList;
+begin
+  Parts := TStringList.Create;
+  try
+    Parts.Delimiter := ' ';
+    Parts.StrictDelimiter := True;
+    Parts.DelimitedText := Trim(AArgs);
+    if Parts.Count = 0 then
+    begin
+      Bus.Publish('log.warn', 'admin: history needs a bucket name, e.g. "history world"', ID);
+      Exit;
+    end;
+    BucketName := Parts[0];
+    Count := 20;
+    if Parts.Count > 1 then
+      Count := StrToIntDef(Parts[1], 20);
+  finally
+    Parts.Free;
+  end;
+
+  Bucket := nil;
+  Snap := FRegistry.Snapshot;
+  try
+    for Exec in Snap do
+      if (Exec is TVDRX_BucketExecutive) and (Exec.ID = BucketName) then
+      begin
+        Bucket := TVDRX_BucketExecutive(Exec);
+        Break;
+      end;
+  finally
+    Snap.Free;
+  end;
+
+  if not Assigned(Bucket) then
+  begin
+    Bus.Publish('log.warn', Format('admin: no bucket named "%s"', [BucketName]), ID);
+    Exit;
+  end;
+
+  Lines := TStringList.Create;
+  try
+    if FileExists(Bucket.FilePath) then
+      Lines.LoadFromFile(Bucket.FilePath);
+    Bus.Publish('log.info', Format('admin: last %d of %d entries in bucket "%s":',
+      [Min(Count, Lines.Count), Lines.Count, BucketName]), ID);
+    for i := Max(0, Lines.Count - Count) to Lines.Count - 1 do
+      Bus.Publish('log.info', '  ' + Lines[i], ID);
+  finally
+    Lines.Free;
+  end;
+end;
+
 procedure TVDRX_AdminExecutive.HandlePacket(const AMsg: TVDRX_Message);
 begin
   if AMsg.Topic = 'sys.reload' then
@@ -192,7 +256,9 @@ begin
   else if AMsg.Topic = 'sys.killall' then
     DoKillAll(AMsg.Payload)
   else if AMsg.Topic = 'sys.list' then
-    DoList;
+    DoList
+  else if AMsg.Topic = 'sys.history' then
+    DoHistory(AMsg.Payload);
 end;
 
 end.
