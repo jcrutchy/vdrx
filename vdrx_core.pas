@@ -177,7 +177,21 @@ type
 // patterns) reuses this instead of growing its own copy that could drift.
 function TopicMatches(const Filter, Topic: string): Boolean;
 
+// Escapes a string into a complete, quoted JSON string literal - not just the
+// escaping, the surrounding quotes too. Anything writing a hand-built JSON
+// line (Bridge's HandlePacket, WSConnection's HandleRPC/HandlePacket) needs
+// this, not StringToJSONString, which only escapes and leaves quoting to the
+// caller - easy to miss, see the game.cmd.ping malformed-JSON bug this fixed.
+function JSONString(const S: string): string;
+
 implementation
+
+function JSONString(const S: string): string;
+begin
+  Result := StringReplace(S, '\', '\\', [rfReplaceAll]);
+  Result := StringReplace(Result, '"', '\"', [rfReplaceAll]);
+  Result := '"' + Result + '"';
+end;
 
 function TopicMatches(const Filter, Topic: string): Boolean;
 var

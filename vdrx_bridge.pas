@@ -391,12 +391,14 @@ procedure TVDRX_BridgeExecutive.HandlePacket(const AMsg: TVDRX_Message);
 var
   Line: string;
 begin
+  Bus.Publish('log.info', Format('bridge %s: HandlePacket got "%s" (process running: %s)',
+    [ID, AMsg.Topic, BoolToStr(Assigned(FProcess) and FProcess.Running, True)]), ID);
   FProcessLock.Enter;
   try
     if Assigned(FProcess) and FProcess.Running then
     begin
       Line := Format('{"topic":%s,"payload":%s,"source":%s}',
-        [StringToJSONString(AMsg.Topic), AMsg.Payload, StringToJSONString(AMsg.SourceID)])
+        [JSONString(AMsg.Topic), AMsg.Payload, JSONString(AMsg.SourceID)])
         + LineEnding;
       FProcess.Input.Write(Line[1], Length(Line));
     end;

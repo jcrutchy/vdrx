@@ -17,6 +17,8 @@
         <Filename Value="vdrx_core.pas"/>
         <IsPartOfProject Value="True"/>
         <EditorIndex Value="14"/>
+        <TopLine Value="169"/>
+        <CursorPos X="21" Y="175"/>
         <UsageCount Value="30"/>
         <Loaded Value="True"/>
       </Unit>
@@ -31,7 +33,6 @@
       <Unit>
         <Filename Value="vdrx_config.pas"/>
         <IsPartOfProject Value="True"/>
-        <IsVisibleTab Value="True"/>
         <EditorIndex Value="13"/>
         <TopLine Value="9"/>
         <CursorPos X="68" Y="19"/>
@@ -58,8 +59,7 @@
         <Filename Value="vdrx_bridge.pas"/>
         <IsPartOfProject Value="True"/>
         <EditorIndex Value="12"/>
-        <TopLine Value="91"/>
-        <CursorPos X="90" Y="107"/>
+        <CursorPos X="29" Y="397"/>
         <UsageCount Value="30"/>
         <Loaded Value="True"/>
       </Unit>
@@ -117,14 +117,14 @@
       <Unit>
         <Filename Value="vdrx_websocket.pas"/>
         <IsPartOfProject Value="True"/>
+        <IsVisibleTab Value="True"/>
         <EditorIndex Value="9"/>
-        <TopLine Value="52"/>
-        <CursorPos X="37" Y="66"/>
+        <CursorPos X="32" Y="24"/>
         <UsageCount Value="30"/>
         <Loaded Value="True"/>
       </Unit>
     </Units>
-    <JumpHistory HistoryIndex="4">
+    <JumpHistory HistoryIndex="7">
       <Position>
         <Filename Value="vdrx_http.pas"/>
         <Caret Line="28" Column="26" TopLine="28"/>
@@ -135,15 +135,27 @@
       </Position>
       <Position>
         <Filename Value="vdrx_websocket.pas"/>
-        <Caret Line="51" Column="46" TopLine="52"/>
-      </Position>
-      <Position>
-        <Filename Value="vdrx_websocket.pas"/>
         <Caret Line="2" Column="2"/>
       </Position>
       <Position>
         <Filename Value="vdrx_websocket.pas"/>
         <Caret Line="8" Column="79"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_websocket.pas"/>
+        <Caret Line="5" Column="18"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_websocket.pas"/>
+        <Caret Line="252" Column="70" TopLine="224"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_websocket.pas"/>
+        <Caret Line="321" Column="69" TopLine="293"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_websocket.pas"/>
+        <Caret Line="401" Column="54" TopLine="373"/>
       </Position>
     </JumpHistory>
     <RunParams>

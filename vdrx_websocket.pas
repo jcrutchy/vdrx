@@ -64,13 +64,6 @@ type
 
 implementation
 
-function JEsc(const S: string): string;
-begin
-  Result := StringReplace(S, '\', '\\', [rfReplaceAll]);
-  Result := StringReplace(Result, '"', '\"', [rfReplaceAll]);
-  Result := '"' + Result + '"';
-end;
-
 function ComputeAcceptKey(const AClientKey: string): string;
 var
   Digest: TSHA1Digest;
@@ -256,7 +249,7 @@ begin
         Bus.Publish('log.info', 'ws ' + ID + ': authenticated (stub - any nonempty token passes)', ID)
       else
         Bus.Publish('log.warn', 'ws ' + ID + ': sys.auth sent with an empty token, rejected', ID);
-      SendFrame(Format('{"event":"auth.ok","source":%s}', [JEsc(Src)]));
+      SendFrame(Format('{"event":"auth.ok","source":%s}', [JSONString(Src)]));
       Exit;
     end;
 
@@ -325,7 +318,7 @@ begin
   end;
 
   Bus.Publish('log.info', 'ws ' + ID + ': disconnected', ID);
-  Bus.Publish('sys.ws.disconnected', Format('{"id":%s}', [JEsc(ID)]), ID);
+  Bus.Publish('sys.ws.disconnected', Format('{"id":%s}', [JSONString(ID)]), ID);
   FListener.Registry.UnregisterSelf(ID); // NOT Unregister - this is our own thread, see vdrx_core.pas's UnregisterSelf comment
 end;
 
@@ -405,7 +398,7 @@ procedure TVDRX_WSConnection.HandlePacket(const AMsg: TVDRX_Message);
 begin
   Bus.Publish('log.info', 'ws ' + ID + ': -> "' + AMsg.Topic + '" ' + AMsg.Payload, ID);
   SendFrame(Format('{"topic":%s,"payload":%s,"source":%s,"seq":%d}',
-    [JEsc(AMsg.Topic), AMsg.Payload, JEsc(AMsg.SourceID), AMsg.Seq]));
+    [JSONString(AMsg.Topic), AMsg.Payload, JSONString(AMsg.SourceID), AMsg.Seq]));
 end;
 
 { TVDRX_WebSocketExecutive }
@@ -435,7 +428,7 @@ begin
   Conn := TVDRX_WSConnection.Create(Bus, Self, ATransport);
   Conn.PendingRequest := AInitialRequest;
   NewID := NextConnID;
-  Bus.Publish('sys.ws.connected', Format('{"id":%s}', [JEsc(NewID)]), ID);
+  Bus.Publish('sys.ws.connected', Format('{"id":%s}', [JSONString(NewID)]), ID);
   Bus.Publish('log.info', 'ws: new connection ' + NewID, ID);
   FRegistry.Register(Conn, NewID, 'sys.none');
   Conn.Initialize;
