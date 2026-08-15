@@ -1,0 +1,12 @@
+{
+  "mode": "spawn",
+  "daemon_exe": "/home/claude/vdrx/vdrx_daemon",
+  "work_dir": "/tmp/vdrx_stress_run",
+  "host": "127.0.0.1",
+  "http_port": 8081,
+  "ws_port": 8082,
+  "suites": ["http", "ws", "procstress"],
+  "http": { "load_requests": 500, "load_concurrency": 20, "connect_timeout_ms": 2000, "read_timeout_ms": 2000 },
+  "ws": { "connect_timeout_ms": 2000, "read_timeout_ms": 2000, "rapid_connect_cycles": 50 },
+  "procstress": { "work_dir": "/tmp/vdrx_stress_procstress", "cycles": 30, "delay_ms": 100 }
+}

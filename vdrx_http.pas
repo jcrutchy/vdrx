@@ -256,6 +256,7 @@ var
   FilePath, Body: string;
   FS: TFileStream;
 begin
+  ABus.Publish('log.info', 'http: static path: "' + APath + '"', ASourceID);
   if (AStaticDir = '') or (Pos('..', APath) > 0) or (APath = '') or (APath[1] <> '/') then
   begin
     ABus.Publish('log.warn', 'http: rejected static path "' + APath + '"', ASourceID);

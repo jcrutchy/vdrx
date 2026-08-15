@@ -23,6 +23,14 @@ uses
   vdrx_weblistener,
   vdrx_templates, vdrx_procutil, vdrx_transport, vdrx_admincmd;
 
+type
+  TVDRX_HTTPSite = record
+    ID: string;
+    HTTP: TVDRX_HTTPExecutive;
+    Templates: TVDRX_TemplateStore;
+  end;
+  TVDRX_HTTPSites = array of TVDRX_HTTPSite;
+
 var
   Kernel: TVDRX_Kernel;
   Config: TVDRX_Config;
@@ -30,14 +38,13 @@ var
   Logger: TVDRX_LoggerExecutive;
   Stdin: TVDRX_StdinExecutive;
   WS: TVDRX_WebSocketExecutive;
-  HTTP: TVDRX_HTTPExecutive;
-  Templates: TVDRX_TemplateStore;
   ProxyRoutes: TVDRX_ProxyRoutes;
   CLIRoutes: TVDRX_CLIRoutes;
   ShutdownGraceMs: Integer;
   DoRestart: Boolean;
   NewProc: TProcess;
   i: Integer;
+  HTTPSites: TVDRX_HTTPSites;
 
 procedure ConfigureListenerTLS(AListener: TVDRX_SocketListenerExecutive; const AKeyPrefix: string);
 begin
@@ -149,6 +156,61 @@ begin
       else
         WriteLn('  Process "', Row.Values['id'], '" (', Row.Values['command'],
           ', restart=', RestartRaw, ', graceful_timeout_ms=', BridgeGraceMs, ')');
+    end;
+  finally
+    Rows.Free;
+  end;
+end;
+
+// Generalized the same way SetupProcesses generalized proxy bridges: every
+// entry in "http_sites" gets its own TVDRX_HTTPExecutive + TVDRX_TemplateStore,
+// each on its own port with its own static/template roots. Previously there
+// was exactly one of each, wired from top-level static_dir/template_dir/
+// executives.http.* keys - fine when VDRX only ever served itself, not once
+// a second app (Kyzu) wants its own site. ProxyRoutes/CLIRoutes stay shared
+// across all sites for now - genuinely global concerns (any site can proxy
+// to any bridge), not per-site ones.
+function SetupHTTPSites(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry;
+  AGracefulMs: Integer; const AProxyRoutes: TVDRX_ProxyRoutes;
+  const ACLIRoutes: TVDRX_CLIRoutes): TVDRX_HTTPSites;
+var
+  Rows: TVDRX_ConfigRows;
+  Row: TStringList;
+  Site: TVDRX_HTTPSite;
+  n: Integer;
+begin
+  SetLength(Result, 0);
+  Rows := AConfig.GetObjectArray('http_sites');
+  try
+    for Row in Rows do
+    begin
+      if (Row.Values['id'] = '') or (Row.Values['port'] = '') then
+      begin
+        WriteLn('  Skipping http_sites entry - needs at least id and port.');
+        Continue;
+      end;
+
+      Site.ID := Row.Values['id'];
+      Site.Templates := TVDRX_TemplateStore.Create(AConfig,
+        IfThen(Row.Values['template_dir'] <> '', Row.Values['template_dir'], 'templates'));
+      Site.HTTP := TVDRX_HTTPExecutive.Create(Kernel.Queue, AConfig, Site.Templates,
+        IfThen(Row.Values['static_dir'] <> '', Row.Values['static_dir'], 'static'),
+        AProxyRoutes, ACLIRoutes);
+      Site.HTTP.Port := StrToIntDef(Row.Values['port'], 8081);
+      Site.HTTP.GracefulTimeoutMs := AGracefulMs;
+
+      if Row.Values['tls_port'] <> '' then
+        Site.HTTP.ConfigureTLS(StrToIntDef(Row.Values['tls_port'], 0),
+          Row.Values['tls_cert'], Row.Values['tls_key']);
+
+      ARegistry.Register(Site.HTTP, Site.ID, 'sys.none'); // serves requests directly, doesn't consume bus messages
+
+      n := Length(Result);
+      SetLength(Result, n + 1);
+      Result[n] := Site;
+
+      WriteLn('  HTTP site "', Site.ID, '": port ', Site.HTTP.Port,
+        ', static="', Row.Values['static_dir'], '", templates="', Row.Values['template_dir'], '"');
     end;
   finally
     Rows.Free;
@@ -271,23 +333,15 @@ begin
     SetupCLIBridges(Config, CLIRoutes);
     SetupBuckets(Config, Kernel.Registry);
   
-    Templates := TVDRX_TemplateStore.Create(Config, Config.GetString('template_dir', 'templates'));
-    if Config.GetBoolean('executives.http.enabled', False) then
-    begin
-      HTTP := TVDRX_HTTPExecutive.Create(Kernel.Queue, Config, Templates,
-        Config.GetString('static_dir', 'static'), ProxyRoutes, CLIRoutes);
-      HTTP.Port := Config.GetInteger('executives.http.port', 8081);
-      HTTP.GracefulTimeoutMs := ShutdownGraceMs;
-      ConfigureListenerTLS(HTTP, 'executives.http');
-      Kernel.Registry.Register(HTTP, 'http', 'sys.none');
-    end;
+    HTTPSites := SetupHTTPSites(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes, CLIRoutes);
   
     Kernel.Start; // Execute() calls Registry.InitializeAll - this is what actually
                   // binds every listener's socket(s) and starts its accept thread(s)
   
     WriteLn('VDRX daemon running.');
     if Assigned(WS) then ReportListener(WS, 'WebSocket');
-    if Assigned(HTTP) then ReportListener(HTTP, 'HTTP');
+    for i := 0 to High(HTTPSites) do
+      ReportListener(HTTPSites[i].HTTP, 'HTTP (' + HTTPSites[i].ID + ')');
     WriteLn('  Logger writing to vdrx_daemon.log (console threshold: INFO).');
     if Assigned(Stdin) then
       WriteLn('  Type quit / restart / reload / kill <pid-or-id> / killall [type] and press Enter to control the daemon.');
@@ -297,7 +351,8 @@ begin
                      // and ShutdownAll has finished tearing everything down cleanly
     DoRestart := Kernel.RestartRequested; // read before Free below
     Kernel.Free;
-    Templates.Free;
+    for i := 0 to High(HTTPSites) do
+      HTTPSites[i].Templates.Free; // HTTP executives themselves are Registry-owned, freed by Kernel.Free above
     Config.Free;
   
     WriteLn('Daemon stopped.');

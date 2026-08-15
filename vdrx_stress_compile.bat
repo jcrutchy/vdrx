@@ -1,0 +1,1 @@
+C:\lazarus\fpc\3.2.2\bin\x86_64-win64\fpc -Mobjfpc -Sh -Fu.. vdrx_stress.lpr

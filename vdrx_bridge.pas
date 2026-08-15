@@ -112,7 +112,7 @@ begin
         FProcess.Free;
         FProcess := nil;
         raise Exception.CreateFmt('bridge "%s": failed to start command "%s" - %s',
-          [ID, FCommand, E.Message]);
+          [ID, FCommand, E.Message]);  // debug: doesn't seem to get to if exe file doesn't exist
       end;
     end;
   finally

@@ -6,7 +6,7 @@ interface
 
 uses
   Classes, SysUtils, Sockets, SyncObjs, base64, sha1, fpjson, jsonparser,
-  vdrx_core, vdrx_socketlistener, vdrx_transport, vdrx_config, vdrx_procutil;
+  vdrx_core, vdrx_socketlistener, vdrx_transport, vdrx_config, vdrx_procutil, DateUtils;
 
 const
   WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -22,6 +22,12 @@ type
     FAuthenticated: Boolean;
     FSendLock: TCriticalSection;
     FPendingRequest: string;
+
+    FPingThread: TThread;
+    FStopping: Boolean;
+    FLastPong: TDateTime;
+    procedure PingLoop;
+
     function DoHandshake: Boolean;
     function ReadFrame(out APayload: string; out AOpcode: Byte): Boolean;
     procedure SendFrame(const APayload: string; AOpcode: Byte = 1);
@@ -42,6 +48,7 @@ type
     FConfig: TVDRX_Config;
     FRegistry: TVDRX_Registry;
     FConnCounter: Integer;
+    FPingIntervalMs, FPongTimeoutMs: Integer;
   protected
     procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
@@ -51,6 +58,8 @@ type
     procedure ApplyConfig; override;
     function NextConnID: string;
     procedure AdoptConnection(ATransport: TVDRX_Transport; const AInitialRequest: string);
+    property PingIntervalMs: Integer read FPingIntervalMs write FPingIntervalMs;
+    property PongTimeoutMs: Integer read FPongTimeoutMs write FPongTimeoutMs;
   end;
 
 implementation
@@ -298,13 +307,66 @@ begin
     Bus.Publish('log.warn', 'ws ' + ID + ': handshake failed, dropping connection', ID);
     Exit;
   end;
+
+  // Only safe to start pinging after the handshake completes - anything sent
+  // before that would corrupt the raw HTTP upgrade exchange.
+  FLastPong := Now;
+  FPingThread := TVDRX_WorkerThread.Create(@PingLoop);
+  FPingThread.Start;
+
   while True do
   begin
     if not ReadFrame(Payload, Opcode) then Break;
-    if Opcode = 1 then HandleRPC(Payload);
+    case Opcode of
+      1: HandleRPC(Payload);
+      9: SendFrame(Payload, 10); // client ping - echo back as pong, per spec
+      10: FLastPong := Now;      // reply to OUR ping - see PingLoop
+    end;
   end;
+
   Bus.Publish('log.info', 'ws ' + ID + ': disconnected', ID);
+  Bus.Publish('sys.ws.disconnected', Format('{"id":%s}', [JEsc(ID)]), ID);
   FListener.Registry.UnregisterSelf(ID); // NOT Unregister - this is our own thread, see vdrx_core.pas's UnregisterSelf comment
+end;
+
+// Sends a ping every PingIntervalMs and force-closes the transport if no
+// pong (ours or a stray client one - either counts as "link is alive") has
+// been seen within PingIntervalMs + PongTimeoutMs. Closing FTransport here
+// unblocks RunLoop's blocking ReadFrame on another thread - the same
+// close-to-unblock idiom Shutdown already relies on (see
+// TVDRX_ListenerConnThread.Transport's comment) - so the normal disconnect/
+// unregister path in RunLoop runs exactly as it would for a real close,
+// no special-casing needed there.
+// FLastPong is read/written across threads without a lock - a one-cycle
+// stale read just delays detection by ~PingIntervalMs, never causes a false
+// disconnect, so it isn't worth a CriticalSection for a heartbeat check.
+procedure TVDRX_WSConnection.PingLoop;
+var
+  Waited: Integer;
+begin
+  while not FStopping do
+  begin
+    Waited := 0;
+    while (not FStopping) and (Waited < FListener.PingIntervalMs) do
+    begin
+      Sleep(200);
+      Inc(Waited, 200);
+    end;
+    if FStopping then Break;
+
+    if MilliSecondsBetween(Now, FLastPong) > (FListener.PingIntervalMs + FListener.PongTimeoutMs) then
+    begin
+      Bus.Publish('log.warn', 'ws ' + ID + ': no pong within timeout, closing stale connection', ID);
+      FTransport.Close;
+      Break;
+    end;
+
+    try
+      SendFrame('', 9); // opcode 9 = ping
+    except
+      Break; // transport already gone - natural disconnect raced us here, RunLoop will handle cleanup
+    end;
+  end;
 end;
 
 procedure TVDRX_WSConnection.Initialize;
@@ -315,6 +377,7 @@ end;
 
 procedure TVDRX_WSConnection.Shutdown;
 begin
+  FStopping := True;
   FTransport.Close;
   if Assigned(FThread) then
   begin
@@ -325,6 +388,16 @@ begin
     end
     else
       Bus.Publish('log.warn', 'ws ' + ID + ': connection thread did not exit in time - abandoning it', ID);
+  end;
+  if Assigned(FPingThread) then
+  begin
+    if WaitThreadOrTimeout(FPingThread, FListener.GracefulTimeoutMs) then
+    begin
+      FPingThread.Free;
+      FPingThread := nil;
+    end
+    else
+      Bus.Publish('log.warn', 'ws ' + ID + ': ping thread did not exit in time - abandoning it', ID);
   end;
 end;
 
@@ -344,6 +417,8 @@ begin
   FRegistry := ARegistry;
   Port := 8082;
   FConnCounter := 0;
+  FPingIntervalMs := 15000;
+  FPongTimeoutMs := 10000;
 end;
 
 function TVDRX_WebSocketExecutive.NextConnID: string;
@@ -360,6 +435,7 @@ begin
   Conn := TVDRX_WSConnection.Create(Bus, Self, ATransport);
   Conn.PendingRequest := AInitialRequest;
   NewID := NextConnID;
+  Bus.Publish('sys.ws.connected', Format('{"id":%s}', [JEsc(NewID)]), ID);
   Bus.Publish('log.info', 'ws: new connection ' + NewID, ID);
   FRegistry.Register(Conn, NewID, 'sys.none');
   Conn.Initialize;
@@ -384,6 +460,8 @@ begin
   NewTLSPort := FConfig.GetInteger('executives.ws.tls_port', 0);
   CertFile := FConfig.GetString('executives.ws.tls_cert', '');
   KeyFile := FConfig.GetString('executives.ws.tls_key', '');
+  FPingIntervalMs := FConfig.GetInteger('executives.ws.ping_interval_ms', 15000);
+  FPongTimeoutMs := FConfig.GetInteger('executives.ws.pong_timeout_ms', 10000);
   if (NewPort <> Port) or (NewTLSPort <> TLSPort) then
   begin
     Shutdown;
