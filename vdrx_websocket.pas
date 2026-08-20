@@ -227,6 +227,7 @@ procedure TVDRX_WSConnection.HandleRPC(const ALine: string);
 var
   J: TJSONData;
   Obj: TJSONObject;
+  PayloadData: TJSONData;
   Method, Topic, Payload, Token, Src: string;
 begin
   try
@@ -279,7 +280,13 @@ begin
     else if Method = 'publish' then
     begin
       Topic := Obj.Get('topic', '');
-      Payload := Obj.Get('payload', '{}');
+      PayloadData := Obj.Find('payload');
+      if not Assigned(PayloadData) then
+        Payload := '{}'
+      else if PayloadData.JSONType = jtString then
+        Payload := PayloadData.AsString
+      else
+        Payload := PayloadData.AsJSON;
       Bus.Publish('log.info', 'ws ' + ID + ': publish "' + Topic + '" ' + Payload, ID);
       Bus.Publish(Topic, Payload, ID);
     end
@@ -465,3 +472,4 @@ begin
 end;
 
 end.
+
