@@ -13,31 +13,86 @@
         <Loaded Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="vdrx_bridge.pas"/>
-        <EditorIndex Value="3"/>
-        <TopLine Value="91"/>
-        <CursorPos X="25" Y="101"/>
-        <UsageCount Value="10"/>
-        <Loaded Value="True"/>
-      </Unit>
-      <Unit>
         <Filename Value="vdrx_network.pas"/>
         <IsPartOfProject Value="True"/>
         <IsVisibleTab Value="True"/>
-        <EditorIndex Value="1"/>
-        <CursorPos X="38" Y="4"/>
+        <EditorIndex Value="3"/>
+        <TopLine Value="1280"/>
+        <CursorPos X="22" Y="1300"/>
         <UsageCount Value="21"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
+        <Filename Value="vdrx_bridge.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="10"/>
+        <TopLine Value="91"/>
+        <CursorPos X="67" Y="98"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
         <Filename Value="vdrx_stdin.pas"/>
-        <EditorIndex Value="2"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="8"/>
         <CursorPos X="43" Y="8"/>
-        <UsageCount Value="10"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vdrx_config.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="7"/>
+        <TopLine Value="164"/>
+        <CursorPos X="83" Y="172"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vdrx_admin.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="1"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vdrx_bucket.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="9"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vdrx_core.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="5"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vdrx_logger.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="6"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vdrx_procutil.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="2"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vdrx_templates.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="4"/>
+        <CursorPos X="44" Y="6"/>
+        <UsageCount Value="20"/>
         <Loaded Value="True"/>
       </Unit>
     </Units>
-    <JumpHistory HistoryIndex="4">
+    <JumpHistory HistoryIndex="10">
       <Position>
         <Filename Value="vdrx.lpr"/>
         <Caret Line="10" Column="27"/>
@@ -57,6 +112,30 @@
       <Position>
         <Filename Value="vdrx_stdin.pas"/>
         <Caret Line="8" Column="43"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_network.pas"/>
+        <Caret Line="15" Column="33" TopLine="22"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_network.pas"/>
+        <Caret Line="106" Column="3" TopLine="89"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_network.pas"/>
+        <Caret Line="111" Column="15" TopLine="89"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_config.pas"/>
+        <Caret Line="8" Column="87"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_network.pas"/>
+        <Caret Line="467" Column="9" TopLine="394"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_network.pas"/>
+        <Caret Line="1487" Column="11" TopLine="1482"/>
       </Position>
     </JumpHistory>
     <RunParams>

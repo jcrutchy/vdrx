@@ -167,6 +167,7 @@ end;
 procedure TVDRX_Config.Reload;
 var
   JSONString: TStringList;
+  NewData: TJSONData;
 begin
   FLock.Enter;
   try
@@ -175,7 +176,14 @@ begin
       try
         JSONString.LoadFromFile(FFilePath);
         if Assigned(FData) then FData.Free;
-        FData := TJSONObject(GetJSON(JSONString.Text));
+        NewData := GetJSON(JSONString.Text);
+        if NewData is TJSONObject then
+        begin
+          if Assigned(FData) then FData.Free;
+          FData := TJSONObject(NewData);
+        end
+        else
+          NewData.Free;
       finally
         JSONString.Free;
       end;
@@ -184,5 +192,8 @@ begin
     FLock.Leave;
   end;
 end;
+
+
+
 
 end.

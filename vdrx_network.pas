@@ -468,6 +468,7 @@ begin
     end;
   finally
     FOwner.UnregisterConnection(Self);
+    FreeOnTerminate := True;
   end;
 end;
 
@@ -1295,6 +1296,7 @@ end;
 
 destructor TVDRX_WSConnection.Destroy;
 begin
+  // DEBUG TODO: Destroy should ensure FPingThread is terminated and joined/freed before freeing transport and synchronization primitives.
   FTransport.Free;
   FSendLock.Free;
   inherited Destroy;
