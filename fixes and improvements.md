@@ -155,3 +155,148 @@ Here is a detailed code analysis of the **VDRX** codebase, categorized by **Crit
 * **Location:** `TVDRX_TLSTransport.SetReadTimeout`
 * **Issue:** `TVDRX_PlainTransport.Create(FSocket)` is instantiated and immediately freed just to call `fpSetsockopt`.
 * **Improvement:** Extract `SetSocketTimeout(FSocket, ATimeoutMs)` into a standalone utility procedure.
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+critical bug C1:
+
+### Understanding the Bug
+
+When a WebSocket client disconnects on its own, `TVDRX_WSConnection.RunLoop` breaks out of its read loop and calls:
+```pascal
+FListener.Registry.UnregisterSelf(ID);
+```
+
+Because `FRegistry.FMasterMap` has `[doOwnsValues]`, `UnregisterSelf` immediately invokes `destructor TVDRX_WSConnection.Destroy`, which frees `FTransport` and `FSendLock`.
+
+This triggers three critical issues:
+1. **Active Ping Loop Crash:** `FPingThread` is still executing `PingLoop` on a separate thread. The next time it runs `SendFrame('', 9)` or checks `FTransport`, it attempts to acquire `FSendLock` or write to `FTransport` (both of which were just freed), resulting in an **Access Violation**.
+2. **Use-After-Free in `RunLoop`:** `RunLoop` is running on `FThread`. Freeing `Self` while inside one of its own methods means any subsequent field/property access or thread termination causes a use-after-free.
+3. **Leaked Thread Object:** `FThread` was created with `FreeOnTerminate := False;` and is never freed on natural disconnects.
+
+---
+
+### Step-by-Step Fix
+
+To fix this, we need to:
+1. Ensure `FPingThread` is signaled, stopped, and freed **before** `FSendLock` or `FTransport` are destroyed.
+2. Mark `TWSConnThread` with `FreeOnTerminate := True` so the connection thread cleans itself up upon exit.
+3. Cache local variables in `RunLoop` before invoking `UnregisterSelf` so no member fields of `Self` are touched after deletion.
+
+---
+
+### Code Changes
+
+#### 1. In `vdrx_network.pas` (`TVDRX_WSConnection.Initialize`)
+Set `FThread.FreeOnTerminate := True;` so connection worker threads do not leak on disconnect:
+
+```pascal
+procedure TVDRX_WSConnection.Initialize;
+begin
+  FThread := TWSConnThread.Create(Self);
+  FThread.FreeOnTerminate := True; // Automatically frees thread resource when RunLoop finishes
+  FThread.Start;
+end;
+```
+
+---
+
+#### 2. In `vdrx_network.pas` (`TVDRX_WSConnection.RunLoop`)
+Clean up `FPingThread` before publishing disconnect events and unregistering, and cache local references to prevent referencing a freed `Self`:
+
+```pascal
+procedure TVDRX_WSConnection.RunLoop;
+var
+  Payload: string;
+  Opcode: Byte;
+  Reg: TVDRX_Registry;
+  ConnID: string;
+begin
+  if not DoHandshake then
+  begin
+    Bus.Publish('log.warn', 'ws ' + ID + ': handshake failed, dropping connection', ID);
+    Reg := FListener.Registry;
+    ConnID := ID;
+    Reg.UnregisterSelf(ConnID);
+    Exit;
+  end;
+
+  FLastPong := Now;
+  FPingThread := TVDRX_WorkerThread.Create(@PingLoop);
+  FPingThread.FreeOnTerminate := False;
+  FPingThread.Start;
+
+  while not FStopping do
+  begin
+    if not ReadFrame(Payload, Opcode) then Break;
+    case Opcode of
+      1: HandleRPC(Payload);
+      9: SendFrame(Payload, 10); // client ping - echo back as pong, per spec
+      10: FLastPong := Now;      // reply to OUR ping
+    end;
+  end;
+
+  // 1. Signal shutdown to ping loop and join the ping thread FIRST
+  FStopping := True;
+  if Assigned(FPingThread) then
+  begin
+    WaitThreadOrTimeout(FPingThread, 1000);
+    FreeAndNil(FPingThread);
+  end;
+
+  // 2. Publish disconnection notifications
+  Bus.Publish('log.info', 'ws ' + ID + ': disconnected', ID);
+  Bus.Publish('sys.ws.disconnected', Format('{"id":%s}', [JSONString(ID)]), ID);
+
+  // 3. Cache registry and ID on stack so we don't access Self fields after UnregisterSelf
+  Reg := FListener.Registry;
+  ConnID := ID;
+
+  // 4. Unregister (this calls Destroy on Self)
+  Reg.UnregisterSelf(ConnID);
+end;
+```
+
+---
+
+#### 3. In `vdrx_network.pas` (`TVDRX_WSConnection.Shutdown` and `Destroy`)
+Guard `Shutdown` and `Destroy` against double-frees and ensure `Destroy` safely tears down remaining resources if shutdown was triggered externally (e.g. via `sys.quit` or `sys.kill`):
+
+```pascal
+procedure TVDRX_WSConnection.Shutdown;
+begin
+  FStopping := True;
+  if Assigned(FTransport) then
+    FTransport.Close;
+
+  // Stop and free ping thread
+  if Assigned(FPingThread) then
+  begin
+    if WaitThreadOrTimeout(FPingThread, FListener.GracefulTimeoutMs) then
+      FreeAndNil(FPingThread)
+    else
+      Bus.Publish('log.warn', 'ws ' + ID + ': ping thread did not exit in time - abandoning it', ID);
+  end;
+
+  // FThread has FreeOnTerminate := True, so we don't call FThread.Free here
+  FThread := nil;
+end;
+
+destructor TVDRX_WSConnection.Destroy;
+begin
+  FStopping := True;
+
+  // Fallback cleanup if Destroy was called directly without Shutdown
+  if Assigned(FPingThread) then
+  begin
+    WaitThreadOrTimeout(FPingThread, 500);
+    FreeAndNil(FPingThread);
+  end;
+
+  FreeAndNil(FTransport);
+  FreeAndNil(FSendLock);
+  inherited Destroy;
+end;
+```
