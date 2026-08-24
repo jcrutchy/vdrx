@@ -17,11 +17,9 @@ uses
   vdrx_stdin,
   vdrx_bridge,
   vdrx_bucket,
-  vdrx_websocket,
-  vdrx_http,
-  vdrx_socketlistener,
-  vdrx_weblistener,
-  vdrx_templates, vdrx_procutil, vdrx_transport, vdrx_admincmd;
+  vdrx_network,
+  vdrx_templates,
+  vdrx_procutil;
 
 type
   TVDRX_HTTPSite = record

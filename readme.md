@@ -1,6 +1,6 @@
 # VDRX
 
-VDRX is a small, boring, Unix-philosophy daemon written in Object Pascal /
+VDRX is a small, Unix-philosophy daemon written in Object Pascal /
 Free Pascal. Its whole job is two things: an in-process pub/sub message bus
 that anything running inside it can publish to and subscribe from, and
 supervision of external processes (spawn, restart-on-crash, graceful-then-

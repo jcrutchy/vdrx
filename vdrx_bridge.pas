@@ -7,6 +7,7 @@ interface
 uses
   Classes, SysUtils, SyncObjs, Process, fpjson, jsonparser, vdrx_core, vdrx_procutil;
 
+
 type
 
   // External-process manager. One instance per external process. Descends from

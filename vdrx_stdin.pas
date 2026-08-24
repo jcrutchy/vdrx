@@ -5,7 +5,7 @@ unit vdrx_stdin;
 interface
 
 uses
-  Classes, SysUtils, vdrx_core, vdrx_admincmd;
+  Classes, SysUtils, vdrx_core, vdrx_admin;
 
 type
   // Reads admin commands (quit/restart/reload/kill/killall - see
