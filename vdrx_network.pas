@@ -138,6 +138,11 @@ type
     function BindListenSocket(APort: Word): TSocket;
     procedure AcceptLoopPlain;
     procedure AcceptLoopTLS;
+    // Polls FActiveConnections membership (rather than AThread.Finished/Free)
+    // to learn when a connection thread is done - see the long comment on
+    // Shutdown below for why touching the TThread object itself after it may
+    // have self-freed via FreeOnTerminate is unsafe.
+    function WaitConnGone(AThread: TVDRX_ListenerConnThread; ATimeoutMs: Integer): Boolean;
   protected
     procedure HandleConnection(ATransport: TVDRX_Transport); virtual; abstract;
 
@@ -715,6 +720,34 @@ begin
   end;
 end;
 
+// FActiveConnections membership (kept in sync by Register/UnregisterConnection,
+// both called from the connection thread itself) is used as the completion
+// signal instead of AThread.Finished, and nothing here ever calls AThread.Free -
+// see the Shutdown comment below.
+function TVDRX_SocketListenerExecutive.WaitConnGone(AThread: TVDRX_ListenerConnThread; ATimeoutMs: Integer): Boolean;
+var
+  Waited: Integer;
+
+  function StillActive: Boolean;
+  begin
+    FCriticalSection.Acquire;
+    try
+      Result := FActiveConnections.IndexOf(AThread) >= 0;
+    finally
+      FCriticalSection.Release;
+    end;
+  end;
+
+begin
+  Waited := 0;
+  while StillActive and (Waited < ATimeoutMs) do
+  begin
+    Sleep(50);
+    Inc(Waited, 50);
+  end;
+  Result := not StillActive;
+end;
+
 procedure TVDRX_SocketListenerExecutive.Shutdown;
 var
   I: Integer;
@@ -771,23 +804,33 @@ begin
     for I := 0 to CopyList.Count - 1 do
     begin
       ConnThread := TVDRX_ListenerConnThread(CopyList[I]);
+      // ConnThread.Execute sets FreeOnTerminate := True right before it
+      // returns, so the RTL frees the TThread object itself, on the
+      // connection's own thread, the moment Execute exits - possibly before
+      // this loop even gets here. That means this code must never touch
+      // ConnThread's own fields (.Finished, .Free) once it's had a chance to
+      // exit, since the object may already be gone: doing so risks a
+      // use-after-free, and calling ConnThread.Free here on top of that would
+      // be a double free. WaitConnGone sidesteps this entirely by polling
+      // FActiveConnections membership (a separate, still-live data
+      // structure) instead of the thread object, and this code never calls
+      // ConnThread.Free - FreeOnTerminate already owns that.
+      //
       // First give it FGracefulTimeoutMs to notice FStopping/EOF and exit on
       // its own; if it doesn't, force its transport closed - that unblocks a
       // blocking Read/Write (a connection idling on a client that never
       // sends/disconnects, the classic hang case) and lets HandleConnection
       // return. Give it one more short window after that before giving up.
-      if not WaitThreadOrTimeout(ConnThread, FGracefulTimeoutMs) then
+      if not WaitConnGone(ConnThread, FGracefulTimeoutMs) then
       begin
         Bus.Publish('log.warn', ID + ': connection thread did not exit in time - forcing its socket closed', ID);
         try ConnThread.Transport.Close; except end;
+        if not WaitConnGone(ConnThread, FGracefulTimeoutMs) then
+          // Genuinely stuck even after a forced close (shouldn't happen) -
+          // abandon it; its transport is already closed so it should
+          // unblock and self-free shortly via FreeOnTerminate regardless.
+          Bus.Publish('log.warn', ID + ': connection thread still stuck after forcing its socket closed - abandoning it', ID);
       end;
-      if WaitThreadOrTimeout(ConnThread, FGracefulTimeoutMs) then
-        ConnThread.Free
-      else
-        // Genuinely stuck even after a forced close (shouldn't happen) -
-        // abandon it rather than risk freeing an object a live thread is
-        // still touching.
-        Bus.Publish('log.warn', ID + ': connection thread still stuck after forcing its socket closed - abandoning it', ID);
     end;
   finally
     CopyList.Free;
@@ -957,7 +1000,7 @@ end;
 function ReadFullRequest(ATransport: TVDRX_Transport): string;
 var
   Buf: array[0..4095] of Byte;
-  Received, HeaderEnd, ContentLength, BodySoFar, ToRead: Integer;
+  Received, HeaderEnd, ContentLength, BodySoFar, ToRead, TotalLen: Integer;
   HeaderBlock, CLStr: string;
 begin
   Result := '';
@@ -980,14 +1023,33 @@ begin
   if ContentLength > MAX_BODY_SIZE then ContentLength := MAX_BODY_SIZE; // clamp rather than reject
 
   BodySoFar := Length(Result) - (HeaderEnd + 3);
+  // Grow Result to its final known size in one shot up front, rather than
+  // via SetLength(Result, Length(Result) + Received) on every 4KB chunk
+  // below - each of those was a full realloc-and-copy of everything read so
+  // far, so a multi-megabyte POST body (up to MAX_BODY_SIZE = 10MB) meant
+  // thousands of reallocations copying an ever-growing buffer, quadratic in
+  // the body size. Extending once here makes each chunk below a plain Move
+  // into already-allocated space.
+  if ContentLength > BodySoFar then
+  begin
+    TotalLen := Length(Result) + (ContentLength - BodySoFar);
+    SetLength(Result, TotalLen);
+  end;
   while BodySoFar < ContentLength do
   begin
     ToRead := ContentLength - BodySoFar;
     if ToRead > SizeOf(Buf) then ToRead := SizeOf(Buf);
     Received := ATransport.Read(Buf[0], ToRead);
-    if Received <= 0 then Break; // client stopped sending early - forward whatever we actually got
-    SetLength(Result, Length(Result) + Received);
-    Move(Buf[0], Result[Length(Result) - Received + 1], Received);
+    if Received <= 0 then
+    begin
+      // Client stopped sending early - forward whatever we actually got,
+      // trimming off the space we pre-allocated for bytes that never
+      // arrived (SetLength above assumed the client would send exactly
+      // ContentLength bytes).
+      SetLength(Result, HeaderEnd + 3 + BodySoFar);
+      Break;
+    end;
+    Move(Buf[0], Result[HeaderEnd + 3 + BodySoFar + 1], Received);
     Inc(BodySoFar, Received);
   end;
 end;
@@ -1526,24 +1588,38 @@ end;
 
 procedure TVDRX_WSConnection.SendFrame(const APayload: string; AOpcode: Byte);
 var
-  Hdr: array[0..3] of Byte;
+  Hdr: array[0..9] of Byte; // 2 base + up to 8 for the 64-bit extended length (RFC 6455 5.2)
   HdrLen: Integer;
   Buf: string;
+  PayloadLen: UInt64;
+  i: Integer;
 begin
   FSendLock.Enter;
   try
+    PayloadLen := UInt64(Length(APayload));
     Hdr[0] := $80 or AOpcode;
-    if Length(APayload) < 126 then
+    if PayloadLen < 126 then
     begin
-      Hdr[1] := Length(APayload);
+      Hdr[1] := Byte(PayloadLen);
       HdrLen := 2;
+    end
+    else if PayloadLen <= 65535 then
+    begin
+      Hdr[1] := 126;
+      Hdr[2] := (PayloadLen shr 8) and $FF;
+      Hdr[3] := PayloadLen and $FF;
+      HdrLen := 4;
     end
     else
     begin
-      Hdr[1] := 126;
-      Hdr[2] := (Length(APayload) shr 8) and $FF;
-      Hdr[3] := Length(APayload) and $FF;
-      HdrLen := 4;
+      // 127 = 64-bit extended length follows, big-endian. Without this branch
+      // any payload over 65535 bytes (large history dumps, bulk responses)
+      // wrote a truncated 16-bit length via the Hdr[1]:=126 path above,
+      // producing a malformed frame the client would reject and disconnect on.
+      Hdr[1] := 127;
+      for i := 0 to 7 do
+        Hdr[2 + i] := (PayloadLen shr ((7 - i) * 8)) and $FF;
+      HdrLen := 10;
     end;
     SetString(Buf, PAnsiChar(@Hdr[0]), HdrLen);
     Buf := Buf + APayload;

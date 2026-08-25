@@ -243,44 +243,64 @@ begin
 end;
 
 procedure TVDRX_BridgeExecutive.ReaderLoop;
+const
+  BufSize = 4096;
 var
-  Line, Buf, StructTopic, StructPayload: string;
+  Buf: array[0..BufSize - 1] of Byte;
+  Received, i: Integer;
+  Line, LineBuf, StructTopic, StructPayload: string;
   Ch: Char;
   Proc: TProcess;
 begin
-  Buf := '';
+  LineBuf := '';
   FProcessLock.Enter;
   Proc := FProcess;
   FProcessLock.Leave;
-  while (not FStopping) and Assigned(Proc) and Proc.Running do
+  // Reads in BufSize-byte chunks instead of one byte (one syscall) at a
+  // time - under high-volume output (log-heavy or JSON-streaming child
+  // processes) the old per-character Read was a real CPU cost. The loop no
+  // longer keys off Proc.Running either: that let it exit the instant a
+  // short-lived process finished, even if there was still unread output
+  // sitting in the OS pipe buffer, silently dropping it. Now it keeps
+  // reading - and processing whatever comes back - until a Read genuinely
+  // comes back empty AND the process has exited, so buffered trailing
+  // output is drained before the loop stops.
+  while (not FStopping) and Assigned(Proc) do
   begin
-    if Proc.Output.Read(Ch, 1) = 1 then
+    Received := Proc.Output.Read(Buf, SizeOf(Buf));
+    if Received > 0 then
     begin
-      if Ch = #10 then
+      for i := 0 to Received - 1 do
       begin
-        Line := Trim(Buf);
-        Buf := '';
-        if Line <> '' then
+        Ch := Chr(Buf[i]);
+        if Ch = #10 then
         begin
-          if TryParseStructuredLine(Line, StructTopic, StructPayload) then
+          Line := Trim(LineBuf);
+          LineBuf := '';
+          if Line <> '' then
           begin
-            if IsPublishAllowed(StructTopic) then
-              Bus.Publish(StructTopic, StructPayload, ID)
-            else
+            if TryParseStructuredLine(Line, StructTopic, StructPayload) then
             begin
-              Bus.Publish('log.warn', Format(
-                'bridge %s: rejected publish to "%s" - not covered by its publish patterns, falling back to %s.out',
-                [ID, StructTopic, ID]), ID);
-              Bus.Publish(ID + '.out', Line, ID);
-            end;
-          end
-          else
-            Bus.Publish(ID + '.out', Line, ID); // plain text - process output re-enters the bus, namespaced by this executive's ID
-        end;
-      end
-      else if Ch <> #13 then
-        Buf := Buf + Ch;
+              if IsPublishAllowed(StructTopic) then
+                Bus.Publish(StructTopic, StructPayload, ID)
+              else
+              begin
+                Bus.Publish('log.warn', Format(
+                  'bridge %s: rejected publish to "%s" - not covered by its publish patterns, falling back to %s.out',
+                  [ID, StructTopic, ID]), ID);
+                Bus.Publish(ID + '.out', Line, ID);
+              end;
+            end
+            else
+              Bus.Publish(ID + '.out', Line, ID); // plain text - process output re-enters the bus, namespaced by this executive's ID
+          end;
+        end
+        else if Ch <> #13 then
+          LineBuf := LineBuf + Ch;
+      end;
     end
+    else if not Proc.Running then
+      Break // no data waiting and the process is gone - genuinely done, not just quiet
     else
       Sleep(20);
   end;

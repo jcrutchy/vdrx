@@ -43,6 +43,7 @@ type
   TVDRX_MessageQueue = class
   private
     FList: TVDRX_MessageList;
+    FHead: Integer; // index of the next message to dequeue; see TryDequeue
     FLock: TCriticalSection;
     FSignal: TEvent;
     FSeqCounter: Int64;
@@ -169,12 +170,17 @@ type
     property RestartRequested: Boolean read FRestartRequested write FRestartRequested;
   end;
 
-// Topic/filter wildcard matching - '*' matches exactly one dot-delimited
-// segment, '>' matches the rest of the topic however many segments remain.
-// Used internally by TVDRX_Registry's dispatch, and exported here so any
+// Topic/filter wildcard matching, scanned in a single pass over both strings
+// with no allocation - '*' matches exactly one dot-delimited segment, '>'
+// matches the rest of the topic however many segments remain. Used
+// internally by TVDRX_Registry's dispatch (once per subscriber per
+// dequeued message, so this runs a lot under load) and exported here so any
 // other unit that needs the same "does this topic satisfy this filter"
 // question (e.g. vdrx_bridge.pas validating a process's declared publish
 // patterns) reuses this instead of growing its own copy that could drift.
+// Previously split both strings on '.' into dynamic arrays on every call,
+// which meant two heap allocations (plus one per segment) per match check;
+// this version walks both strings with plain index scanning instead.
 function TopicMatches(const Filter, Topic: string): Boolean;
 
 // Escapes a string into a complete, quoted JSON string literal - not just the
@@ -195,21 +201,46 @@ end;
 
 function TopicMatches(const Filter, Topic: string): Boolean;
 var
-  fParts, tParts: TStringArray;
-  i: Integer;
+  fLen, tLen, fPos, tPos, fEnd, tEnd, segLen: Integer;
 begin
-  fParts := Filter.Split(['.']);
-  tParts := Topic.Split(['.']);
-  for i := 0 to High(fParts) do
+  fLen := Length(Filter);
+  tLen := Length(Topic);
+  fPos := 1;
+  tPos := 1;
+  while True do
   begin
-    if fParts[i] = '>' then
+    fEnd := fPos;
+    while (fEnd <= fLen) and (Filter[fEnd] <> '.') do Inc(fEnd);
+    segLen := fEnd - fPos;
+
+    if (segLen = 1) and (Filter[fPos] = '>') then
       Exit(True);
-    if i > High(tParts) then
-      Exit(False);
-    if (fParts[i] <> '*') and (fParts[i] <> tParts[i]) then
-      Exit(False);
+
+    if tPos = 0 then
+      Exit(False); // filter has another segment; topic has already run out
+
+    tEnd := tPos;
+    while (tEnd <= tLen) and (Topic[tEnd] <> '.') do Inc(tEnd);
+
+    if not ((segLen = 1) and (Filter[fPos] = '*')) then
+    begin
+      if segLen <> (tEnd - tPos) then Exit(False);
+      if (segLen > 0) and not CompareMem(@Filter[fPos], @Topic[tPos], segLen) then
+        Exit(False);
+    end;
+
+    if fEnd > fLen then
+      // this was the filter's last segment - match iff the topic segment
+      // just compared was also its last (mirrors the old Length(fParts) =
+      // Length(tParts) check at the end of the split-based version)
+      Exit(tEnd > tLen);
+
+    fPos := fEnd + 1;
+    if tEnd > tLen then
+      tPos := 0
+    else
+      tPos := tEnd + 1;
   end;
-  Result := Length(fParts) = Length(tParts);
 end;
 
 { TVDRX_WorkerThread }
@@ -272,12 +303,24 @@ begin
     Exit;
   FLock.Enter;
   try
-    Result := FList.Count > 0;
+    Result := FHead < FList.Count;
     if Result then
     begin
-      AMsg := FList[0];
-      FList.Delete(0);
-      if FList.Count > 0 then
+      AMsg := FList[FHead];
+      Inc(FHead);
+      // FList.Delete(0) here used to shift every remaining element down by
+      // one on every single dequeue - O(N) per message, so O(N^2) for a
+      // backlog draining under load. Advancing FHead instead makes the
+      // common case O(1); the consumed prefix [0..FHead) is only actually
+      // removed from FList in one shot (DeleteRange, an O(N) memmove) once
+      // it's grown large relative to what's left, so that cost is amortized
+      // across many dequeues rather than paid on every one.
+      if (FHead > 256) and (FHead * 2 >= FList.Count) then
+      begin
+        FList.DeleteRange(0, FHead);
+        FHead := 0;
+      end;
+      if FHead < FList.Count then
         FSignal.SetEvent;
     end;
   finally
@@ -578,6 +621,18 @@ end;
 
 destructor TVDRX_Kernel.Destroy;
 begin
+  // FQueue/FRegistry used to be freed at the bottom of Execute, on the
+  // worker thread, right after ShutdownAll. But both are created in Create
+  // and exposed to the main thread via the Queue/Registry properties for the
+  // whole lifetime of the Kernel object - if the main thread read either
+  // property anywhere around WaitFor/termination (or any code holds a
+  // reference from earlier), it could dereference an already-freed pointer.
+  // Freeing them here instead means they only go away when the TThread
+  // object itself is destroyed (i.e. after the main thread has called
+  // WaitFor and then frees the Kernel), which is the point nothing should
+  // still be touching them.
+  FQueue.Free;
+  FRegistry.Free;
   inherited;
 end;
 
@@ -607,8 +662,6 @@ begin
     end;
   end;
   FRegistry.ShutdownAll;
-  FQueue.Free;
-  FRegistry.Free;
   WriteLn('Dispatcher: Exited loop cleanly.');
 end;
 
