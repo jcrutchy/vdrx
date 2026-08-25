@@ -388,6 +388,31 @@ begin
   end;
 end;
 
+// Payload is supposed to already be a JSON-encoded value by the time it
+// reaches here (see TVDRX_Message.Payload's producers - the WS RPC layer,
+// admin commands, etc.), but not everything that publishes onto the bus
+// (e.g. a plain-text CLI/bridge payload) guarantees that. Splicing an
+// unquoted, non-JSON payload straight into the "payload":%s slot below used
+// to produce invalid JSON on the wire (e.g. {"topic":"x","payload":hello
+// world,"source":"y"}), which every downstream JSON parser would choke on.
+// Try to parse it as JSON first; only if that fails do we know it's raw
+// text, and wrap it as a JSON string so the line is always valid JSON.
+function EnsureJSONPayload(const APayload: string): string;
+var
+  Parsed: TJSONData;
+begin
+  try
+    Parsed := GetJSON(APayload);
+    try
+      Result := APayload; // already valid JSON (object, array, string, number, bool, null) - pass through unchanged
+    finally
+      Parsed.Free;
+    end;
+  except
+    Result := JSONString(APayload); // not JSON at all - treat as raw text and quote it
+  end;
+end;
+
 procedure TVDRX_BridgeExecutive.HandlePacket(const AMsg: TVDRX_Message);
 var
   Line: string;
@@ -399,7 +424,7 @@ begin
     if Assigned(FProcess) and FProcess.Running then
     begin
       Line := Format('{"topic":%s,"payload":%s,"source":%s}',
-        [JSONString(AMsg.Topic), AMsg.Payload, JSONString(AMsg.SourceID)])
+        [JSONString(AMsg.Topic), EnsureJSONPayload(AMsg.Payload), JSONString(AMsg.SourceID)])
         + LineEnding;
       FProcess.Input.Write(Line[1], Length(Line));
     end;

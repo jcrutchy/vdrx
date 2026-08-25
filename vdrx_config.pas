@@ -175,15 +175,41 @@ begin
       JSONString := TStringList.Create;
       try
         JSONString.LoadFromFile(FFilePath);
-        if Assigned(FData) then FData.Free;
-        NewData := GetJSON(JSONString.Text);
-        if NewData is TJSONObject then
+        // Parse into a local var FIRST and only touch FData once we know
+        // parsing succeeded. The previous version freed FData right here,
+        // before GetJSON ran - so a syntax error in the reloaded vdrx.conf
+        // (e.g. a trailing comma) left FData a dangling/freed pointer for
+        // every GetString/GetInteger call across the whole daemon until the
+        // next successful reload, since GetJSON raising an exception meant
+        // FData was never reassigned.
+        //
+        // GetJSON itself can raise on malformed JSON, and Reload is called
+        // straight from TVDRX_AdminExecutive.HandlePacket ('sys.reload')
+        // with nothing catching exceptions between here and
+        // TVDRX_Kernel.Execute's message dispatch loop - letting this
+        // propagate would kill the whole kernel dispatch thread over one
+        // bad config file. Catch and keep the last-known-good FData instead.
+        try
+          NewData := GetJSON(JSONString.Text);
+        except
+          on E: Exception do
+          begin
+            WriteLn(StdErr, 'vdrx_config: Reload failed to parse ' + FFilePath +
+              ' - keeping previous config (' + E.Message + ')');
+            NewData := nil;
+          end;
+        end;
+        if Assigned(NewData) then
         begin
-          if Assigned(FData) then FData.Free;
-          FData := TJSONObject(NewData);
-        end
-        else
-          NewData.Free;
+          if NewData is TJSONObject then
+          begin
+            if Assigned(FData) then FData.Free;
+            FData := TJSONObject(NewData);
+          end
+          else
+            NewData.Free;
+        end;
+        // else: parse failed above (already logged) - FData is left untouched
       finally
         JSONString.Free;
       end;

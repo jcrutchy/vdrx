@@ -423,12 +423,25 @@ end;
 procedure TVDRX_Registry.Unregister(const AID: string);
 var
   Exec: TVDRX_Executive;
+  Pair: specialize TPair<string, TVDRX_Executive>;
 begin
   FLock.Enter;
   try
     if not FMasterMap.TryGetValue(AID, Exec) then
       Exit;
     RemoveSubscriptionsUnlocked(Exec);
+    // ExtractPair (not Remove) while still under FLock: this atomically
+    // pulls Exec out of the map and hands exclusive ownership to this call.
+    // TObjectDictionary's ExtractPair, unlike Remove, does NOT free the
+    // value - ownership transfers to us instead. That closes the race that
+    // used to exist here: two threads calling Unregister(AID) concurrently
+    // could both TryGetValue the same Exec pointer, both call Exec.Shutdown,
+    // and then whichever thread's Remove ran first would free Exec out from
+    // under the other thread's still-in-flight Shutdown call (use-after-free).
+    // Now only one thread can ever ExtractPair a given AID; a second
+    // concurrent call simply finds nothing left to TryGetValue and exits above.
+    Pair := FMasterMap.ExtractPair(AID);
+    Exec := Pair.Value;
   finally
     FLock.Leave;
   end;
@@ -439,16 +452,11 @@ begin
   // FMasterMap.Remove's destructor call run - which meant killing/unregistering
   // a Bridge (or any executive holding a thread/child process) never actually
   // stopped what it owned. Small race window here: a concurrent Register(AID,...)
-  // could re-add a *different* executive under AID before the Remove below runs,
+  // could re-add a *different* executive under AID before ExtractPair above runs,
   // which would then be silently dropped - acceptable for now (nothing here is
   // authenticated or under heavy concurrency yet, see vdrx_admincmd.pas).
   Exec.Shutdown;
-  FLock.Enter;
-  try
-    FMasterMap.Remove(AID); // owning map - this is what actually frees Exec
-  finally
-    FLock.Leave;
-  end;
+  Exec.Free; // we exclusively own Exec now (see ExtractPair above), so free it ourselves
 end;
 
 function TVDRX_Registry.Find(const AID: string): TVDRX_Executive;

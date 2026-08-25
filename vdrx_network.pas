@@ -310,6 +310,40 @@ begin
   Result := True;
 end;
 
+// to get around lack of poSearchPath in process.TProcessOptions
+function ProcessFindInPath(const Exe: string): string;
+var
+  Paths: TStringList;
+  Dir: string;
+  Candidate: string;
+begin
+  Result := Exe;  // default return value
+
+  // If Exe already contains a path, don't search PATH
+  if (Pos(PathDelim, Exe) > 0) or (Pos('/', Exe) > 0) then
+    Exit;
+
+  Paths := TStringList.Create;
+  try
+    Paths.Delimiter := PathSeparator;
+    Paths.StrictDelimiter := True;
+    Paths.DelimitedText := GetEnvironmentVariable('PATH');
+
+    for Dir in Paths do
+    begin
+      Candidate := IncludeTrailingPathDelimiter(Dir) + Exe;
+      if FileExists(Candidate) then
+      begin
+        Result := Candidate;
+        Exit;
+      end;
+    end;
+  finally
+    Paths.Free;
+  end;
+end;
+
+
 function ConnectTCP(const AHost: string; APort: Word): TVDRX_Transport;
 var
   Sock: TSocket;
@@ -531,8 +565,20 @@ begin
   Addr.sin_family := AF_INET;
   Addr.sin_port := htons(APort);
   Addr.sin_addr.s_addr := 0;
-  fpBind(Result, @Addr, SizeOf(Addr));
-  fpListen(Result, FBacklog);
+  if fpBind(Result, @Addr, SizeOf(Addr)) <> 0 then
+  begin
+    Bus.Publish('log.error', ID + ': fpBind failed on port ' + IntToStr(APort) +
+      ' (errno ' + IntToStr(socketerror) + ') - port likely already in use', ID);
+    CloseSocket(Result);
+    Exit(-1); // caller must check for -1 rather than trying to accept on a dead/invalid socket
+  end;
+  if fpListen(Result, FBacklog) <> 0 then
+  begin
+    Bus.Publish('log.error', ID + ': fpListen failed on port ' + IntToStr(APort) +
+      ' (errno ' + IntToStr(socketerror) + ')', ID);
+    CloseSocket(Result);
+    Exit(-1);
+  end;
 end;
 
 procedure TVDRX_SocketListenerExecutive.AcceptLoopPlain;
@@ -543,12 +589,25 @@ var
   ConnThread: TVDRX_ListenerConnThread;
 begin
   FPlainSocket := BindListenSocket(FPort);
+  if FPlainSocket = -1 then
+  begin
+    FPlainSocket := 0;
+    Exit; // bind/listen already logged the reason above; nothing to accept on
+  end;
   while not FStopping do
   begin
     AddrLen := SizeOf(ClientAddr);
     ClientSock := fpAccept(FPlainSocket, @ClientAddr, @AddrLen);
     if ClientSock = -1 then
+    begin
+      // An unexpected accept error (anything other than the socket having
+      // just been closed for shutdown, which the FStopping check above
+      // already handles) used to hit this in a tight loop with no wait,
+      // pegging a CPU core. Give the error a moment to clear.
+      if not FStopping then
+        Sleep(10);
       Continue;
+    end;
 
     FCriticalSection.Acquire;
     try
@@ -563,7 +622,14 @@ begin
     end;
     ConnThread.Start;
   end;
-  CloseSocket(FPlainSocket);
+  // Shutdown may have already closed FPlainSocket to unblock fpAccept above -
+  // guard against closing an already-closed (and possibly since-reused, on
+  // POSIX) descriptor a second time.
+  if FPlainSocket <> 0 then
+  begin
+    CloseSocket(FPlainSocket);
+    FPlainSocket := 0;
+  end;
 end;
 
 procedure TVDRX_SocketListenerExecutive.AcceptLoopTLS;
@@ -575,12 +641,21 @@ var
   ConnThread: TVDRX_ListenerConnThread;
 begin
   FTLSSocket := BindListenSocket(FTLSPort);
+  if FTLSSocket = -1 then
+  begin
+    FTLSSocket := 0;
+    Exit;
+  end;
   while not FStopping do
   begin
     AddrLen := SizeOf(ClientAddr);
     ClientSock := fpAccept(FTLSSocket, @ClientAddr, @AddrLen);
     if ClientSock = -1 then
+    begin
+      if not FStopping then
+        Sleep(10);
       Continue;
+    end;
 
     Transport := TVDRX_TLSTransport.Create(ClientSock, FTLSContext.Ctx);
     if not Transport.Handshook then
@@ -602,7 +677,11 @@ begin
     end;
     ConnThread.Start;
   end;
-  CloseSocket(FTLSSocket);
+  if FTLSSocket <> 0 then
+  begin
+    CloseSocket(FTLSSocket);
+    FTLSSocket := 0;
+  end;
 end;
 
 function TVDRX_SocketListenerExecutive.TLSActive: Boolean;
@@ -644,11 +723,21 @@ var
 begin
   FStopping := True;
 
-  // 1. Unblock accept loops
+  // 1. Unblock accept loops. Guard + zero each socket var so the accept
+  // loop's own closing code (AcceptLoopPlain/AcceptLoopTLS) won't also try
+  // to close it again once it wakes up from fpAccept - double-closing a fd
+  // on POSIX is dangerous once the number has been recycled for another
+  // thread's socket.
   if FPlainSocket <> 0 then
+  begin
     CloseSocket(FPlainSocket);
+    FPlainSocket := 0;
+  end;
   if FTLSSocket <> 0 then
+  begin
     CloseSocket(FTLSSocket);
+    FTLSSocket := 0;
+  end;
 
   // 2. Join accept threads (bounded - these should return almost immediately
   // once their listen socket is closed above).
@@ -1115,14 +1204,23 @@ begin
 
   Proc := TProcess.Create(nil);
   try
-    Proc.Executable := ARoute.Command;
+    if FileExists(ARoute.Command) then
+      Proc.Executable := ARoute.Command
+    else
+      Proc.Executable := ProcessFindInPath(ARoute.Command);
     Proc.Parameters.Add(ScriptPath);
     Proc.Environment.Add('REQUEST_METHOD=' + Method);
     Proc.Environment.Add('QUERY_STRING=' + QueryString);
     Proc.Environment.Add('REQUEST_URI=' + Path + IfThen(QueryString <> '', '?' + QueryString, ''));
     Proc.Environment.Add('CONTENT_TYPE=' + ExtractHeaderValue(HeaderBlock, 'Content-Type'));
     Proc.Environment.Add('CONTENT_LENGTH=' + ExtractHeaderValue(HeaderBlock, 'Content-Length'));
+    // poSearchPath: without it, ARoute.Command only works as an absolute
+    // path ("/usr/bin/php") - a bare command name like "php" from
+    // vdrx.conf would fail to launch on any system where it's only
+    // resolvable via the shell's PATH.
+    //Proc.Options := [poUsePipes, poStderrToOutPut, poSearchPath]; // poSearchPath not in process.TProcessOptions
     Proc.Options := [poUsePipes, poStderrToOutPut];
+
     Proc.CurrentDirectory := ARoute.ScriptDir;
     Proc.Execute;
 
@@ -1275,7 +1373,15 @@ constructor TWSConnThread.Create(AConn: TVDRX_WSConnection);
 begin
   inherited Create(True);
   FConn := AConn;
-  FreeOnTerminate := False;
+  // Natural (client-initiated) disconnects finish inside RunLoop by calling
+  // UnregisterSelf, which frees the owning TVDRX_WSConnection (and this
+  // thread's FConn along with it) while still running on this very thread.
+  // Nothing outside ever holds a reference to FThread to Free it in that
+  // path (see RunLoop), so this thread must clean up its own TThread object
+  // when it terminates or it leaks. Shutdown's forced-close path still works
+  // fine with this set True: it just stops calling FThread.Free itself
+  // (see TVDRX_WSConnection.Shutdown).
+  FreeOnTerminate := True;
 end;
 
 procedure TWSConnThread.Execute;
@@ -1296,7 +1402,18 @@ end;
 
 destructor TVDRX_WSConnection.Destroy;
 begin
-  // DEBUG TODO: Destroy should ensure FPingThread is terminated and joined/freed before freeing transport and synchronization primitives.
+  FStopping := True;
+  // Fallback cleanup: normally RunLoop already stops and frees FPingThread
+  // itself before calling UnregisterSelf (which is what drives us here), so
+  // this is a no-op on that path. But Destroy can also be reached via
+  // Shutdown's FMasterMap.Remove, so guard here too - freeing FTransport/
+  // FSendLock below while FPingThread's PingLoop might still be mid-SendFrame
+  // on another thread is the exact use-after-free this used to hit.
+  if Assigned(FPingThread) then
+  begin
+    WaitThreadOrTimeout(FPingThread, 500);
+    FreeAndNil(FPingThread);
+  end;
   FTransport.Free;
   FSendLock.Free;
   inherited Destroy;
@@ -1345,11 +1462,19 @@ begin
   Result := True;
 end;
 
+// Frames declaring a payload bigger than this are rejected outright rather
+// than trusting the client's stated 64-bit length as-is - without a cap, a
+// single malicious/buggy frame could claim an enormous length and force a
+// huge SetLength allocation before we've even read that much data.
+const
+  WS_MAX_FRAME_LEN = 64 * 1024 * 1024; // 64MB
+
 function TVDRX_WSConnection.ReadFrame(out APayload: string; out AOpcode: Byte): Boolean;
 var
   Hdr: array[0..1] of Byte;
   Ext: array[0..1] of Byte;
-  Len: Integer;
+  Ext8: array[0..7] of Byte;
+  Len: Int64;
   Mask: array[0..3] of Byte;
   Data: array of Byte;
   Received, i: Integer;
@@ -1363,22 +1488,39 @@ begin
   Len := LenByte;
   if LenByte = 126 then
   begin
-    FTransport.Read(Ext[0], 2);
+    if FTransport.Read(Ext[0], 2) <> 2 then Exit;
     Len := (Ext[0] shl 8) or Ext[1];
   end
   else if LenByte = 127 then
-    Exit;
+  begin
+    // 64-bit extended length (RFC 6455 5.2) - previously this branch just
+    // aborted and dropped the connection for any frame over 65,535 bytes.
+    if FTransport.Read(Ext8[0], 8) <> 8 then Exit;
+    Len := 0;
+    for i := 0 to 7 do
+      Len := (Len shl 8) or Ext8[i];
+    if (Len < 0) or (Len > WS_MAX_FRAME_LEN) then Exit; // oversized/malformed - drop rather than allocate
+  end;
   if (Hdr[1] and $80) <> 0 then
-    FTransport.Read(Mask[0], 4)
+  begin
+    if FTransport.Read(Mask[0], 4) <> 4 then Exit;
+  end
   else
     FillChar(Mask, SizeOf(Mask), 0);
-  SetLength(Data, Len);
+  SetLength(Data, Integer(Len));
   Received := 0;
   while Received < Len do
-    Inc(Received, FTransport.Read(Data[Received], Len - Received));
-  for i := 0 to Len - 1 do
+  begin
+    i := FTransport.Read(Data[Received], Integer(Len - Received));
+    if i <= 0 then Exit; // connection closed/errored mid-frame
+    Inc(Received, i);
+  end;
+  for i := 0 to Integer(Len) - 1 do
     Data[i] := Data[i] xor Mask[i mod 4];
-  SetString(APayload, PAnsiChar(@Data[0]), Len);
+  if Len > 0 then
+    SetString(APayload, PAnsiChar(@Data[0]), Integer(Len))
+  else
+    APayload := '';
   Result := True;
 end;
 
@@ -1512,9 +1654,24 @@ begin
     end;
   end;
 
+  // Stop and free FPingThread BEFORE UnregisterSelf below, which frees Self
+  // (FMasterMap has [doOwnsValues]). FPingThread's PingLoop touches FSendLock
+  // and FTransport on its own thread; freeing those out from under a still-
+  // running PingLoop was a real Access Violation. Setting FStopping here also
+  // makes PingLoop notice and exit on its own between iterations even without
+  // the join below.
+  FStopping := True;
+  if Assigned(FPingThread) then
+  begin
+    WaitThreadOrTimeout(FPingThread, 1000);
+    FreeAndNil(FPingThread);
+  end;
+
   Bus.Publish('log.info', 'ws ' + ID + ': disconnected', ID);
   Bus.Publish('sys.ws.disconnected', Format('{"id":%s}', [JSONString(ID)]), ID);
   FListener.Registry.UnregisterSelf(ID); // NOT Unregister - this is our own thread, see vdrx_core.pas's UnregisterSelf comment
+  // Self (and every field on it, including FTransport/FSendLock) is invalid
+  // from this point on - do not touch anything after the call above.
 end;
 
 // Sends a ping every PingIntervalMs and force-closes the transport if no
@@ -1569,13 +1726,12 @@ begin
   FTransport.Close;
   if Assigned(FThread) then
   begin
-    if WaitThreadOrTimeout(FThread, FListener.GracefulTimeoutMs) then
-    begin
-      FThread.Free;
-      FThread := nil;
-    end
-    else
-      Bus.Publish('log.warn', 'ws ' + ID + ': connection thread did not exit in time - abandoning it', ID);
+    // FThread now has FreeOnTerminate := True (see TWSConnThread.Create), so
+    // it frees itself when RunLoop returns - we must NOT call FThread.Free
+    // here too, or we'd double-free it. Just wait for it to finish, then
+    // drop our own now-dangling reference.
+    WaitThreadOrTimeout(FThread, FListener.GracefulTimeoutMs);
+    FThread := nil;
   end;
   if Assigned(FPingThread) then
   begin

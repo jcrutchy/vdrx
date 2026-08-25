@@ -284,3 +284,57 @@ the topic/JSON payload and act on it.
 - **IRC**: no longer part of this repo — see the standalone IRCD project
   (`hogircd`), which can be wired in as a `processes` entry like anything
   else once it's ready to be supervised that way
+
+~~
+
+Overview & Architecture
+
+VDRX is an asynchronous, message-driven Free Pascal daemon that acts as an
+application server, reverse proxy, process supervisor, and messaging bus.
+
+Key Units & Components
+
+1.  Kernel & Bus Core (vdrx_core.pas):
+
+      - TVDRX_Kernel & TVDRX_MessageQueue: Central message bus dispatcher.
+      - TVDRX_Registry: Thread-safe registry mapping executives to topic filters
+        with wildcard matching (*, >).
+      - TVDRX_Executive: Base class for all actors and services in the system.
+
+2.  Network & Web Services (vdrx_network.pas):
+
+      - TVDRX_SocketListenerExecutive: Base socket server supporting both plain
+        TCP and OpenSSL TLS transports.
+      - TVDRX_HTTPExecutive: Multi-site HTTP server handling static files,
+        reverse proxy routing (TVDRX_ProxyRoute), and CGI/CLI script execution
+        (TVDRX_CLIRoute).
+      - TVDRX_WebSocketExecutive & TVDRX_WSConnection: WebSocket server
+        supporting sub/unsub RPC over the bus, ping/pong heartbeats, and frame
+        handling.
+
+3.  Process Supervision (vdrx_bridge.pas, vdrx_procutil.pas):
+
+      - TVDRX_BridgeExecutive: Spawns and supervises external processes with
+        exponential backoff crash recovery, configurable restart policies
+        (always, on-failure, never), graceful shutdown signaling, and
+        bidirectional JSON/plain bus bridging.
+
+4.  Administration & Stdin (vdrx_admin.pas, vdrx_stdin.pas):
+
+      - Console command interface handling daemon commands: quit, restart,
+        reload, kill <pid|id>, killall [type], list, and history <bucket> [n].
+
+5.  Storage & Logging (vdrx_bucket.pas, vdrx_logger.pas):
+
+      - TVDRX_BucketExecutive: Append-only JSONL history persistence engine for
+        bus topics.
+      - TVDRX_LoggerExecutive: Bus-driven ANSI color console and file logger
+        (vdrx_daemon.log).
+
+6.  Configuration & Templating (vdrx_config.pas, vdrx_templates.pas):
+
+      - TVDRX_Config: Thread-safe, hot-reloadable JSON configuration reader
+        (vdrx.conf).
+      - TVDRX_TemplateStore: On-demand caching template engine supporting nested
+        recursion (@@child@@), settings ($$SETTING$$), constants (??CONST??),
+        loops (##loop:name##), and parameters (%%var%%).
