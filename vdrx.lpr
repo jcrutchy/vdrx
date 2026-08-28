@@ -93,6 +93,15 @@ begin
         WriteLn('  Skipping processes entry - needs at least id and command.');
         Continue;
       end;
+      // "enabled": false (default true) - skip standing this one up entirely,
+      // without having to delete/comment it out of the config. Checked here,
+      // same place as the id/command validation above, so a disabled entry
+      // costs nothing beyond this one string compare.
+      if (Row.Values['enabled'] = 'False') or (Row.Values['enabled'] = 'false') or (Row.Values['enabled'] = '0') then
+      begin
+        WriteLn('  Process "', Row.Values['id'], '": disabled (enabled=false) - skipping.');
+        Continue;
+      end;
       Bridge := TVDRX_BridgeExecutive.Create(Kernel.Queue);
       Bridge.Command := Row.Values['command'];
       // Most simple dev web servers (php -S included) don't respond to a
@@ -286,11 +295,102 @@ begin
   end;
 end;
 
+// Every entry in "socket_clients" gets its own TVDRX_SocketClientExecutive -
+// a supervised outbound TCP/TLS connection, the dialer counterpart to
+// SetupProcesses' spawned children. id/host/port are the only required
+// fields; everything else falls back to sane defaults (see
+// TVDRX_SocketClientExecutive.Create) exactly like SetupProcesses does for
+// "processes". "subscribe" uses the same comma-joined-filter convention as
+// "processes" - filters this instance's socket writes, not its own inbound
+// data (that always publishes to "<id>.out", unconditionally, same as
+// Bridge's stdout).
+procedure SetupSocketClients(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry;
+  AGracefulMs: Integer);
+var
+  Rows: TVDRX_ConfigRows;
+  Row: TStringList;
+  Client: TVDRX_SocketClientExecutive;
+  FramingRaw, ReconnectRaw: string;
+  Filters: TStringArray;
+  i: Integer;
+begin
+  Rows := AConfig.GetObjectArray('socket_clients');
+  try
+    for Row in Rows do
+    begin
+      if (Row.Values['id'] = '') or (Row.Values['host'] = '') or (Row.Values['port'] = '') then
+      begin
+        WriteLn('  Skipping socket_clients entry - needs at least id, host, and port.');
+        Continue;
+      end;
+      if (Row.Values['enabled'] = 'False') or (Row.Values['enabled'] = 'false') or (Row.Values['enabled'] = '0') then
+      begin
+        WriteLn('  Socket client "', Row.Values['id'], '": disabled (enabled=false) - skipping.');
+        Continue;
+      end;
+      Client := TVDRX_SocketClientExecutive.Create(Kernel.Queue);
+      Client.Host := Row.Values['host'];
+      Client.Port := Word(StrToIntDef(Row.Values['port'], 0));
+      Client.TLS := (Row.Values['tls'] = 'True') or (Row.Values['tls'] = 'true') or (Row.Values['tls'] = '1');
+      Client.TLSVerify := not ((Row.Values['tls_verify'] = 'False') or (Row.Values['tls_verify'] = 'false') or (Row.Values['tls_verify'] = '0'));
+      Client.TLSCAFile := Row.Values['tls_ca_file'];
+      Client.TLSPeerName := Row.Values['tls_peer_name'];
+      Client.GracefulTimeoutMs := StrToIntDef(Row.Values['graceful_timeout_ms'], AGracefulMs);
+
+      // "framing": "delimiter" (default) | "chunk" - see TVDRX_SocketClientExecutive
+      FramingRaw := Row.Values['framing'];
+      if FramingRaw = '' then FramingRaw := 'delimiter';
+      if (FramingRaw <> 'delimiter') and (FramingRaw <> 'chunk') then
+      begin
+        WriteLn('  Socket client "', Row.Values['id'], '": unrecognized framing "', FramingRaw, '" - using "delimiter".');
+        FramingRaw := 'delimiter';
+      end;
+      Client.Framing := FramingRaw;
+      Client.Delimiter := IfThen(Row.Values['delimiter'] <> '', Row.Values['delimiter'], #13#10);
+      Client.ChunkSize := StrToIntDef(Row.Values['chunk_size'], 4096);
+
+      // "reconnect": "auto" (default) | "none" - see TVDRX_SocketClientExecutive
+      ReconnectRaw := Row.Values['reconnect'];
+      if ReconnectRaw = '' then ReconnectRaw := 'auto';
+      if (ReconnectRaw <> 'auto') and (ReconnectRaw <> 'none') then
+      begin
+        WriteLn('  Socket client "', Row.Values['id'], '": unrecognized reconnect "', ReconnectRaw, '" - using "auto".');
+        ReconnectRaw := 'auto';
+      end;
+      Client.ReconnectPolicy := ReconnectRaw;
+      Client.ReconnectDelayMs := StrToIntDef(Row.Values['reconnect_delay_ms'], 500);
+      Client.MaxReconnectDelayMs := StrToIntDef(Row.Values['max_reconnect_delay_ms'], 30000);
+
+      if Row.Values['subscribe'] <> '' then
+      begin
+        Filters := SplitString(Row.Values['subscribe'], ',');
+        ARegistry.Register(Client, Row.Values['id'], Trim(Filters[0]));
+        for i := 1 to High(Filters) do
+          ARegistry.Register(Client, Row.Values['id'], Trim(Filters[i]));
+      end
+      else
+        ARegistry.Register(Client, Row.Values['id'], 'sys.none');
+
+      WriteLn('  Socket client "', Row.Values['id'], '": ', Row.Values['host'], ':', Client.Port,
+        IfThen(Client.TLS, ' (TLS, verify=' + BoolToStr(Client.TLSVerify, True) + ')', ''),
+        ', framing=', FramingRaw, ', reconnect=', ReconnectRaw);
+    end;
+  finally
+    Rows.Free;
+  end;
+end;
+
 begin
 
   try
     Kernel := TVDRX_Kernel.Create;
     Config := TVDRX_Config.Create('vdrx.conf');
+
+    // Must run before Registry.InitializeAll (Kernel.Start below) - any
+    // executive whose Initialize does a TLS handshake needs the right DLLs
+    // already pointed at before that call. See ApplyOpenSSLDLLOverrides'
+    // comment in vdrx_network.pas.
+    ApplyOpenSSLDLLOverrides(Config);
 
     ShutdownGraceMs := Config.GetInteger('shutdown_grace_ms', 5000);
 
@@ -328,6 +428,7 @@ begin
     end;
 
     SetupProcesses(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes);
+    SetupSocketClients(Config, Kernel.Registry, ShutdownGraceMs);
     SetupCLIBridges(Config, CLIRoutes);
     SetupBuckets(Config, Kernel.Registry);
 
@@ -382,3 +483,4 @@ begin
   end;
 
 end.
+

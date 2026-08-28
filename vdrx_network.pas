@@ -79,7 +79,16 @@ type
     FSSL: PSSL;
     FOK: Boolean;
   public
-    constructor Create(ASocket: TSocket; ACtx: PSSL_CTX);
+    // Server role (accept side) - unchanged from before.
+    constructor Create(ASocket: TSocket; ACtx: PSSL_CTX); overload;
+    // Client role (connect side) - SslConnect instead of SslAccept, plus SNI
+    // (SSL_CTRL_SET_TLSEXT_HOSTNAME via SslCtrl - FPC's openssl unit has no
+    // higher-level wrapper for this) so name-based virtual hosting on the
+    // remote end works. AHostname drives SNI only; whether the resulting
+    // cert is actually checked against it is governed by ACtx's own
+    // verify-mode (see TVDRX_TLSClientContext) - this constructor doesn't
+    // duplicate that decision.
+    constructor Create(ASocket: TSocket; ACtx: PSSL_CTX; const AHostname: string); overload;
     destructor Destroy; override;
     property Handshook: Boolean read FOK; // caller checks this and drops the connection if False
     function Read(var ABuf; ALen: Integer): Integer; override;
@@ -98,6 +107,32 @@ type
     FOK: Boolean;
   public
     constructor Create(const ACertFile, AKeyFile: string);
+    destructor Destroy; override;
+    property OK: Boolean read FOK;
+    property Ctx: PSSL_CTX read FCtx;
+  end;
+
+  // Client-role counterpart to TVDRX_TLSContext - no cert/key to load (we're
+  // not presenting one), instead configures whether/how the REMOTE peer's
+  // cert gets checked. AVerifyPeer=False (SSL_VERIFY_NONE) means TLS
+  // encrypts the link but authenticates nobody - fine for quick testing
+  // against a self-signed dev server, not fine for anything talking to the
+  // open internet (see the MITM discussion in session notes). AVerifyPeer=
+  // True with no ACAFile relies on whatever default paths FPC's openssl
+  // unit's underlying libssl was built with - on Windows (which has no
+  // system-wide CA bundle location the way most Linux distros do) that
+  // usually means nothing is found and every handshake fails outright, so
+  // supplying a real ACAFile is effectively mandatory there - see
+  // ApplyOpenSSLDLLOverrides's unit comment for the parallel DLL-location
+  // problem. FOK reflects only "was the context itself constructable" -
+  // whether verification succeeds is a per-handshake outcome, checked via
+  // TVDRX_TLSTransport.Handshook after Create.
+  TVDRX_TLSClientContext = class
+  private
+    FCtx: PSSL_CTX;
+    FOK: Boolean;
+  public
+    constructor Create(const ACAFile: string; AVerifyPeer: Boolean);
     destructor Destroy; override;
     property OK: Boolean read FOK;
     property Ctx: PSSL_CTX read FCtx;
@@ -271,6 +306,75 @@ type
     property PongTimeoutMs: Integer read FPongTimeoutMs write FPongTimeoutMs;
   end;
 
+  // Generic outbound socket client - the dialer counterpart to
+  // TVDRX_SocketListenerExecutive's accept side. Deliberately protocol-blind:
+  // it moves bytes/lines between one remote TCP/TLS connection and the bus,
+  // publishing to "<ID>.out" and writing whatever this executive is
+  // registered to receive straight to the socket (see HandlePacket) -
+  // exactly mirroring TVDRX_BridgeExecutive's "<ID>.out"/stdin convention,
+  // so a bus consumer can't tell an IRC-over-TLS socket client from a
+  // bridged PHP process. All actual protocol handling (IRC's NICK/USER,
+  // PING/PONG, etc.) lives entirely in whatever's subscribed to this
+  // executive's output - same "VDRX owns the wire, something else owns the
+  // protocol" split as Bridge, just for a connection VDRX dials itself
+  // instead of one it spawns.
+  //
+  // Framing is deliberately limited to two modes rather than an open-ended
+  // plugin system - see session notes for why: line-oriented protocols
+  // (IRC, SMTP, ...) and raw byte-chunk protocols cover every case actually
+  // in front of this, and a fancier scheme (length-prefixed, etc.) is easy
+  // to add later against a second real use case rather than guessed at now.
+  // Reading is deliberately more lenient than writing in delimiter mode -
+  // see ReaderLoop.
+  TVDRX_SocketClientExecutive = class(TVDRX_Executive)
+  private
+    FHost: string;
+    FPort: Word;
+    FTLS: Boolean;
+    FTLSVerify: Boolean;
+    FTLSCAFile: string;
+    FTLSPeerName: string; // SNI hostname; falls back to FHost if left blank
+    FFraming: string;     // 'delimiter' (default) | 'chunk'
+    FDelimiter: string;   // write-side terminator; default #13#10
+    FChunkSize: Integer;  // used when FFraming = 'chunk'
+    FReconnectPolicy: string; // 'auto' (default, backoff-retry) | 'none' (dial once, stay down)
+    FReconnectDelayMs, FMaxReconnectDelayMs: Integer;
+    FGracefulTimeoutMs: Integer;
+
+    FTransport: TVDRX_Transport;
+    FTransportLock: TCriticalSection;
+    FConnected: Boolean; // reader loop's substitute for "process still running" -
+                          // there's no exit code for a dropped socket, just
+                          // "the last Read failed"
+    FReaderThread: TThread;
+    FMonitorThread: TThread;
+    FStopping: Boolean;
+
+    procedure DoConnect;
+    procedure DoDisconnect;
+    procedure ReaderLoop;
+    procedure MonitorLoop;
+  public
+    constructor Create(ABus: TVDRX_MessageQueue); override;
+    destructor Destroy; override;
+    property Host: string read FHost write FHost;
+    property Port: Word read FPort write FPort;
+    property TLS: Boolean read FTLS write FTLS;
+    property TLSVerify: Boolean read FTLSVerify write FTLSVerify;
+    property TLSCAFile: string read FTLSCAFile write FTLSCAFile;
+    property TLSPeerName: string read FTLSPeerName write FTLSPeerName;
+    property Framing: string read FFraming write FFraming;
+    property Delimiter: string read FDelimiter write FDelimiter;
+    property ChunkSize: Integer read FChunkSize write FChunkSize;
+    property ReconnectPolicy: string read FReconnectPolicy write FReconnectPolicy;
+    property ReconnectDelayMs: Integer read FReconnectDelayMs write FReconnectDelayMs;
+    property MaxReconnectDelayMs: Integer read FMaxReconnectDelayMs write FMaxReconnectDelayMs;
+    property GracefulTimeoutMs: Integer read FGracefulTimeoutMs write FGracefulTimeoutMs;
+    procedure Initialize; override;
+    procedure Shutdown; override;
+    procedure HandlePacket(const AMsg: TVDRX_Message); override;
+  end;
+
 const
   MAX_HEADER_SIZE = 16384;
   MAX_BODY_SIZE = 10 * 1024 * 1024; // generous for dev/test form posts - not meant for large uploads
@@ -283,6 +387,27 @@ const
 // talks TLS as a CLIENT, which is fine since backends are loopback-only by
 // design (see vdrx_http.pas's ProxyRequest).
 function ConnectTCP(const AHost: string; APort: Word): TVDRX_Transport;
+
+// Same as ConnectTCP, but resolves AHost via DNS (resolve.THostResolver)
+// when it isn't a bare IPv4 literal - for TVDRX_SocketClientExecutive
+// dialing an arbitrary remote host, unlike ConnectTCP's loopback-only
+// backends. Still IPv4/AF_INET only (matches the rest of this codebase).
+// Returns nil on either resolution or connect failure - no exception, same
+// contract as ConnectTCP.
+function ConnectTCPHost(const AHost: string; APort: Word): TVDRX_Transport;
+
+// Reads tls_ssl_dll/tls_crypto_dll (top-level config keys) and, if either
+// is set, assigns them to FPC's openssl unit's DLLSSLName/DLLUtilName
+// globals before anything calls into it - see vdrx.lpr for call site (must
+// run before Registry.InitializeAll, i.e. before any TLS-using executive's
+// Initialize). Windows-only: Linux distros almost always have libssl
+// discoverable via the unversioned name already (see hogircd's
+// libssl-dev-vs-libssl3 note); Windows has no equivalent system-wide
+// location, which is the actual problem this solves (see session notes -
+// bot.lpr's "Could not initialize OpenSSL library" against OpenSSL 4.x).
+// A no-op with nothing configured, so existing Linux-only deployments are
+// unaffected either way.
+procedure ApplyOpenSSLDLLOverrides(AConfig: TVDRX_Config);
 
 implementation
 
@@ -371,6 +496,79 @@ begin
   Result := TVDRX_PlainTransport.Create(Sock);
 end;
 
+// Shared by ConnectTCPHost (below) and TVDRX_SocketClientExecutive.DoConnect
+// - the TLS path needs the raw connected TSocket (to wrap in
+// TVDRX_TLSTransport itself), not a TVDRX_Transport already wrapping one, so
+// this is the one place the actual resolve+connect happens and both callers
+// build on it instead of duplicating it.
+function ConnectRawSocket(const AHost: string; APort: Word; out ASocket: TSocket): Boolean;
+var
+  Addr: TInetSockAddr;
+  IPBytes: Cardinal;
+  Resolver: THostResolver;
+  NetAddr: THostAddr;
+begin
+  Result := False;
+  ASocket := -1;
+  if not ParseIPv4(AHost, IPBytes) then
+  begin
+    // Not a bare dotted-quad - resolve it. THostResolver wraps the
+    // platform's own resolver (getaddrinfo/gethostbyname under the hood),
+    // so this works the same on Windows and Unix without any extra
+    // platform-specific code here.
+    Resolver := THostResolver.Create(nil);
+    try
+      if not Resolver.NameLookup(AHost) then Exit; // resolution failed - no such host, or no network
+      NetAddr := Resolver.NetHostAddress; // already network-byte-order (in_addr) - matches sin_addr directly
+      Move(NetAddr, IPBytes, SizeOf(IPBytes));
+    finally
+      Resolver.Free;
+    end;
+  end;
+  ASocket := fpSocket(AF_INET, SOCK_STREAM, 0);
+  if ASocket < 0 then Exit;
+  FillChar(Addr, SizeOf(Addr), 0);
+  Addr.sin_family := AF_INET;
+  Addr.sin_port := htons(APort);
+  Move(IPBytes, Addr.sin_addr, SizeOf(Addr.sin_addr));
+  if fpConnect(ASocket, @Addr, SizeOf(Addr)) <> 0 then
+  begin
+    CloseSocket(ASocket);
+    ASocket := -1;
+    Exit;
+  end;
+  Result := True;
+end;
+
+function ConnectTCPHost(const AHost: string; APort: Word): TVDRX_Transport;
+var
+  Sock: TSocket;
+begin
+  Result := nil;
+  if not ConnectRawSocket(AHost, APort, Sock) then Exit;
+  Result := TVDRX_PlainTransport.Create(Sock);
+end;
+
+// See this function's interface comment for the general shape. Only
+// Windows actually needs the override - Linux almost always finds libssl
+// via the unversioned name once libssl-dev's symlink is present (see the
+// hogircd session notes), so on Unix this is a documented no-op even if
+// tls_ssl_dll/tls_crypto_dll happen to be set in a config shared across
+// platforms.
+procedure ApplyOpenSSLDLLOverrides(AConfig: TVDRX_Config);
+{$IFDEF WINDOWS}
+var
+  SSLDll, CryptoDll: string;
+{$ENDIF}
+begin
+  {$IFDEF WINDOWS}
+  SSLDll := AConfig.GetString('tls_ssl_dll', '');
+  CryptoDll := AConfig.GetString('tls_crypto_dll', '');
+  if SSLDll <> '' then DLLSSLName := SSLDll;
+  if CryptoDll <> '' then DLLUtilName := CryptoDll;
+  {$ENDIF}
+end;
+
 { TVDRX_PlainTransport }
 
 constructor TVDRX_PlainTransport.Create(ASocket: TSocket);
@@ -422,6 +620,22 @@ begin
   FSSL := SslNew(ACtx);
   SslSetFd(FSSL, FSocket);
   FOK := Assigned(FSSL) and (SslAccept(FSSL) = 1); // blocking - fine, runs on this connection's own thread
+end;
+
+constructor TVDRX_TLSTransport.Create(ASocket: TSocket; ACtx: PSSL_CTX; const AHostname: string);
+begin
+  inherited Create;
+  FSocket := ASocket;
+  if not Assigned(ACtx) then Exit; // FOK stays False (default) - see this constructor's interface comment; guards against SslSetFd(nil, ...) below, which segfaults in native OpenSSL with no nil-check of its own
+  FSSL := SslNew(ACtx);
+  if not Assigned(FSSL) then Exit;
+  SslSetFd(FSSL, FSocket);
+  if AHostname <> '' then
+    // SNI - FPC's openssl unit has no SslSetTlsExtHostName wrapper, so this
+    // goes through the generic SslCtrl the same way the C
+    // SSL_set_tlsext_host_name() macro does.
+    SslCtrl(FSSL, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, PChar(AHostname));
+  FOK := (SslConnect(FSSL) = 1); // blocking - runs on this connection's own thread, same as the server-role constructor above
 end;
 
 destructor TVDRX_TLSTransport.Destroy;
@@ -482,6 +696,41 @@ begin
 end;
 
 destructor TVDRX_TLSContext.Destroy;
+begin
+  if Assigned(FCtx) then
+    SslCtxFree(FCtx);
+  inherited Destroy;
+end;
+
+{ TVDRX_TLSClientContext }
+
+constructor TVDRX_TLSClientContext.Create(const ACAFile: string; AVerifyPeer: Boolean);
+begin
+  inherited Create;
+  FCtx := SslCtxNew(SslTLSMethod); // same version-negotiating method as the server context - see its comment
+  FOK := Assigned(FCtx);
+  if not FOK then Exit;
+  if AVerifyPeer then
+  begin
+    SslCtxSetVerify(FCtx, SSL_VERIFY_PEER, nil);
+    if ACAFile <> '' then
+      FOK := (SslCtxLoadVerifyLocations(FCtx, ACAFile, '') = 1)
+    {$IFDEF UNIX}
+    // No CA file configured - fall back to the common Debian/Ubuntu/RHEL
+    // bundle location most Linux systems already have, rather than silently
+    // failing every handshake. Windows has no equivalent well-known path -
+    // ACAFile is effectively mandatory there (see this class's interface
+    // comment) - so no fallback attempt is made under {$IFDEF WINDOWS}.
+    else if FileExists('/etc/ssl/certs/ca-certificates.crt') then
+      FOK := (SslCtxLoadVerifyLocations(FCtx, '/etc/ssl/certs/ca-certificates.crt', '') = 1)
+    {$ENDIF}
+    ;
+  end
+  else
+    SslCtxSetVerify(FCtx, SSL_VERIFY_NONE, nil);
+end;
+
+destructor TVDRX_TLSClientContext.Destroy;
 begin
   if Assigned(FCtx) then
     SslCtxFree(FCtx);
@@ -1891,4 +2140,285 @@ begin
   end;
 end;
 
+{ TVDRX_SocketClientExecutive }
+
+constructor TVDRX_SocketClientExecutive.Create(ABus: TVDRX_MessageQueue);
+begin
+  inherited Create(ABus);
+  FTransportLock := TCriticalSection.Create;
+  FPort := 0;
+  FTLS := False;
+  FTLSVerify := True;
+  FFraming := 'delimiter';
+  FDelimiter := #13#10;
+  FChunkSize := 4096;
+  FReconnectPolicy := 'auto';
+  FReconnectDelayMs := 500;
+  FMaxReconnectDelayMs := 30000;
+  FGracefulTimeoutMs := 5000;
+  FStopping := False;
+  FConnected := False;
+end;
+
+destructor TVDRX_SocketClientExecutive.Destroy;
+begin
+  FTransportLock.Free;
+  inherited Destroy;
+end;
+
+// Dials out and, on success, starts the reader thread. Does NOT retry on
+// its own - MonitorLoop owns retry/backoff decisions, same division of
+// labour as Bridge's StartProcess/MonitorLoop split.
+procedure TVDRX_SocketClientExecutive.DoConnect;
+var
+  Sock: TSocket;
+  Ctx: TVDRX_TLSClientContext;
+  Transport: TVDRX_Transport;
+  PeerName: string;
+begin
+  Bus.Publish('log.info', Format('%s: (re)connecting to %s:%d ...', [ID, FHost, FPort]), ID);
+  if not ConnectRawSocket(FHost, FPort, Sock) then
+  begin
+    Bus.Publish('log.warn', Format('%s: connect to %s:%d failed', [ID, FHost, FPort]), ID);
+    Exit;
+  end;
+
+  if FTLS then
+  begin
+    PeerName := IfThen(FTLSPeerName <> '', FTLSPeerName, FHost);
+    Ctx := TVDRX_TLSClientContext.Create(FTLSCAFile, FTLSVerify);
+    try
+      if not Ctx.OK then
+      begin
+        Bus.Publish('log.warn', Format('%s: TLS context setup failed for %s:%d (libssl not loadable, or CA file "%s" could not be loaded) - not connecting',
+          [ID, FHost, FPort, FTLSCAFile]), ID);
+        CloseSocket(Sock);
+        Exit;
+      end;
+      Transport := TVDRX_TLSTransport.Create(Sock, Ctx.Ctx, PeerName);
+      if not TVDRX_TLSTransport(Transport).Handshook then
+      begin
+        Bus.Publish('log.warn', Format('%s: TLS handshake to %s:%d failed (verify_peer=%s, ca_file="%s")',
+          [ID, FHost, FPort, BoolToStr(FTLSVerify, True), FTLSCAFile]), ID);
+        Transport.Close;
+        Transport.Free;
+        Exit;
+      end;
+    finally
+      Ctx.Free;
+    end;
+  end
+  else
+    Transport := TVDRX_PlainTransport.Create(Sock);
+
+  FTransportLock.Enter;
+  try
+    FTransport := Transport;
+    FConnected := True;
+  finally
+    FTransportLock.Leave;
+  end;
+
+  Bus.Publish('log.info', Format('%s: connected to %s:%d%s', [ID, FHost, FPort, IfThen(FTLS, ' (TLS)', '')]), ID);
+  FReaderThread := TVDRX_WorkerThread.Create(@ReaderLoop);
+  FReaderThread.FreeOnTerminate := False;
+  FReaderThread.Start;
+end;
+
+// Same close-to-unblock idiom used throughout this unit (Shutdown on the
+// listener side, PingLoop on the WS side) - closing FTransport unblocks
+// ReaderLoop's blocking Read on its own thread, so the normal "read
+// returned <=0" cleanup path in ReaderLoop runs exactly as it would for a
+// genuine remote disconnect, no special-casing needed here.
+procedure TVDRX_SocketClientExecutive.DoDisconnect;
+var
+  Transport: TVDRX_Transport;
+  ReaderThread: TThread;
+begin
+  FTransportLock.Enter;
+  try
+    Transport := FTransport;
+    FTransport := nil;
+    FConnected := False;
+    ReaderThread := FReaderThread;
+    FReaderThread := nil;
+  finally
+    FTransportLock.Leave;
+  end;
+
+  if Assigned(Transport) then
+  begin
+    Transport.Close;
+    if WaitThreadOrTimeout(ReaderThread, FGracefulTimeoutMs) then
+    begin
+      if Assigned(ReaderThread) then ReaderThread.Free;
+    end
+    else
+      Bus.Publish('log.warn', ID + ': reader thread did not exit in time - abandoning it', ID);
+    Transport.Free;
+  end;
+end;
+
+// Reads in chunks and frames per FFraming, publishing each complete
+// message to "<ID>.out". Delimiter mode splits on LINE FEED and silently
+// drops any immediately-preceding CR - so both bare \n and \r\n on the wire
+// parse identically, regardless of what FDelimiter (write-side only) is set
+// to. This mirrors TVDRX_BridgeExecutive.ReaderLoop's existing #13/#10
+// handling exactly, not a new behaviour invented for this class.
+procedure TVDRX_SocketClientExecutive.ReaderLoop;
+const
+  BufSize = 4096;
+var
+  Buf: array[0..BufSize - 1] of Byte;
+  Received, i: Integer;
+  LineBuf, Line: string;
+  Ch: Char;
+  Transport: TVDRX_Transport;
+  ChunkBuf: string;
+begin
+  LineBuf := '';
+  while not FStopping do
+  begin
+    FTransportLock.Enter;
+    Transport := FTransport;
+    FTransportLock.Leave;
+    if not Assigned(Transport) then Break;
+
+    if FFraming = 'chunk' then
+    begin
+      SetLength(ChunkBuf, FChunkSize);
+      Received := Transport.Read(ChunkBuf[1], FChunkSize);
+      if Received > 0 then
+        Bus.Publish(ID + '.out', Copy(ChunkBuf, 1, Received), ID)
+      else
+      begin
+        FTransportLock.Enter;
+        FConnected := False;
+        FTransportLock.Leave;
+        Break;
+      end;
+    end
+    else
+    begin
+      Received := Transport.Read(Buf, SizeOf(Buf));
+      if Received > 0 then
+      begin
+        for i := 0 to Received - 1 do
+        begin
+          Ch := Chr(Buf[i]);
+          if Ch = #10 then
+          begin
+            Line := LineBuf;
+            LineBuf := '';
+            if Line <> '' then
+              Bus.Publish(ID + '.out', Line, ID);
+          end
+          else if Ch <> #13 then
+            LineBuf := LineBuf + Ch;
+        end;
+      end
+      else
+      begin
+        FTransportLock.Enter;
+        FConnected := False;
+        FTransportLock.Leave;
+        Break;
+      end;
+    end;
+  end;
+end;
+
+// Watches FConnected and applies FReconnectPolicy - the direct counterpart
+// to TVDRX_BridgeExecutive.MonitorLoop, same 500ms-doubling-to-30000ms
+// backoff shape, reset to FReconnectDelayMs's starting value after a clean
+// (re)connect. There's no exit-code distinction to make here the way
+// Bridge's 'on-failure' has (a dropped socket doesn't carry one), so this
+// only supports the two policies actually asked for.
+procedure TVDRX_SocketClientExecutive.MonitorLoop;
+var
+  StillConnected: Boolean;
+  StartDelayMs: Integer;
+begin
+  StartDelayMs := FReconnectDelayMs;
+  while not FStopping do
+  begin
+    Sleep(1000);
+    if FStopping then Break;
+
+    FTransportLock.Enter;
+    StillConnected := FConnected;
+    FTransportLock.Leave;
+
+    if (not StillConnected) and (not FStopping) then
+    begin
+      DoDisconnect; // clears FTransport/FReaderThread even if ReaderLoop already exited on its own
+
+      if FReconnectPolicy = 'none' then
+      begin
+        Bus.Publish('log.info', Format('%s: disconnected, reconnect policy "none" - leaving it down', [ID]), ID);
+        Exit;
+      end;
+
+      Sleep(FReconnectDelayMs);
+      if FReconnectDelayMs < FMaxReconnectDelayMs then
+        FReconnectDelayMs := FReconnectDelayMs * 2; // exponential backoff on a reconnect loop
+      if not FStopping then
+      begin
+        DoConnect;
+        FReconnectDelayMs := StartDelayMs; // reset after a clean (re)connect attempt
+      end;
+    end;
+  end;
+end;
+
+procedure TVDRX_SocketClientExecutive.Initialize;
+begin
+  FStopping := False;
+  DoConnect;
+  FMonitorThread := TVDRX_WorkerThread.Create(@MonitorLoop);
+  FMonitorThread.FreeOnTerminate := False;
+  FMonitorThread.Start;
+end;
+
+procedure TVDRX_SocketClientExecutive.Shutdown;
+begin
+  FStopping := True;
+  DoDisconnect;
+  if Assigned(FMonitorThread) then
+  begin
+    if WaitThreadOrTimeout(FMonitorThread, FGracefulTimeoutMs) then
+      FMonitorThread.Free
+    else
+      Bus.Publish('log.warn', ID + ': monitor thread did not exit in time - abandoning it', ID);
+    FMonitorThread := nil;
+  end;
+end;
+
+// Writes AMsg.Payload straight to the socket, framed per FFraming - NOT
+// JSON-wrapped the way Bridge's stdin protocol is, because the payload IS
+// the wire protocol here (an IRC line, an SMTP command, ...), not an
+// envelope around one. Which messages even reach this executive at all is
+// governed entirely by its Registry subscription filter(s), set up
+// alongside every other config-driven executive in vdrx.lpr - this method
+// doesn't re-check the topic itself.
+procedure TVDRX_SocketClientExecutive.HandlePacket(const AMsg: TVDRX_Message);
+var
+  Transport: TVDRX_Transport;
+  OutStr: string;
+begin
+  FTransportLock.Enter;
+  Transport := FTransport;
+  FTransportLock.Leave;
+  if not Assigned(Transport) then Exit; // not currently connected - message is dropped, not queued
+
+  if FFraming = 'chunk' then
+    OutStr := AMsg.Payload
+  else
+    OutStr := AMsg.Payload + FDelimiter;
+
+  if Length(OutStr) > 0 then
+    Transport.Write(OutStr[1], Length(OutStr));
+end;
+
 end.
+
