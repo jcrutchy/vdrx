@@ -112,7 +112,15 @@ while (($rawLine = fgets(STDIN)) !== false) {
         continue;
     }
 
-    $msg = json_decode($rawLine, true);
+    // JSON_INVALID_UTF8_SUBSTITUTE: IRC has never mandated a text encoding
+    // - a stray non-UTF-8 byte (a Windows-1252 smart quote from a services
+    // bot is a common real example) is normal, expected traffic, not
+    // malformed input. Without this flag, json_decode() fails the ENTIRE
+    // line with a silent null on a single bad byte, even though the
+    // surrounding JSON is syntactically well-formed - losing the whole
+    // message over one character. This substitutes U+FFFD for the bad
+    // byte(s) and decodes everything else normally instead.
+    $msg = json_decode($rawLine, true, 512, JSON_INVALID_UTF8_SUBSTITUTE);
     if (!is_array($msg) || !isset($msg['topic'], $msg['payload'])) {
         // Not a structured bus message - shouldn't happen given bridge's
         // own input format, but don't crash the daemon over a malformed line.
