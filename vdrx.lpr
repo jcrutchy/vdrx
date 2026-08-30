@@ -202,7 +202,7 @@ begin
         IfThen(Row.Values['template_dir'] <> '', Row.Values['template_dir'], 'templates'));
       Site.HTTP := TVDRX_HTTPExecutive.Create(Kernel.Queue, AConfig, Site.Templates,
         IfThen(Row.Values['static_dir'] <> '', Row.Values['static_dir'], 'static'),
-        AProxyRoutes, ACLIRoutes);
+        AProxyRoutes, ACLIRoutes, ARegistry);
       Site.HTTP.Port := StrToIntDef(Row.Values['port'], 8081);
       Site.HTTP.GracefulTimeoutMs := AGracefulMs;
 
@@ -217,22 +217,23 @@ begin
       Result[n] := Site;
 
       WriteLn('  HTTP site "', Site.ID, '": port ', Site.HTTP.Port,
-        ', static="', Row.Values['static_dir'], '", templates="', Row.Values['template_dir'], '"');
+        ', static="', ExpandFileName(IfThen(Row.Values['static_dir'] <> '', Row.Values['static_dir'], 'static')),
+        '", templates="', Site.Templates.Dir, '"');
     end;
   finally
     Rows.Free;
   end;
 end;
 
-// "protocol": "cgi" (default) | "bus" - see TVDRX_CLIRoute's comment in
-// vdrx_network.pas for the full contract difference. 'cgi' keeps the
-// original required fields (script_dir is where per-path script files are
-// resolved from). 'bus' only needs id/prefix/command - script_dir becomes
-// optional (just sets the process's working directory) since there's no
-// per-path file lookup: Command is the one fixed script that handles
-// everything under Prefix, and Prefix itself behaves as a URL-rewrite base
-// rather than a filesystem root - see RunBusCLIScript's sub_path/query
-// passthrough.
+// "protocol": "cgi" (default) | "bus" | "bus-daemon" - see TVDRX_CLIRoute's
+// comment in vdrx_network.pas for the full contract differences.
+//   'cgi'        - needs id/prefix/command/script_dir (original behaviour).
+//   'bus'        - needs id/prefix/command; script_dir optional (just sets
+//                  the spawned process's CWD, defaults to '.').
+//   'bus-daemon' - needs id/prefix/in_topic; command/script_dir are unused
+//                  (nothing is spawned - requests are published to in_topic
+//                  for whatever's already subscribed there, typically a
+//                  persistent `processes` entry, to answer).
 procedure SetupCLIBridges(AConfig: TVDRX_Config; out ARoutes: TVDRX_CLIRoutes);
 var
   Rows: TVDRX_ConfigRows;
@@ -245,17 +246,28 @@ begin
   try
     for Row in Rows do
     begin
-      if (Row.Values['id'] = '') or (Row.Values['command'] = '') or (Row.Values['prefix'] = '') then
+      if (Row.Values['id'] = '') or (Row.Values['prefix'] = '') then
       begin
-        WriteLn('  Skipping cli_bridges entry - needs at least id, prefix, and command.');
+        WriteLn('  Skipping cli_bridges entry - needs at least id and prefix.');
         Continue;
       end;
 
       Protocol := LowerCase(IfThen(Row.Values['protocol'] <> '', Row.Values['protocol'], 'cgi'));
-      if (Protocol <> 'cgi') and (Protocol <> 'bus') then
+      if (Protocol <> 'cgi') and (Protocol <> 'bus') and (Protocol <> 'bus-daemon') then
       begin
         WriteLn('  cli_bridges entry "', Row.Values['id'], '": unrecognized protocol "', Protocol, '" - using "cgi".');
         Protocol := 'cgi';
+      end;
+
+      if (Protocol = 'bus-daemon') and (Row.Values['in_topic'] = '') then
+      begin
+        WriteLn('  Skipping cli_bridges entry "', Row.Values['id'], '" - protocol "bus-daemon" also needs in_topic.');
+        Continue;
+      end;
+      if (Protocol <> 'bus-daemon') and (Row.Values['command'] = '') then
+      begin
+        WriteLn('  Skipping cli_bridges entry "', Row.Values['id'], '" - protocol "', Protocol, '" also needs command.');
+        Continue;
       end;
       if (Protocol = 'cgi') and (Row.Values['script_dir'] = '') then
       begin
@@ -267,27 +279,71 @@ begin
       SetLength(ARoutes, n + 1);
       ARoutes[n].Prefix := Row.Values['prefix'];
       ARoutes[n].Command := Row.Values['command'];
-      ARoutes[n].ScriptDir := Row.Values['script_dir']; // optional for 'bus' - RunBusCLIScript falls back to '.'
+      ARoutes[n].ScriptDir := Row.Values['script_dir']; // optional for 'bus' - RunBusCLIScript falls back to '.'; unused for 'bus-daemon'
       ARoutes[n].TimeoutMs := StrToIntDef(Row.Values['timeout_ms'], 5000);
       ARoutes[n].ContentType := IfThen(Row.Values['content_type'] <> '', Row.Values['content_type'], 'text/html');
       ARoutes[n].Protocol := Protocol;
+      ARoutes[n].InTopic := Row.Values['in_topic'];
 
-      if Protocol = 'bus' then
-        WriteLn('  CLI bridge "', Row.Values['id'], '" (bus): ', ARoutes[n].Prefix, ' -> ',
-          ARoutes[n].Command, ' (timeout_ms=', ARoutes[n].TimeoutMs, ')')
+      case Protocol of
+        'bus':
+          WriteLn('  CLI bridge "', Row.Values['id'], '" (bus): ', ARoutes[n].Prefix, ' -> ',
+            ARoutes[n].Command, ' [cwd=', ExpandFileName(IfThen(ARoutes[n].ScriptDir <> '', ARoutes[n].ScriptDir, GetCurrentDir)),
+            '] (timeout_ms=', ARoutes[n].TimeoutMs, ')');
+        'bus-daemon':
+          WriteLn('  CLI bridge "', Row.Values['id'], '" (bus-daemon): ', ARoutes[n].Prefix, ' -> in_topic="',
+            ARoutes[n].InTopic, '" (timeout_ms=', ARoutes[n].TimeoutMs, ')');
       else
         WriteLn('  CLI bridge "', Row.Values['id'], '" (cgi): ', ARoutes[n].Prefix, ' -> ',
-          ARoutes[n].Command, ' ', ARoutes[n].ScriptDir, '/* (timeout_ms=', ARoutes[n].TimeoutMs, ')');
+          ARoutes[n].Command, ' ', ExpandFileName(ARoutes[n].ScriptDir), '/* (timeout_ms=', ARoutes[n].TimeoutMs, ')');
+      end;
     end;
   finally
     Rows.Free;
   end;
 end;
 
-// One TVDRX_BucketExecutive per "buckets" config entry, registered on
-// whatever topic filter(s) it declares - same comma-joined-array pattern as
-// "processes"' subscribe field. Every matching message gets appended to
-// that bucket's own history file (default bucket_<name>.jsonl, override with
+// One TVDRX_TemplateExecutive per "templates" config entry, registered on
+// whatever "subscribe" filter it declares (same comma/array-joined pattern
+// GetObjectArray already flattens everywhere else - "processes"' subscribe,
+// "buckets"' topics). Each entry owns its own TVDRX_TemplateStore rooted at
+// "dir" - completely independent of any http_sites entry's own
+// template_dir, which is the point: a bus-CLI reply's "template_topic"
+// names one of THESE explicitly, rather than implicitly inheriting whatever
+// HTTP site's connection happened to answer the request - see
+// BuildBusCLIResponse's comment in vdrx_network.pas.
+//
+//   { "id": "admin_templates", "dir": "templates", "subscribe": "template.admin.render" }
+//
+// Deliberately not tied to http_sites at all in config - an included app's
+// own config (see the "includes" mechanism) can define its own template
+// executive alongside its own cli_bridges routes, with no coordination
+// needed with vdrx.conf's own http_sites beyond agreeing on a topic name.
+procedure SetupTemplateExecutives(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry);
+var
+  Rows: TVDRX_ConfigRows;
+  Row: TStringList;
+  Store: TVDRX_TemplateStore;
+  Exec: TVDRX_TemplateExecutive;
+begin
+  Rows := AConfig.GetObjectArray('templates');
+  try
+    for Row in Rows do
+    begin
+      if (Row.Values['id'] = '') or (Row.Values['dir'] = '') or (Row.Values['subscribe'] = '') then
+      begin
+        WriteLn('  Skipping templates entry - needs at least id, dir, and subscribe.');
+        Continue;
+      end;
+      Store := TVDRX_TemplateStore.Create(AConfig, Row.Values['dir']);
+      Exec := TVDRX_TemplateExecutive.Create(Kernel.Queue, Store); // owns Store - see TVDRX_TemplateExecutive.Destroy
+      ARegistry.Register(Exec, Row.Values['id'], Row.Values['subscribe']);
+      WriteLn('  Template executive "', Row.Values['id'], '": dir="', Store.Dir, '", subscribe="', Row.Values['subscribe'], '"');
+    end;
+  finally
+    Rows.Free;
+  end;
+end;
 // "file"). See vdrx_bucket.pas for why this is full history rather than
 // latest-value-per-topic, and vdrx_admin.pas's DoHistory for how it's read
 // back (the "history" console command - there's no automatic replay).
@@ -459,6 +515,7 @@ begin
     SetupProcesses(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes);
     SetupSocketClients(Config, Kernel.Registry, ShutdownGraceMs);
     SetupCLIBridges(Config, CLIRoutes);
+    SetupTemplateExecutives(Config, Kernel.Registry);
     SetupBuckets(Config, Kernel.Registry);
 
     HTTPSites := SetupHTTPSites(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes, CLIRoutes);

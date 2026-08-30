@@ -16,6 +16,24 @@ type
   TVDRX_ConfigRows = specialize TObjectList<TStringList>; // owns its rows
 
   TVDRX_Config = class
+  // Backed by whatever JSON object AFilePath's file contains, MERGED with
+  // every file its top-level "includes" array names (recursively - an
+  // included file can itself have its own "includes"). This is what lets an
+  // application's own executive definitions (its "processes"/"http_sites"/
+  // "cli_bridges"/"socket_clients"/... entries, or a future "templates"
+  // list) live and get version-controlled in that application's own repo,
+  // with vdrx.conf itself just naming the file:
+  //
+  //   { "includes": ["../kyzu/kyzu.vdrx.conf"], "http_sites": [...] }
+  //
+  // Include paths are resolved relative to the file that names them, not to
+  // the daemon's own working directory - so kyzu.vdrx.conf's own includes
+  // (if it has any) work the same way regardless of where vdrx.exe is
+  // actually launched from. See DeepMergeInto/LoadMerged (in the
+  // implementation section) for the exact merge rules: array-valued keys
+  // accumulate across every file involved; the top-level vdrx.conf's own
+  // scalar settings always win over anything an include sets.
+
   private
     FData: TJSONObject;
     FLock: TCriticalSection;
@@ -36,9 +54,164 @@ type
     // the result.
     function GetObjectArray(APath: string): TVDRX_ConfigRows;
     procedure Reload;
+    // Absolute path of whichever file this config was actually loaded from
+    // - always FFilePath itself, never an include (see LoadMerged) - so an
+    // error message naming "the config" can say exactly which file, even
+    // once includes are involved.
+    property FilePath: string read FFilePath;
   end;
 
 implementation
+
+// SysUtils doesn't provide this (it's normally an LCL/FileUtil helper, not
+// available to a plain fp-units-fcl build) - a minimal cross-platform check
+// covering what actually shows up in an "includes" entry: a leading path
+// delimiter (Unix root, or a Windows UNC share), or a Windows drive letter
+// ("C:\..." / "C:/...").
+function IsAbsolutePath(const APath: string): Boolean;
+begin
+  Result := (Length(APath) > 0) and (APath[1] in ['/', '\'])
+    or ((Length(APath) >= 2) and (APath[2] = ':') and (UpCase(APath[1]) in ['A'..'Z']));
+end;
+
+// Recursively merges ASource's keys into ATarget (ATarget wins the tiebreak
+// on every rule below, i.e. this is "layer ASource underneath what's already
+// in ATarget", not the other way round):
+//   - both sides have an OBJECT at the same key -> recurse (a nested
+//     "settings" object from an include and one from the including file
+//     both contribute their keys, rather than one replacing the other
+//     wholesale)
+//   - both sides have an ARRAY at the same key -> CONCATENATE, ATarget's
+//     existing elements first, ASource's appended after. This is what makes
+//     "includes" actually useful for VDRX's shape of config in particular:
+//     "processes"/"http_sites"/"cli_bridges"/"socket_clients"/"buckets" (and
+//     any future array-valued section - a "templates" list, say) all
+//     accumulate across every included file plus the top-level one,
+//     automatically, with no per-section-name special-casing needed here at
+//     all - this function has no idea any of those keys exist.
+//   - anything else (a scalar, or a type mismatch) -> ATarget's existing
+//     value wins if it has one; only added from ASource if ATarget doesn't
+//     already have that key. Combined with the include-processing order in
+//     LoadMerged below (each included file merged in, in listed order,
+//     BEFORE the file that did the including is itself merged on top), the
+//     net effect is: the top-level vdrx.conf's own scalar settings always
+//     win over anything an include sets, and an earlier include wins over a
+//     later one for whatever neither the top-level file nor an earlier
+//     include already decided.
+procedure DeepMergeInto(ATarget, ASource: TJSONObject);
+var
+  i, j: Integer;
+  Name: string;
+  SrcVal, ExistingVal: TJSONData;
+begin
+  for i := 0 to ASource.Count - 1 do
+  begin
+    Name := ASource.Names[i];
+    SrcVal := ASource.Items[i];
+    ExistingVal := ATarget.Find(Name);
+    if Assigned(ExistingVal) and (ExistingVal is TJSONObject) and (SrcVal is TJSONObject) then
+      DeepMergeInto(TJSONObject(ExistingVal), TJSONObject(SrcVal))
+    else if Assigned(ExistingVal) and (ExistingVal is TJSONArray) and (SrcVal is TJSONArray) then
+      for j := 0 to TJSONArray(SrcVal).Count - 1 do
+        TJSONArray(ExistingVal).Add(TJSONArray(SrcVal).Items[j].Clone)
+    else if not Assigned(ExistingVal) then
+      ATarget[Name] := SrcVal.Clone;
+    // else: ATarget already has a non-mergeable value at this key - it wins, ASource's is dropped
+  end;
+end;
+
+// Loads AFilePath, recursively resolves and merges any top-level "includes"
+// array it names (paths resolved relative to AFilePath's OWN directory, so
+// an included file's includes work the same way regardless of which
+// directory the daemon itself was launched from - see the readme's path
+// gotchas, this is deliberately NOT relative to the daemon's CWD), and
+// returns the fully merged TJSONObject. AVisited is the set of absolute
+// paths already loaded on this call chain, both to avoid infinite recursion
+// on an accidental include cycle and to avoid pointlessly loading the same
+// shared file twice if two different includes both name it - either case
+// silently skips the repeat rather than raising, since a merge is
+// idempotent-ish for arrays only in the sense that skipping is safer than
+// either double-concatenating a shared processes/http_sites entry or
+// killing the whole daemon's config load over what's likely a harmless
+// diamond-shaped include graph, not a real error.
+function LoadMerged(const AFilePath: string; AVisited: TStringList): TJSONObject;
+var
+  AbsPath: string;
+  JSONText: TStringList;
+  Parsed: TJSONData;
+  IncludesNode: TJSONData;
+  IncludePath: string;
+  i: Integer;
+  IncludedObj: TJSONObject;
+  BaseDir: string;
+begin
+  Result := nil;
+  AbsPath := ExpandFileName(AFilePath);
+  if AVisited.IndexOf(AbsPath) >= 0 then
+  begin
+    WriteLn(StdErr, 'vdrx_config: "', AbsPath, '" already loaded on this include chain - skipping repeat/cycle.');
+    Exit;
+  end;
+  AVisited.Add(AbsPath);
+
+  if not FileExists(AbsPath) then
+  begin
+    WriteLn(StdErr, 'vdrx_config: included file not found: ', AbsPath);
+    Exit;
+  end;
+
+  JSONText := TStringList.Create;
+  try
+    JSONText.LoadFromFile(AbsPath);
+    try
+      Parsed := GetJSON(JSONText.Text);
+    except
+      on E: Exception do
+      begin
+        WriteLn(StdErr, 'vdrx_config: failed to parse ', AbsPath, ' - ', E.Message);
+        Exit;
+      end;
+    end;
+  finally
+    JSONText.Free;
+  end;
+
+  if not (Parsed is TJSONObject) then
+  begin
+    WriteLn(StdErr, 'vdrx_config: ', AbsPath, ' does not contain a JSON object at the top level - ignoring it.');
+    Parsed.Free;
+    Exit;
+  end;
+
+  Result := TJSONObject(Parsed);
+  BaseDir := ExtractFileDir(AbsPath);
+
+  // Resolve and merge every include BEFORE this file's own content, so
+  // DeepMergeInto's "ATarget already has this key -> ATarget wins" rule
+  // means this file's own settings always beat anything an include sets -
+  // see DeepMergeInto's comment.
+  IncludesNode := Result.Find('includes');
+  if Assigned(IncludesNode) and (IncludesNode is TJSONArray) then
+  begin
+    for i := 0 to TJSONArray(IncludesNode).Count - 1 do
+    begin
+      IncludePath := TJSONArray(IncludesNode)[i].AsString;
+      if IncludePath = '' then Continue;
+      if not IsAbsolutePath(IncludePath) then
+        IncludePath := IncludeTrailingPathDelimiter(BaseDir) + IncludePath;
+      IncludedObj := LoadMerged(IncludePath, AVisited);
+      if Assigned(IncludedObj) then
+      begin
+        try
+          DeepMergeInto(Result, IncludedObj);
+        finally
+          IncludedObj.Free;
+        end;
+      end;
+    end;
+    Result.Delete('includes'); // it's done its job - don't leave it visible as a stray top-level array to anything reading the merged config
+  end;
+end;
 
 constructor TVDRX_Config.Create(const AFilePath: string);
 begin
@@ -166,53 +339,33 @@ end;
 
 procedure TVDRX_Config.Reload;
 var
-  JSONString: TStringList;
-  NewData: TJSONData;
+  Visited: TStringList;
+  NewData: TJSONObject;
 begin
   FLock.Enter;
   try
-    if FileExists(FFilePath) then begin
-      JSONString := TStringList.Create;
-      try
-        JSONString.LoadFromFile(FFilePath);
-        // Parse into a local var FIRST and only touch FData once we know
-        // parsing succeeded. The previous version freed FData right here,
-        // before GetJSON ran - so a syntax error in the reloaded vdrx.conf
-        // (e.g. a trailing comma) left FData a dangling/freed pointer for
-        // every GetString/GetInteger call across the whole daemon until the
-        // next successful reload, since GetJSON raising an exception meant
-        // FData was never reassigned.
-        //
-        // GetJSON itself can raise on malformed JSON, and Reload is called
-        // straight from TVDRX_AdminExecutive.HandlePacket ('sys.reload')
-        // with nothing catching exceptions between here and
-        // TVDRX_Kernel.Execute's message dispatch loop - letting this
-        // propagate would kill the whole kernel dispatch thread over one
-        // bad config file. Catch and keep the last-known-good FData instead.
-        try
-          NewData := GetJSON(JSONString.Text);
-        except
-          on E: Exception do
-          begin
-            WriteLn(StdErr, 'vdrx_config: Reload failed to parse ' + FFilePath +
-              ' - keeping previous config (' + E.Message + ')');
-            NewData := nil;
-          end;
-        end;
-        if Assigned(NewData) then
-        begin
-          if NewData is TJSONObject then
-          begin
-            if Assigned(FData) then FData.Free;
-            FData := TJSONObject(NewData);
-          end
-          else
-            NewData.Free;
-        end;
-        // else: parse failed above (already logged) - FData is left untouched
-      finally
-        JSONString.Free;
+    Visited := TStringList.Create;
+    try
+      Visited.Sorted := True;
+      Visited.Duplicates := dupIgnore;
+      // NewData comes back fully merged - top-level file plus every
+      // "includes" entry it (recursively) names - see LoadMerged/
+      // DeepMergeInto above. Same "parse into a local var first, only touch
+      // FData once we know it succeeded" reasoning as before: an error
+      // anywhere in that chain (missing file, bad JSON, a bad include path)
+      // is logged by LoadMerged itself and leaves NewData nil here, so a
+      // broken 'sys.reload' keeps the last-known-good FData rather than
+      // leaving every GetString/GetInteger call across the daemon reading a
+      // freed pointer.
+      NewData := LoadMerged(FFilePath, Visited);
+      if Assigned(NewData) then
+      begin
+        if Assigned(FData) then FData.Free;
+        FData := NewData;
       end;
+      // else: LoadMerged already logged why - FData is left untouched
+    finally
+      Visited.Free;
     end;
   finally
     FLock.Leave;

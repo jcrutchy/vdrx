@@ -54,14 +54,16 @@ wildcard matches only itself.
 ### The four ways to get code running against the bus
 
 This is really the whole practical question when you're building something:
-**how does my code talk to VDRX?** There are four answers, and they compose:
+**how does my code talk to VDRX?** There are six answers, and they compose:
 
 | Mechanism | Lifetime | Use it for |
 |---|---|---|
 | **Supervised process** (`processes`) | Long-running, restart-on-crash | A daemon that needs to react to bus events continuously - an IRC protocol handler, a game tick loop, a worker |
 | **Reverse-proxy route** (`processes` + `prefix`/`host`/`port`) | Long-running, has its own HTTP server | An existing web app/framework you don't want to rewrite - `php -S`, a Node server, anything that speaks HTTP itself |
 | **CGI-style CLI route** (`cli_bridges`, `protocol: "cgi"`) | Spawned fresh per HTTP request | A classic "one script = one URL" site, PHP/Python/whatever, using ordinary CGI env vars |
-| **Bus CLI route** (`cli_bridges`, `protocol: "bus"`) | Spawned fresh per HTTP request, OR a long-running daemon if you subscribe it yourself | An HTTP endpoint whose backend logic you want expressed as "read one JSON request, write one JSON reply" - language-agnostic, and the same shape a persistent bus subscriber already uses |
+| **Bus CLI route** (`cli_bridges`, `protocol: "bus"`) | Spawned fresh per HTTP request | An HTTP endpoint whose backend logic you want expressed as "read one JSON request, write one JSON reply" - language-agnostic |
+| **Bus-daemon route** (`cli_bridges`, `protocol: "bus-daemon"`) | Long-running, shared across every request | The same request/reply shape as above, but answered by an already-running `processes` subscriber instead of a fresh spawn each time - no per-request process-start cost |
+| **Template executive** (`templates`) | Long-running | Rendering a named template set (`.tpl` files + `%%params%%`/`##rows##`) reachable by topic name from anywhere - a bus-CLI reply, a persistent daemon, anything - rather than tied to one HTTP site's connection |
 
 The rest of this doc walks through each one with a real example.
 
@@ -232,21 +234,31 @@ contract, because it's just "read one JSON line, write one JSON line":
  "rows":{"messages":[{"from":"vdrx","text":"hi"}]}}
 ```
 
-The `template` form is the one worth calling out: VDRX's own template
-engine (`vdrx_templates.pas`) renders it server-side - `params` fill
-`%%var%%` placeholders, each entry in a `rows` array becomes one pass
-through a `##loop:name##...##endloop:name##` block. The script supplies
-*data*, never markup. See `scripts/template_demo.php` and
-`templates/greeting.tpl` for a complete working pair.
+The `template` form has two variants, chosen by whether `template_topic` is
+present - see §4d below for why that matters and when to use which:
+
+```json
+{"status":200,"template":"greeting","params":{"name":"World"},
+ "rows":{"messages":[{"from":"vdrx","text":"hi"}]}}
+```
+```json
+{"status":200,"template":"greeting","template_topic":"template.admin.render",
+ "params":{"name":"World"}, "rows":{"messages":[{"from":"vdrx","text":"hi"}]}}
+```
+
+Without `template_topic`, rendering happens in-process against whichever
+HTTP site's own `template_dir` answered *this* connection - simple, no bus
+round trip, but implicit: which store answers depends on which site's port
+the request happened to arrive on. With `template_topic`, the render
+request is instead published to that explicit topic and answered by a
+`TVDRX_TemplateExecutive` (§4d) - unambiguous regardless of which site's
+connection this is. See `scripts/template_demo.php` and
+`templates/greeting.tpl` for a complete working pair using the explicit form.
 
 `prefix` behaves like a URL-rewrite base, not a directory: `sub_path` is
 whatever's left of the path after it, and `query` is the raw query string
 - parse either however your script likes (`parse_str` in PHP, `urllib` in
-Python, whatever). This is deliberately the same "one JSON request in, one
-structured reply out" shape a *persistent* bus subscriber already uses
-with `processes`, so the same script logic can plausibly serve both a
-one-shot HTTP request and a long-running daemon reacting to bus events,
-without a VDRX-specific SDK to learn either way.
+Python, whatever).
 
 **Two gotchas worth knowing before you hit them:**
 
@@ -259,7 +271,9 @@ without a VDRX-specific SDK to learn either way.
   not found" message), which looks like a VDRX bug but almost always means
   a path problem. Keep the folder layout (`scripts/`, `templates/`,
   `phpcli/`) next to `vdrx.conf` matching what the config says, or update
-  the config to match wherever things actually live.
+  the config to match wherever things actually live. The startup banner and
+  every relevant log line print the resolved absolute path VDRX actually
+  used, specifically so this is diagnosable without guessing.
 - **A literal `#` in a URL is a browser-side fragment delimiter** and gets
   stripped before the request ever reaches the server, unless it's
   percent-encoded as `%23`. This matters immediately for IRC channel names:
@@ -276,6 +290,70 @@ script that wants to log its own activity should write to a file, the same
 convention `scripts/irc_client.php` already follows for its bus-subscriber
 side.
 
+### 4c. Bus-daemon routes (`protocol: "bus-daemon"`)
+
+The persistent-subscriber counterpart to §4b: same request/reply JSON
+shape, but nothing is spawned per request. Instead, the request is
+published to `in_topic` with a freshly-minted, per-request `reply_to`
+added, and VDRX just waits (bounded by `timeout_ms`) for a reply there:
+
+```json
+{ "id": "echo-daemon-route", "prefix": "/echo-daemon", "protocol": "bus-daemon",
+  "in_topic": "echo.daemon.in", "timeout_ms": 5000, "content_type": "text/plain" }
+```
+
+Whatever's subscribed to `in_topic` answers - typically an ordinary
+`processes` entry (§2), already running, shared across every concurrent
+request instead of paying spawn cost per request:
+
+```json
+{ "id": "echo_daemon", "command": "php scripts/echo_daemon.php", "restart": "always",
+  "subscribe": ["echo.daemon.in"], "publish": ["http.reply.*"], "enabled": true }
+```
+
+See `scripts/echo_daemon.php` for a working pair with the config above.
+One thing worth knowing if you write one of these: a `processes` entry's
+stdin envelope wraps whatever was published as `{"topic":...,"payload":...,
+"source":...}` - and if the *published* payload was itself valid JSON (as
+an HTTP request envelope always is), it's embedded as a genuine nested
+object, not double-encoded as a string. So `payload` in your script is
+already the decoded request array/dict, not JSON text needing a second
+decode pass - a real "Array to string conversion" trap in PHP if you decode
+it twice, and the fix that let `echo_daemon.php` answer requests correctly.
+
+Use §4b when each request is independent and simplicity matters more than
+spawn cost; use this when request volume matters, or the daemon needs to
+hold state across requests (a connection pool, an in-memory cache) that a
+fresh process per request couldn't.
+
+### 4d. Templates as their own executive - `templates`
+
+A `templates` config entry gives a `TVDRX_TemplateStore` (§6's engine) its
+own bus identity, independent of any `http_sites` entry:
+
+```json
+{ "id": "admin_templates", "dir": "templates", "subscribe": "template.admin.render" }
+```
+
+Anything - a bus-CLI reply's `template_topic` (§4b), a `bus-daemon`'s own
+reply, a persistent process - can publish a render request to
+`template.admin.render` and get back a rendered body, regardless of which
+HTTP site (if any) is involved in the request at all:
+
+```json
+// published to the topic above:
+{"template":"greeting","params":{"name":"World"},"rows":{...},"reply_to":"..."}
+// its reply, to reply_to:
+{"body":"<rendered html>"}
+```
+
+This is what §4b's `template_topic` field actually talks to - see that
+section for why you'd choose it over an HTTP site's own implicit
+`template_dir`: mainly, when the same `cli_bridges` route is reachable on
+more than one site's port (routes are global, §4 above), rendering against
+"whichever site happened to answer" stops being well-defined, and this
+makes the choice explicit instead.
+
 ---
 
 ## 5. WebSocket - `executives.ws`
@@ -288,14 +366,38 @@ on top:
 { "enabled": true, "port": 8082, "ping_interval_ms": 15000, "pong_timeout_ms": 10000 }
 ```
 
-From JS: connect, then send `{"action":"subscribe","filter":"irc_bot.out"}`
-/ `{"action":"publish","topic":"irc_bot.in","payload":"..."}` /
-`{"action":"unsubscribe",...}`. Each connection is itself a registered
-executive, so a browser tab is a first-class bus participant - the same
-mechanism a Bridge-managed process or a bus-CLI script uses to talk to
-everything else. This is usually the right tool for anything that needs
-to *push* updates to a browser continuously (chat, live state, notifications)
-- prefer it over polling a bus-CLI route.
+From JS: connect, then send `{"method":"sys.auth","token":"..."}` (any
+non-empty token passes today - see §9), then
+`{"method":"subscribe","filter":"irc_bot.out"}` /
+`{"method":"publish","topic":"irc_bot.in","payload":"..."}` /
+`{"method":"unsubscribe","filter":"..."}` / `{"method":"unsubscribe_all"}`.
+Each connection is a first-class bus participant, so a browser tab talks to
+everything else the same way a Bridge-managed process or a bus-CLI script
+does. This is usually the right tool for anything that needs to *push*
+updates to a browser continuously (chat, live state, notifications) -
+prefer it over polling a bus-CLI route.
+
+**Internally**, a connection is actually two cooperating executives, not
+one - purely an implementation detail (the JSON-RPC surface above is
+unchanged either way), but worth knowing if you're reading logs or
+`vdrx_network.pas` itself:
+
+- `TVDRX_WSConnection` - pure connectivity. Owns the socket, does the
+  handshake, frames messages, keeps the ping/pong heartbeat alive, and
+  relays bus traffic to/from the browser. It never parses a client's text
+  frame - it just republishes the raw JSON onto that connection's own
+  `<id>.rpc.in` topic.
+- `TVDRX_WSProtocolExecutive` - everything else: `sys.auth`,
+  `subscribe`/`unsubscribe`/`unsubscribe_all`/`publish`, all the actual
+  interpretation of what a client said. It's a separate Registry entry
+  (`<id>.rpc`), subscribed only to `<id>.rpc.in`, and replies by publishing
+  to `<id>.rpc.out` - which the connectivity object relays to the socket
+  verbatim, rather than wrapping in the usual bus-message envelope, since
+  it's already a complete reply line (an `auth.ok` event, say).
+
+Same split as everywhere else in VDRX (Bridge/socket_client): the thing
+touching the wire never interprets what's on it, and the thing interpreting
+it never touches the wire.
 
 ---
 
@@ -342,8 +444,8 @@ durable log of a set of topics rather than just watching them go by:
 | `vdrx_procutil.pas` | Cross-platform process wait/terminate/kill helpers |
 | `vdrx_bridge.pas` | `TVDRX_BridgeExecutive` - supervised external processes (§2) |
 | `vdrx_bucket.pas` | Append-only JSONL topic recorder (§6) |
-| `vdrx_templates.pas` | Template engine - `$$setting$$`/`??const??`/`%%var%%`/`##loop##`/`@@child@@` |
-| `vdrx_network.pas` | Everything socket-facing: TLS/plain transport, the listener base class, `TVDRX_HTTPExecutive` (§4), `TVDRX_WebSocketExecutive` (§5), `TVDRX_SocketClientExecutive` (§3) |
+| `vdrx_templates.pas` | Template engine (`$$setting$$`/`??const??`/`%%var%%`/`##loop##`/`@@child@@`) and `TVDRX_TemplateExecutive`, the bus-reachable wrapper around it (§4d) |
+| `vdrx_network.pas` | Everything socket-facing: TLS/plain transport, the listener base class, `TVDRX_HTTPExecutive` (§4) including `TVDRX_OneShotWaiter`/`PublishAndWait` (the bus-daemon/template-topic reply-correlation primitive), `TVDRX_WebSocketExecutive` + `TVDRX_WSConnection`/`TVDRX_WSProtocolExecutive` (§5), `TVDRX_SocketClientExecutive` (§3) |
 | `vdrx.lpr` | Entry point - reads `vdrx.conf`, wires every executive above up from it |
 
 ---
@@ -372,11 +474,17 @@ scripts) resolve against that same working directory - see the gotcha in
 
 - No authentication on the `sys.*` admin surface, or on WebSocket
   (`sys.auth` accepts any non-empty token) - fine for a single-operator
-  dev box, not yet for anything multi-tenant.
+  dev box, not yet for anything multi-tenant. This matters more now that
+  §2-§4d mean more things than before are reachable purely by knowing a
+  topic name - there's no per-topic access control yet, only "can you
+  reach the bus at all."
 - Per-connection HTTP/WS threads are fire-and-forget, not individually
   tracked/joined on shutdown.
-- A persistent (subscribed-daemon, not spawn-per-request) bus-HTTP mode -
-  where a long-running process answers many concurrent HTTP requests via
-  correlation IDs on reply topics, rather than one process per request -
-  is a natural extension of §4b but isn't built yet; today's `protocol:
-  "bus"` routes are always spawn-per-request.
+- §4 (static files, reverse-proxy routes) still dispatches in-process on
+  the connection thread rather than through the bus - only `cli_bridges`
+  and template rendering go through `PublishAndWait`/`TVDRX_OneShotWaiter`
+  so far. Extending the same correlation-ID pattern to static/proxy
+  serving (topic-encoded routing, per the original design discussion)
+  would finish the "everything only talks via the bus" picture, but adds a
+  bus round trip to every request including the highest-volume ones
+  (images, CSS, JS), so it's a deliberate scope boundary, not an oversight.

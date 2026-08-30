@@ -5,7 +5,7 @@ unit vdrx_templates;
 interface
 
 uses
-  Classes, SysUtils, StrUtils, SyncObjs, Generics.Collections, vdrx_config;
+  Classes, SysUtils, StrUtils, SyncObjs, Generics.Collections, fpjson, jsonparser, vdrx_core, vdrx_config;
 
 type
   // One loop iteration's params (Name=Value, same shape as Fill's AParams).
@@ -45,13 +45,25 @@ type
   // Fill()'ing a given name for the first time touches disk for it. Template
   // files are named '<name>.tpl' under ATemplateDir (flat, not recursive into
   // subdirectories).
+  //
+  // ATemplateDir is resolved to an ABSOLUTE path once, at Create time (via
+  // ExpandFileName against the process's CWD at that moment), and FDir keeps
+  // that absolute form from then on - not because relative paths don't work
+  // (they do, resolved the same way any other relative config path is), but
+  // so every diagnostic this unit ever logs can name the exact, unambiguous
+  // file it looked for. In a setup with several independently-configured
+  // scripts and sites, "templates/greeting.tpl not found" leaves you
+  // guessing which of several plausible working directories that was
+  // relative to; "C:\dev\vdrx\templates\greeting.tpl not found" doesn't -
+  // see the public Dir property, used by RunBusCLIScript's own error
+  // messages in vdrx_network.pas for the same reason.
   TVDRX_TemplateStore = class
   private
     FLock: TCriticalSection;
     FTemplates: TStringList; // Name=Value cache; Value = raw file content (or '' if the file didn't exist - cached too, so a bad name doesn't re-stat every request)
     FConstants: TStringList; // Name=Value, set via SetConstant
     FConfig: TVDRX_Config;
-    FDir: string;
+    FDir: string; // always absolute - see unit comment above
     function LookupSetting(const AName: string): string;
     function LookupConstant(const AName: string): string;
     function LoadTemplateCached(const AName: string): string;
@@ -73,6 +85,64 @@ type
     // map for any ##loop:name## blocks anywhere in the template or its
     // children. Caller keeps ownership of both.
     function Fill(const ATemplateName: string; AParams: TStringList = nil; ARows: TVDRX_TemplateNamedRows = nil): string;
+    // The absolute directory this store loads '<name>.tpl' files from - for
+    // callers (RunBusCLIScript's diagnostics, an admin/debug page, etc.)
+    // that want to report exactly where a template was or wasn't found,
+    // rather than just the bare name that failed.
+    property Dir: string read FDir;
+  end;
+
+// Flattens a JSON object's scalar members into a Name=Value TStringList -
+// the shape Fill's AParams expects. Shared (declared once here, used by both
+// vdrx_templates.pas's own TVDRX_TemplateExecutive and vdrx_network.pas's
+// BuildBusCLIResponse) so the "which JSON value types count as a usable
+// param" rule can't drift between the two call sites. Non-scalar members
+// (nested objects/arrays) are skipped; AParamsObj may be nil (empty
+// result). Caller owns and frees the result.
+function JSONParamsToStringList(AParamsObj: TJSONObject): TStringList;
+
+// Converts a JSON "rows" object - {"loopName": [{...row fields...}, ...],
+// ...} - into the TVDRX_TemplateNamedRows shape Fill's ARows expects for
+// ##loop:loopName##...##endloop## blocks. Only scalar fields within each
+// row object are kept. Non-array values under a loop name, or non-object
+// entries within one, are silently skipped rather than raising - a
+// malformed "rows" value from a buggy caller should render that loop as
+// empty, not fail the whole response. ARowsObj may be nil (empty result).
+// Caller owns and frees the result (it owns its TVDRX_TemplateRows values
+// too, via doOwnsValues).
+function JSONRowsToTemplateRows(ARowsObj: TJSONObject): TVDRX_TemplateNamedRows;
+
+type
+  // Makes a TVDRX_TemplateStore reachable purely over the bus - the
+  // "protocol executive" half of the connectivity/protocol split described
+  // in the readme's §2: an HTTP site's own template_dir is still perfectly
+  // fine for simple cases (a bus-CLI reply's plain "template" field renders
+  // in-process, no bus round trip - see BuildBusCLIResponse in
+  // vdrx_network.pas), but anything that wants to name a SPECIFIC template
+  // set explicitly, regardless of which HTTP site's connection happens to
+  // be asking, publishes a render request to this executive's own
+  // subscribed topic instead (a bus-CLI reply's "template_topic" field -
+  // same file, same function).
+  //
+  // Wire format, matching every other bus-mediated request/reply pair in
+  // this codebase (RunBusCLIScript's envelope, TVDRX_OneShotWaiter's
+  // contract):
+  //   in:  {"template":"name","params":{...},"rows":{...},"reply_to":"..."}
+  //   out (published to "reply_to"): {"body":"<rendered text>"}
+  // A missing/unresolvable "template" name still replies (with an empty
+  // "body") rather than staying silent - see HandlePacket - since a silent
+  // non-reply is indistinguishable from "this executive isn't running at
+  // all" to whatever's waiting on PublishAndWait's timeout, and the
+  // distinction (misconfigured template name vs. nothing subscribed at all)
+  // is worth being able to tell apart from the caller's own log line.
+  TVDRX_TemplateExecutive = class(TVDRX_Executive)
+  private
+    FStore: TVDRX_TemplateStore;
+  public
+    constructor Create(ABus: TVDRX_MessageQueue; AStore: TVDRX_TemplateStore); reintroduce;
+    destructor Destroy; override;
+    procedure HandlePacket(const AMsg: TVDRX_Message); override;
+    property Store: TVDRX_TemplateStore read FStore;
   end;
 
 implementation
@@ -120,7 +190,7 @@ begin
   FTemplates := TStringList.Create;
   FConstants := TStringList.Create;
   FConfig := AConfig;
-  FDir := ATemplateDir;
+  FDir := ExpandFileName(ATemplateDir); // absolute from here on - see unit comment
   // Deliberately no directory scan/eager load here - see unit comment.
 end;
 
@@ -361,6 +431,117 @@ begin
     Chain.Free;
   end;
   Result := ReplaceParams(Result, AParams); // final outer-level %% pass - anything already consumed inside a loop body no longer contains %% by this point
+end;
+
+function JSONParamsToStringList(AParamsObj: TJSONObject): TStringList;
+var
+  i: Integer;
+begin
+  Result := TStringList.Create;
+  if not Assigned(AParamsObj) then Exit;
+  for i := 0 to AParamsObj.Count - 1 do
+    if AParamsObj.Items[i].JSONType in [jtString, jtNumber, jtBoolean] then
+      Result.Values[AParamsObj.Names[i]] := AParamsObj.Items[i].AsString;
+end;
+
+function JSONRowsToTemplateRows(ARowsObj: TJSONObject): TVDRX_TemplateNamedRows;
+var
+  i, j, k: Integer;
+  Arr: TJSONArray;
+  RowObj: TJSONObject;
+  Rows: TVDRX_TemplateRows;
+  Row: TStringList;
+begin
+  Result := TVDRX_TemplateNamedRows.Create([doOwnsValues]);
+  if not Assigned(ARowsObj) then Exit;
+  for i := 0 to ARowsObj.Count - 1 do
+  begin
+    if ARowsObj.Items[i].JSONType <> jtArray then Continue;
+    Arr := TJSONArray(ARowsObj.Items[i]);
+    Rows := TVDRX_TemplateRows.Create(True);
+    for j := 0 to Arr.Count - 1 do
+    begin
+      if not (Arr[j] is TJSONObject) then Continue;
+      RowObj := TJSONObject(Arr[j]);
+      Row := TStringList.Create;
+      for k := 0 to RowObj.Count - 1 do
+        if RowObj.Items[k].JSONType in [jtString, jtNumber, jtBoolean] then
+          Row.Values[RowObj.Names[k]] := RowObj.Items[k].AsString;
+      Rows.Add(Row);
+    end;
+    Result.Add(ARowsObj.Names[i], Rows);
+  end;
+end;
+
+{ TVDRX_TemplateExecutive }
+
+constructor TVDRX_TemplateExecutive.Create(ABus: TVDRX_MessageQueue; AStore: TVDRX_TemplateStore);
+begin
+  inherited Create(ABus);
+  FStore := AStore;
+end;
+
+destructor TVDRX_TemplateExecutive.Destroy;
+begin
+  FStore.Free; // this executive owns the store it was handed - see SetupTemplateExecutives in vdrx.lpr, which creates one store per config entry specifically to hand off here
+  inherited;
+end;
+
+// See this class's declaration comment for the wire format. Always publishes
+// SOME reply if "reply_to" was present, even on a bad/missing template name
+// (an empty "body") - a caller waiting via PublishAndWait needs to be able
+// to tell "this executive answered, but the name was wrong" apart from "no
+// timeout, but also no reply because nothing's listening at all here".
+procedure TVDRX_TemplateExecutive.HandlePacket(const AMsg: TVDRX_Message);
+var
+  J: TJSONData;
+  Obj: TJSONObject;
+  TemplateName, ReplyTo, Body: string;
+  Params: TStringList;
+  Rows: TVDRX_TemplateNamedRows;
+begin
+  J := nil;
+  try
+    try J := GetJSON(AMsg.Payload); except J := nil; end;
+    if not Assigned(J) or not (J is TJSONObject) then
+    begin
+      Bus.Publish('log.warn', 'template ' + ID + ': dropped non-JSON-object render request: ' + AMsg.Payload, ID);
+      Exit;
+    end;
+    Obj := TJSONObject(J);
+    ReplyTo := Obj.Get('reply_to', '');
+    if ReplyTo = '' then
+    begin
+      Bus.Publish('log.warn', 'template ' + ID + ': render request had no "reply_to" - dropped: ' + AMsg.Payload, ID);
+      Exit;
+    end;
+
+    TemplateName := Obj.Get('template', '');
+    if Assigned(Obj.Find('params')) and (Obj.Find('params') is TJSONObject) then
+      Params := JSONParamsToStringList(TJSONObject(Obj.Find('params')))
+    else
+      Params := JSONParamsToStringList(nil);
+    try
+      if Assigned(Obj.Find('rows')) and (Obj.Find('rows') is TJSONObject) then
+        Rows := JSONRowsToTemplateRows(TJSONObject(Obj.Find('rows')))
+      else
+        Rows := JSONRowsToTemplateRows(nil);
+      try
+        Body := FStore.Fill(TemplateName, Params, Rows);
+      finally
+        Rows.Free;
+      end;
+    finally
+      Params.Free;
+    end;
+
+    if Body = '' then
+      Bus.Publish('log.warn', Format('template %s: "%s" not found or rendered empty - looked for %s', [ID, TemplateName, IncludeTrailingPathDelimiter(FStore.Dir) + TemplateName + '.tpl']), ID);
+
+    Bus.Publish(ReplyTo, Format('{"body":%s}', [JSONString(Body)]), ID);
+  finally
+    if Assigned(J) then J.Free;
+  end;
 end;
 
 end.

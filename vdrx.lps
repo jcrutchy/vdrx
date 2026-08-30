@@ -8,7 +8,7 @@
       <Unit>
         <Filename Value="vdrx.lpr"/>
         <IsPartOfProject Value="True"/>
-        <TopLine Value="453"/>
+        <TopLine Value="484"/>
         <CursorPos X="65" Y="473"/>
         <UsageCount Value="32"/>
         <Loaded Value="True"/>
@@ -25,10 +25,9 @@
       <Unit>
         <Filename Value="vdrx_bridge.pas"/>
         <IsPartOfProject Value="True"/>
-        <IsVisibleTab Value="True"/>
         <EditorIndex Value="10"/>
         <TopLine Value="423"/>
-        <CursorPos X="45" Y="441"/>
+        <CursorPos X="47" Y="439"/>
         <UsageCount Value="31"/>
         <Loaded Value="True"/>
       </Unit>
@@ -43,9 +42,9 @@
       <Unit>
         <Filename Value="vdrx_config.pas"/>
         <IsPartOfProject Value="True"/>
+        <IsVisibleTab Value="True"/>
         <EditorIndex Value="7"/>
-        <TopLine Value="164"/>
-        <CursorPos X="83" Y="172"/>
+        <CursorPos X="19" Y="11"/>
         <UsageCount Value="31"/>
         <Loaded Value="True"/>
       </Unit>

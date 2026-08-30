@@ -67,13 +67,25 @@ type
   //   (the other half of the original design discussion) is a separate,
   //   not-yet-built piece - a persistent TVDRX_BridgeExecutive with a
   //   correlation-ID reply-topic scheme, not this one-shot-per-request path.
+  //   'bus-daemon' - the persistent-subscriber counterpart to 'bus': instead
+  //   of spawning a fresh process per request, the request envelope (same
+  //   shape as 'bus' - see above) is published onto InTopic with a
+  //   per-request "reply_to" added, and this route just waits (via
+  //   TVDRX_OneShotWaiter, TimeoutMs-bounded) for a reply on that topic -
+  //   see RunBusDaemonRoute. Whatever's subscribed to InTopic answers it;
+  //   typically a persistent `processes` entry (the same kind already used
+  //   for irc_bot), so many concurrent requests share one already-running
+  //   process instead of paying spawn cost per request. Command/ScriptDir
+  //   are unused for this protocol - InTopic is the only routing
+  //   information needed, since VDRX isn't starting anything itself here.
   TVDRX_CLIRoute = record
     Prefix: string;
     Command: string;
     ScriptDir: string;
     TimeoutMs: Integer;
     ContentType: string;
-    Protocol: string; // 'cgi' (default) | 'bus' - see comment above
+    Protocol: string; // 'cgi' (default) | 'bus' | 'bus-daemon' - see comment above
+    InTopic: string;  // only used by 'bus-daemon'
   end;
   TVDRX_CLIRoutes = array of TVDRX_CLIRoute;
 
@@ -275,6 +287,40 @@ type
     property Fired: Boolean read FFired;
   end;
 
+  // Generic "publish a request, block this thread until a correlated reply
+  // arrives (or a timeout), tear down" primitive - the building block behind
+  // both RunBusDaemonRoute (a persistent, subscribed process answering many
+  // HTTP requests, rather than one spawned per request - see
+  // TVDRX_CLIRoute's "bus-daemon" protocol) and a bus-mode reply's optional
+  // "template_topic" field (routing template rendering through a specific,
+  // explicitly-named TVDRX_TemplateExecutive rather than whichever HTTP
+  // site's own TVDRX_TemplateStore happened to answer the connection - see
+  // vdrx_templates.pas).
+  //
+  // Deliberately NOT a long-lived subscriber: one instance answers exactly
+  // one reply, on a reply topic minted uniquely per call (see
+  // NextReplyTopic) so concurrent callers never collide, then it's torn
+  // down. This mirrors what a WS connection or a Bridge already is
+  // (registered-with-the-Registry, delivered to via HandlePacket) but for a
+  // single request/response instead of a connection's whole lifetime -
+  // the same Registry filter-match mechanism, just used for one round trip.
+  TVDRX_OneShotWaiter = class(TVDRX_Executive)
+  private
+    FEvent: TEvent;
+    FReplyPayload: string;
+    FGotReply: Boolean;
+  public
+    constructor Create(ABus: TVDRX_MessageQueue);
+    destructor Destroy; override;
+    procedure HandlePacket(const AMsg: TVDRX_Message); override;
+    // Blocks the CALLING thread (not a thread of the waiter's own - it has
+    // none) until HandlePacket fires or ATimeoutMs elapses. Caller is
+    // responsible for Registry.Unregister(ID)'ing this waiter afterwards
+    // either way - see PublishAndWait below, which always does both
+    // regardless of which one happened.
+    function WaitForReply(ATimeoutMs: Integer; out APayload: string): Boolean;
+  end;
+
   TVDRX_HTTPExecutive = class(TVDRX_SocketListenerExecutive)
   private
     FConfig: TVDRX_Config;
@@ -282,27 +328,42 @@ type
     FStaticDir: string;
     FProxyRoutes: TVDRX_ProxyRoutes;
     FCLIRoutes: TVDRX_CLIRoutes;
+    FRegistry: TVDRX_Registry;
   protected
     procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
     constructor Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config;
       ATemplates: TVDRX_TemplateStore;
       const AStaticDir: string; const AProxyRoutes: TVDRX_ProxyRoutes;
-      const ACLIRoutes: TVDRX_CLIRoutes); reintroduce;
+      const ACLIRoutes: TVDRX_CLIRoutes; ARegistry: TVDRX_Registry); reintroduce;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
     procedure ApplyConfig; override;
     class function BuildResponse(const ARequest: string;
       ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
       const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
-      ABus: TVDRX_MessageQueue; const ASourceID: string): string;
+      ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string): string;
   end;
 
+  // Pure connectivity - the WS handshake, frame read/write, ping/pong
+  // keepalive, and relaying bus traffic to/from the socket. Deliberately
+  // contains NO interpretation of what a client's text frame MEANS - see
+  // TVDRX_WSProtocolExecutive below for that half of the split. A text
+  // frame's raw JSON is simply republished onto "<ID>.rpc.in" for whichever
+  // protocol executive is subscribed there to interpret (see AdoptConnection
+  // in TVDRX_WebSocketExecutive, which creates one alongside every
+  // connection); this class never parses it. The one thing this class keeps
+  // that could be argued as "protocol" is HandlePacket's ordinary bus->socket
+  // forwarding envelope - {"topic":...,"payload":...,"source":...,"seq":...}
+  // - but that's the wire format for "a browser is a bus participant" itself
+  // (see the readme's §5), not any one RPC method's interpretation of it, so
+  // it stays here; a "<ID>.rpc.out" topic is special-cased instead, to let
+  // the protocol executive send an already-fully-formed reply line (e.g.
+  // "auth.ok") verbatim rather than have it wrapped in that envelope too.
   TVDRX_WSConnection = class(TVDRX_Executive)
   private
     FListener: TVDRX_WebSocketExecutive;
     FTransport: TVDRX_Transport;
     FThread: TThread;
-    FAuthenticated: Boolean;
     FSendLock: TCriticalSection;
     FPendingRequest: string;
 
@@ -313,17 +374,43 @@ type
 
     function DoHandshake: Boolean;
     function ReadFrame(out APayload: string; out AOpcode: Byte): Boolean;
-    procedure SendFrame(const APayload: string; AOpcode: Byte = 1);
-    procedure HandleRPC(const ALine: string);
   public
     constructor Create(ABus: TVDRX_MessageQueue; AListener: TVDRX_WebSocketExecutive; ATransport: TVDRX_Transport);
     destructor Destroy; override;
     property PendingRequest: string read FPendingRequest write FPendingRequest;
+    procedure SendFrame(const APayload: string; AOpcode: Byte = 1);
     procedure Initialize; override;
     procedure Shutdown; override;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
     procedure RunLoop;
     class function IsUpgradeRequest(const ARequest: string): Boolean;
+  end;
+
+  // The "protocol" half of the split above - all of what used to be
+  // TVDRX_WSConnection.HandleRPC, now living in its own Registry-registered
+  // executive, subscribed only to its connection's "<ID>.rpc.in" topic
+  // (never touching FTransport, never seeing raw WS frames or opcodes).
+  // sys.auth/subscribe/unsubscribe/unsubscribe_all/publish - the entire
+  // client-facing JSON-RPC surface - is interpreted here.
+  //
+  // The one unavoidable coupling to the connectivity object: subscribe/
+  // unsubscribe/unsubscribe_all have to call Registry.Register/
+  // UnregisterFilter/ClearFilters against the CONNECTIVITY object's own ID
+  // (it's the one whose HandlePacket can actually reach the socket) - and
+  // Register's signature needs an actual TVDRX_Executive reference, not
+  // just an ID string, the one time a NEW filter is being added. FConn
+  // exists solely to satisfy that - this class never calls a method on it
+  // that touches the transport (SendFrame included: an outgoing reply is
+  // published to "<ID>.rpc.out" instead, for the connectivity object's own
+  // HandlePacket to relay - see its comment above).
+  TVDRX_WSProtocolExecutive = class(TVDRX_Executive)
+  private
+    FListener: TVDRX_WebSocketExecutive;
+    FConn: TVDRX_WSConnection;
+    FAuthenticated: Boolean;
+  public
+    constructor Create(ABus: TVDRX_MessageQueue; AListener: TVDRX_WebSocketExecutive; AConn: TVDRX_WSConnection); reintroduce;
+    procedure HandlePacket(const AMsg: TVDRX_Message); override;
   end;
 
   TVDRX_WebSocketExecutive = class(TVDRX_SocketListenerExecutive)
@@ -1162,7 +1249,7 @@ begin
     FWebSocket.AdoptConnection(ATransport, Request)
   else
   begin
-    Response := TVDRX_HTTPExecutive.BuildResponse(Request, FTemplates, FConfig, FStaticDir, FProxyRoutes, FCLIRoutes, Bus, ID);
+    Response := TVDRX_HTTPExecutive.BuildResponse(Request, FTemplates, FConfig, FStaticDir, FProxyRoutes, FCLIRoutes, Bus, FWebSocket.Registry, ID);
     ATransport.Write(Response[1], Length(Response));
     ATransport.Close;
     ATransport.Free;
@@ -1723,33 +1810,87 @@ end;
 // from a buggy script should render that loop as empty, not 500 the whole
 // response. Caller owns and frees the result (it owns its TVDRX_TemplateRows
 // values too, via doOwnsValues).
-function JSONRowsToTemplateRows(ARowsObj: TJSONObject): TVDRX_TemplateNamedRows;
-var
-  i, j, k: Integer;
-  Arr: TJSONArray;
-  RowObj: TJSONObject;
-  Rows: TVDRX_TemplateRows;
-  Row: TStringList;
+{ TVDRX_OneShotWaiter }
+
+constructor TVDRX_OneShotWaiter.Create(ABus: TVDRX_MessageQueue);
 begin
-  Result := TVDRX_TemplateNamedRows.Create([doOwnsValues]);
-  if not Assigned(ARowsObj) then Exit;
-  for i := 0 to ARowsObj.Count - 1 do
-  begin
-    if ARowsObj.Items[i].JSONType <> jtArray then Continue;
-    Arr := TJSONArray(ARowsObj.Items[i]);
-    Rows := TVDRX_TemplateRows.Create(True);
-    for j := 0 to Arr.Count - 1 do
-    begin
-      if not (Arr[j] is TJSONObject) then Continue;
-      RowObj := TJSONObject(Arr[j]);
-      Row := TStringList.Create;
-      for k := 0 to RowObj.Count - 1 do
-        if RowObj.Items[k].JSONType in [jtString, jtNumber, jtBoolean] then
-          Row.Values[RowObj.Names[k]] := RowObj.Items[k].AsString;
-      Rows.Add(Row);
-    end;
-    Result.Add(ARowsObj.Names[i], Rows);
+  inherited Create(ABus);
+  FEvent := TEvent.Create(nil, True, False, '');
+  FGotReply := False;
+end;
+
+destructor TVDRX_OneShotWaiter.Destroy;
+begin
+  FEvent.Free;
+  inherited;
+end;
+
+procedure TVDRX_OneShotWaiter.HandlePacket(const AMsg: TVDRX_Message);
+begin
+  // Only ever expecting exactly one message (this waiter's reply topic is
+  // unique per request - see NextReplyTopic) - a second one showing up
+  // before teardown would just overwrite FReplyPayload harmlessly, since
+  // WaitForReply's caller stops waiting after the first SetEvent anyway.
+  FReplyPayload := AMsg.Payload;
+  FGotReply := True;
+  FEvent.SetEvent;
+end;
+
+function TVDRX_OneShotWaiter.WaitForReply(ATimeoutMs: Integer; out APayload: string): Boolean;
+begin
+  Result := (FEvent.WaitFor(ATimeoutMs) = wrSignaled) and FGotReply;
+  if Result then APayload := FReplyPayload else APayload := '';
+end;
+
+var
+  GReplyTopicCounter: Integer = 0;
+  GReplyTopicLock: TCriticalSection;
+
+// Mints a reply topic unique for the lifetime of this daemon process -
+// "<prefix>.N", N from a lock-protected counter (not InterlockedIncrement:
+// this only runs once per request/render-call, nowhere near hot enough for
+// a lock-free path to matter, and a plain critical section is one less
+// platform-specific primitive to get subtly wrong). Same naming shape as
+// TVDRX_WebSocketExecutive.NextConnID's "ws.conn.N" - deliberately, so a
+// glance at vdrx_daemon.log's topic names tells you what KIND of thing
+// minted a given identifier.
+function NextReplyTopic(const APrefix: string): string;
+begin
+  GReplyTopicLock.Enter;
+  try
+    Inc(GReplyTopicCounter);
+    Result := APrefix + '.' + IntToStr(GReplyTopicCounter);
+  finally
+    GReplyTopicLock.Leave;
   end;
+end;
+
+// The shared "publish a request, block for a correlated reply" primitive
+// behind both RunBusDaemonRoute (§3 of the readme) and BuildBusCLIResponse's
+// "template_topic" routing (§2). AEnvelope is the full JSON payload to
+// publish to AInTopic - this function only adds and manages "reply_to"
+// itself (via NextReplyTopic(AReplyPrefix)) so every caller doesn't have to
+// duplicate the mint/register/publish/wait/unregister sequence, or risk
+// forgetting the Unregister on a timeout path.
+function PublishAndWait(ARegistry: TVDRX_Registry; ABus: TVDRX_MessageQueue;
+  const AInTopic, AReplyPrefix: string; AEnvelope: TJSONObject;
+  ATimeoutMs: Integer; const ASourceID: string; out AReply: string): Boolean;
+var
+  ReplyTopic: string;
+  Waiter: TVDRX_OneShotWaiter;
+begin
+  ReplyTopic := NextReplyTopic(AReplyPrefix);
+  AEnvelope.Add('reply_to', ReplyTopic);
+
+  Waiter := TVDRX_OneShotWaiter.Create(ABus);
+  ARegistry.Register(Waiter, ReplyTopic, ReplyTopic); // ID = filter = the reply topic itself - nothing else needs to address this waiter by name
+
+  ABus.Publish(AInTopic, AEnvelope.AsJSON, ASourceID);
+  Result := Waiter.WaitForReply(ATimeoutMs, AReply);
+
+  ARegistry.Unregister(ReplyTopic); // external teardown (this call runs on the HTTP connection thread, not the waiter's own - it has none) - see TVDRX_OneShotWaiter's comment and vdrx_core.pas's Unregister-vs-UnregisterSelf distinction
+  if not Result then
+    ABus.Publish('log.warn', Format('bus wait: no reply on "%s" (published to "%s") within %dms', [ReplyTopic, AInTopic, ATimeoutMs]), ASourceID);
 end;
 
 // Turns a bus CLI script's one-line JSON reply into an actual HTTP response.
@@ -1757,18 +1898,34 @@ end;
 //   {"status":200,"content_type":"...","headers":{...},"body":"..."}
 //     - body is used verbatim.
 //   {"status":200,"template":"name","params":{...},"rows":{...}}
-//     - VDRX's own TVDRX_TemplateStore.Fill renders the body server-side
-//       (params -> %%var%% substitution, rows -> ##loop## blocks) - the
-//       script supplies data, not markup. See vdrx_templates.pas.
+//     - rendered server-side. Two ways this can resolve, chosen by whether
+//       "template_topic" is also present:
+//         - absent (the original, still-supported shape): ATemplates.Fill
+//           runs in-process against whichever HTTP site's own template
+//           store answered THIS connection - simple, zero bus round trip,
+//           but implicit: which store answers depends on which site's port
+//           the request happened to arrive on, which is surprising the
+//           moment more than one site could plausibly serve the same
+//           route (see the readme's §4b note on this).
+//         - present, e.g. {"template_topic":"template.vdrx_admin.render",
+//           "template":"greeting",...} - the render request is instead
+//           PUBLISHED to that explicit topic via PublishAndWait, and
+//           whichever TVDRX_TemplateExecutive is subscribed there (see
+//           vdrx_templates.pas and the "templates" config section)
+//           answers it, regardless of which HTTP site's connection this
+//           is. This is the fix for that ambiguity: the script says
+//           exactly which template store it means, instead of VDRX
+//           guessing from connection topology.
 // "status"/"content_type" fall back to 200/ADefaultContentType if omitted;
 // extra "headers" entries are appended as-is (last-write-wins with the
 // Content-Type/Content-Length lines this function always sets itself).
 function BuildBusCLIResponse(const AReplyLine, ADefaultContentType: string;
-  ATemplates: TVDRX_TemplateStore; ABus: TVDRX_MessageQueue; const ASourceID: string): string;
+  ATemplates: TVDRX_TemplateStore; ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string): string;
 var
   J: TJSONData;
-  Obj, ParamsObj, RowsObj, HeadersObj: TJSONObject;
-  Status, ContentType, Body, TemplateName: string;
+  Obj, ParamsObj, RowsObj, HeadersObj, RenderEnvelope, ReplyObj: TJSONObject;
+  ReplyJSON: TJSONData;
+  Status, ContentType, Body, TemplateName, TemplateTopic, ReplyRaw: string;
   StatusCode, i: Integer;
   Params: TStringList;
   NamedRows: TVDRX_TemplateNamedRows;
@@ -1798,17 +1955,51 @@ begin
     Status := IntToStr(StatusCode) + ' ' + HTTPStatusText(StatusCode);
     ContentType := Obj.Get('content_type', ADefaultContentType);
     TemplateName := Obj.Get('template', '');
+    TemplateTopic := Obj.Get('template_topic', '');
 
-    if TemplateName <> '' then
+    if (TemplateName <> '') and (TemplateTopic <> '') then
     begin
-      ParamsObj := FindJSONObject(Obj, 'params');
-      Params := TStringList.Create;
+      // Explicit routing - see this function's header comment. Forward
+      // exactly the fields a render request needs (template/params/rows)
+      // as their own envelope; PublishAndWait adds "reply_to" itself.
+      RenderEnvelope := TJSONObject.Create;
       try
-        if Assigned(ParamsObj) then
-          for i := 0 to ParamsObj.Count - 1 do
-            if ParamsObj.Items[i].JSONType in [jtString, jtNumber, jtBoolean] then
-              Params.Values[ParamsObj.Names[i]] := ParamsObj.Items[i].AsString;
+        RenderEnvelope.Add('template', TemplateName);
+        if Assigned(FindJSONObject(Obj, 'params')) then RenderEnvelope.Add('params', FindJSONObject(Obj, 'params').Clone);
+        if Assigned(FindJSONObject(Obj, 'rows')) then RenderEnvelope.Add('rows', FindJSONObject(Obj, 'rows').Clone);
 
+        if not PublishAndWait(ARegistry, ABus, TemplateTopic, 'template.reply', RenderEnvelope, 5000, ASourceID, ReplyRaw) then
+        begin
+          ABus.Publish('log.warn', Format('http bus cli: no template executive answered "%s" for template "%s"', [TemplateTopic, TemplateName]), ASourceID);
+          Exit(PlainResponse('502 Bad Gateway', 'text/plain', 'Template executive did not respond'));
+        end;
+      finally
+        RenderEnvelope.Free;
+      end;
+
+      Body := '';
+      ReplyJSON := nil;
+      try
+        try ReplyJSON := GetJSON(ReplyRaw); except ReplyJSON := nil; end;
+        if Assigned(ReplyJSON) and (ReplyJSON is TJSONObject) then
+        begin
+          ReplyObj := TJSONObject(ReplyJSON);
+          Body := ReplyObj.Get('body', '');
+        end;
+      finally
+        if Assigned(ReplyJSON) then ReplyJSON.Free;
+      end;
+      if Body = '' then
+        ABus.Publish('log.warn', Format('http bus cli: template executive "%s" returned no body for template "%s"', [TemplateTopic, TemplateName]), ASourceID);
+    end
+    else if TemplateName <> '' then
+    begin
+      // Original, still-supported shape - render in-process against
+      // whichever site's own TVDRX_TemplateStore answered this connection.
+      // See this function's header comment for the trade-off vs. above.
+      ParamsObj := FindJSONObject(Obj, 'params');
+      Params := JSONParamsToStringList(ParamsObj);
+      try
         RowsObj := FindJSONObject(Obj, 'rows');
         NamedRows := JSONRowsToTemplateRows(RowsObj);
         try
@@ -1820,7 +2011,7 @@ begin
         Params.Free;
       end;
       if Body = '' then
-        ABus.Publish('log.warn', 'http bus cli: template "' + TemplateName + '" not found or rendered empty', ASourceID);
+        ABus.Publish('log.warn', Format('http bus cli: template "%s" not found or rendered empty - looked for %s', [TemplateName, IncludeTrailingPathDelimiter(ATemplates.Dir) + TemplateName + '.tpl']), ASourceID);
     end
     else
       Body := Obj.Get('body', '');
@@ -1858,7 +2049,7 @@ end;
 // here, so anything printed before the JSON reply line would otherwise
 // corrupt it.
 function RunBusCLIScript(const ARequest: string; const ARoute: TVDRX_CLIRoute;
-  ATemplates: TVDRX_TemplateStore; ABus: TVDRX_MessageQueue; const ASourceID: string): string;
+  ATemplates: TVDRX_TemplateStore; ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string): string;
 var
   Method, Path, SubPath, QueryString, HeaderBlock, Body, ReqLine, Output, FirstLine: string;
   HeaderEnd: Integer;
@@ -1868,6 +2059,7 @@ var
   WatchdogThread: TThread;
   Buf: array[0..4095] of Byte;
   Received, i: Integer;
+  Cwd: string;
 begin
   ParseRequestLine(ARequest, Method, Path);
   QueryString := ExtractQueryString(ARequest);
@@ -1899,14 +2091,24 @@ begin
     {$WARN SYMBOL_DEPRECATED OFF} // CommandLine: same free-form "let TProcess parse the quoting" style as vdrx_bridge.pas's FCommand
     Proc.CommandLine := ARoute.Command;
     {$WARN SYMBOL_DEPRECATED ON}
-    Proc.CurrentDirectory := IfThen(ARoute.ScriptDir <> '', ARoute.ScriptDir, GetCurrentDir);
+    // Resolved to absolute up front (ExpandFileName is a no-op on an
+    // already-absolute path) so every log line below - and, more
+    // importantly, whatever error a language-specific interpreter prints
+    // when it can't find its own script - names an unambiguous location
+    // rather than a path that's only meaningful relative to wherever the
+    // daemon happened to be launched from. Worth having explicitly in mind
+    // once several cli_bridges entries (in different languages, possibly
+    // with different script_dir values) are all resolving relative paths
+    // against the same shared daemon CWD - see the readme's §4b gotcha.
+    Cwd := ExpandFileName(IfThen(ARoute.ScriptDir <> '', ARoute.ScriptDir, GetCurrentDir));
+    Proc.CurrentDirectory := Cwd;
     Proc.Options := [poUsePipes, poStderrToOutPut];
     try
       Proc.Execute;
     except
       on E: Exception do
       begin
-        ABus.Publish('log.error', Format('http bus cli: failed to start "%s" - %s', [ARoute.Command, E.Message]), ASourceID);
+        ABus.Publish('log.error', Format('http bus cli: failed to start "%s" (cwd=%s) - %s', [ARoute.Command, Cwd, E.Message]), ASourceID);
         Exit(PlainResponse('502 Bad Gateway', 'text/plain', 'Could not start script'));
       end;
     end;
@@ -1934,7 +2136,7 @@ begin
 
       if Watchdog.Fired then
       begin
-        ABus.Publish('log.error', Format('http bus cli: %s exceeded %dms, killed it', [ARoute.Command, ARoute.TimeoutMs]), ASourceID);
+        ABus.Publish('log.error', Format('http bus cli: %s (cwd=%s) exceeded %dms, killed it', [ARoute.Command, Cwd, ARoute.TimeoutMs]), ASourceID);
         Exit(PlainResponse('504 Gateway Timeout', 'text/plain', 'Script timed out'));
       end;
     finally
@@ -1979,17 +2181,70 @@ begin
       end;
     end;
     if (FirstLine = '') and (Count > 0) then
-      ABus.Publish('log.warn', Format('http bus cli: %s produced no line starting with "{" - raw output: %s', [ARoute.Command, Output]), ASourceID);
+      ABus.Publish('log.warn', Format('http bus cli: %s (cwd=%s) produced no line starting with "{" - raw output: %s', [ARoute.Command, Cwd, Output]), ASourceID);
   finally
     Free;
   end;
 
-  ABus.Publish('log.info', Format('http bus cli: %s %s (sub_path="%s") -> %d bytes', [ARoute.Command, Path, SubPath, Length(Output)]), ASourceID);
-  Result := BuildBusCLIResponse(FirstLine, ARoute.ContentType, ATemplates, ABus, ASourceID);
+  ABus.Publish('log.info', Format('http bus cli: %s %s (sub_path="%s", cwd=%s) -> %d bytes', [ARoute.Command, Path, SubPath, Cwd, Length(Output)]), ASourceID);
+  Result := BuildBusCLIResponse(FirstLine, ARoute.ContentType, ATemplates, ABus, ARegistry, ASourceID);
+end;
+
+// The 'bus-daemon' counterpart to RunBusCLIScript above - same request
+// envelope shape (method/path/prefix/sub_path/query/headers/body), same
+// reply shape (BuildBusCLIResponse handles both identically - a persistent
+// subscriber and a spawned script answer in exactly the same JSON), but no
+// process is spawned here at all: the request is published to ARoute.InTopic
+// and this just waits for a reply, via the same PublishAndWait primitive a
+// template_topic lookup uses. Whatever answers InTopic - typically a
+// persistent `processes` entry already subscribed to it, the same kind of
+// thing already running irc_bot - handles as many concurrent requests as
+// arrive, each getting its own uniquely-minted reply topic, without paying
+// spawn cost per request.
+function RunBusDaemonRoute(const ARequest: string; const ARoute: TVDRX_CLIRoute;
+  ATemplates: TVDRX_TemplateStore; ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string): string;
+var
+  Method, Path, SubPath, QueryString, HeaderBlock, Body, ReplyRaw: string;
+  HeaderEnd: Integer;
+  ReqObj: TJSONObject;
+begin
+  ParseRequestLine(ARequest, Method, Path);
+  QueryString := ExtractQueryString(ARequest);
+  HeaderEnd := Pos(#13#10#13#10, ARequest);
+  if HeaderEnd > 0 then HeaderBlock := Copy(ARequest, 1, HeaderEnd - 1) else HeaderBlock := ARequest;
+  Body := ExtractBody(ARequest);
+
+  if Length(Path) >= Length(ARoute.Prefix) then
+    SubPath := Copy(Path, Length(ARoute.Prefix) + 1, MaxInt)
+  else
+    SubPath := '';
+
+  ReqObj := TJSONObject.Create;
+  try
+    ReqObj.Add('method', Method);
+    ReqObj.Add('path', Path);
+    ReqObj.Add('prefix', ARoute.Prefix);
+    ReqObj.Add('sub_path', SubPath);
+    ReqObj.Add('query', QueryString);
+    ReqObj.Add('headers', HeadersToJSON(HeaderBlock));
+    ReqObj.Add('body', Body);
+
+    if not PublishAndWait(ARegistry, ABus, ARoute.InTopic, 'http.reply', ReqObj, ARoute.TimeoutMs, ASourceID, ReplyRaw) then
+    begin
+      ABus.Publish('log.error', Format('http bus-daemon: no subscriber on "%s" answered %s within %dms', [ARoute.InTopic, Path, ARoute.TimeoutMs]), ASourceID);
+      Exit(PlainResponse('504 Gateway Timeout', 'text/plain', 'No daemon answered in time'));
+    end;
+  finally
+    ReqObj.Free;
+  end;
+
+  ABus.Publish('log.info', Format('http bus-daemon: %s %s (in_topic=%s) -> %d bytes', [Method, Path, ARoute.InTopic, Length(ReplyRaw)]), ASourceID);
+  Result := BuildBusCLIResponse(ReplyRaw, ARoute.ContentType, ATemplates, ABus, ARegistry, ASourceID);
 end;
 
 constructor TVDRX_HTTPExecutive.Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config; ATemplates: TVDRX_TemplateStore;
-  const AStaticDir: string; const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes);
+  const AStaticDir: string; const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
+  ARegistry: TVDRX_Registry);
 begin
   inherited Create(ABus);
   FConfig := AConfig;
@@ -1997,13 +2252,14 @@ begin
   FStaticDir := AStaticDir;
   FProxyRoutes := AProxyRoutes;
   FCLIRoutes := ACLIRoutes;
+  FRegistry := ARegistry;
   Port := 8081;
 end;
 
 class function TVDRX_HTTPExecutive.BuildResponse(const ARequest: string;
   ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
   const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
-  ABus: TVDRX_MessageQueue; const ASourceID: string): string;
+  ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string): string;
 var
   Method, Path, BoardName: string;
   Route: TVDRX_ProxyRoute;
@@ -2019,10 +2275,15 @@ begin
 
   if MatchCLIRoute(Path, ACLIRoutes, CLIRoute) then
   begin
-    if SameText(CLIRoute.Protocol, 'bus') then
+    if SameText(CLIRoute.Protocol, 'bus-daemon') then
+    begin
+      ABus.Publish('log.info', Format('http: %s %s -> bus-daemon %s', [Method, Path, CLIRoute.InTopic]), ASourceID);
+      Exit(RunBusDaemonRoute(ARequest, CLIRoute, ATemplates, ABus, ARegistry, ASourceID));
+    end
+    else if SameText(CLIRoute.Protocol, 'bus') then
     begin
       ABus.Publish('log.info', Format('http: %s %s -> bus cli %s', [Method, Path, CLIRoute.Command]), ASourceID);
-      Exit(RunBusCLIScript(ARequest, CLIRoute, ATemplates, ABus, ASourceID));
+      Exit(RunBusCLIScript(ARequest, CLIRoute, ATemplates, ABus, ARegistry, ASourceID));
     end
     else
     begin
@@ -2048,7 +2309,7 @@ begin
   if Request <> '' then
   begin
     ParseRequestLine(Request, Method, Path);
-    Response := BuildResponse(Request, FTemplates, FConfig, FStaticDir, FProxyRoutes, FCLIRoutes, Bus, ID);
+    Response := BuildResponse(Request, FTemplates, FConfig, FStaticDir, FProxyRoutes, FCLIRoutes, Bus, FRegistry, ID);
     Bus.Publish('log.info', Format('http: %s %s -> %s', [Method, Path, StatusOf(Response)]), ID);
     ATransport.Write(Response[1], Length(Response));
   end
@@ -2134,7 +2395,6 @@ begin
   FListener := AListener;
   FTransport := ATransport;
   FSendLock := TCriticalSection.Create;
-  FAuthenticated := False;
 end;
 
 destructor TVDRX_WSConnection.Destroy;
@@ -2304,7 +2564,24 @@ begin
   end;
 end;
 
-procedure TVDRX_WSConnection.HandleRPC(const ALine: string);
+{ TVDRX_WSProtocolExecutive }
+
+constructor TVDRX_WSProtocolExecutive.Create(ABus: TVDRX_MessageQueue; AListener: TVDRX_WebSocketExecutive; AConn: TVDRX_WSConnection);
+begin
+  inherited Create(ABus);
+  FListener := AListener;
+  FConn := AConn;
+  FAuthenticated := False;
+end;
+
+// AMsg.Payload is one raw client text frame's worth of JSON - published by
+// TVDRX_WSConnection.RunLoop onto this executive's own "<connID>.rpc.in"
+// subscription (see TVDRX_WebSocketExecutive.AdoptConnection), never parsed
+// by the connectivity object itself. Same method set and behaviour as the
+// original in-connection HandleRPC; only WHERE it runs, and how a reply
+// reaches the browser (FConn.ID + '.rpc.out' instead of a direct SendFrame
+// call - see TVDRX_WSConnection's class comment), has changed.
+procedure TVDRX_WSProtocolExecutive.HandlePacket(const AMsg: TVDRX_Message);
 var
   J: TJSONData;
   Obj: TJSONObject;
@@ -2312,9 +2589,9 @@ var
   Method, Topic, Payload, Token, Src: string;
 begin
   try
-    J := GetJSON(ALine);
+    J := GetJSON(AMsg.Payload);
   except
-    Bus.Publish('log.warn', 'ws ' + ID + ': dropped malformed JSON RPC: ' + ALine, ID);
+    Bus.Publish('log.warn', 'ws ' + FConn.ID + ': dropped malformed JSON RPC: ' + AMsg.Payload, ID);
     Exit;
   end;
   try
@@ -2325,38 +2602,38 @@ begin
     if Method = 'sys.auth' then
     begin
       Token := Obj.Get('token', '');
-      Src := Obj.Get('source', ID);
+      Src := Obj.Get('source', FConn.ID);
       FAuthenticated := Token <> '';
       if FAuthenticated then
-        Bus.Publish('log.info', 'ws ' + ID + ': authenticated (stub - any nonempty token passes)', ID)
+        Bus.Publish('log.info', 'ws ' + FConn.ID + ': authenticated (stub - any nonempty token passes)', ID)
       else
-        Bus.Publish('log.warn', 'ws ' + ID + ': sys.auth sent with an empty token, rejected', ID);
-      SendFrame(Format('{"event":"auth.ok","source":%s}', [JSONString(Src)]));
+        Bus.Publish('log.warn', 'ws ' + FConn.ID + ': sys.auth sent with an empty token, rejected', ID);
+      Bus.Publish(FConn.ID + '.rpc.out', Format('{"event":"auth.ok","source":%s}', [JSONString(Src)]), ID);
       Exit;
     end;
 
     if not FAuthenticated then
     begin
-      Bus.Publish('log.warn', 'ws ' + ID + ': "' + Method + '" ignored - not authenticated yet', ID);
+      Bus.Publish('log.warn', 'ws ' + FConn.ID + ': "' + Method + '" ignored - not authenticated yet', ID);
       Exit;
     end;
 
     if Method = 'subscribe' then
     begin
       Topic := Obj.Get('filter', '');
-      Bus.Publish('log.info', 'ws ' + ID + ': subscribe "' + Topic + '"', ID);
-      FListener.Registry.Register(Self, ID, Topic);
+      Bus.Publish('log.info', 'ws ' + FConn.ID + ': subscribe "' + Topic + '"', ID);
+      FListener.Registry.Register(FConn, FConn.ID, Topic);
     end
     else if Method = 'unsubscribe' then
     begin
       Topic := Obj.Get('filter', '');
-      Bus.Publish('log.info', 'ws ' + ID + ': unsubscribe "' + Topic + '"', ID);
-      FListener.Registry.UnregisterFilter(ID, Topic);
+      Bus.Publish('log.info', 'ws ' + FConn.ID + ': unsubscribe "' + Topic + '"', ID);
+      FListener.Registry.UnregisterFilter(FConn.ID, Topic);
     end
     else if Method = 'unsubscribe_all' then
     begin
-      Bus.Publish('log.info', 'ws ' + ID + ': unsubscribe_all', ID);
-      FListener.Registry.ClearFilters(ID);
+      Bus.Publish('log.info', 'ws ' + FConn.ID + ': unsubscribe_all', ID);
+      FListener.Registry.ClearFilters(FConn.ID);
     end
     else if Method = 'publish' then
     begin
@@ -2368,11 +2645,11 @@ begin
         Payload := PayloadData.AsString
       else
         Payload := PayloadData.AsJSON;
-      Bus.Publish('log.info', 'ws ' + ID + ': publish "' + Topic + '" ' + Payload, ID);
-      Bus.Publish(Topic, Payload, ID);
+      Bus.Publish('log.info', 'ws ' + FConn.ID + ': publish "' + Topic + '" ' + Payload, ID);
+      Bus.Publish(Topic, Payload, FConn.ID);
     end
     else
-      Bus.Publish('log.warn', 'ws ' + ID + ': unrecognised RPC method "' + Method + '"', ID);
+      Bus.Publish('log.warn', 'ws ' + FConn.ID + ': unrecognised RPC method "' + Method + '"', ID);
   finally
     J.Free;
   end;
@@ -2399,7 +2676,10 @@ begin
   begin
     if not ReadFrame(Payload, Opcode) then Break;
     case Opcode of
-      1: HandleRPC(Payload);
+      // Text frames are pure connectivity's job to MOVE, not interpret -
+      // republished onto the bus for TVDRX_WSProtocolExecutive (see its
+      // class comment) rather than parsed here.
+      1: Bus.Publish(ID + '.rpc.in', Payload, ID);
       9: SendFrame(Payload, 10); // client ping - echo back as pong, per spec
       10: FLastPong := Now;      // reply to OUR ping - see PingLoop
     end;
@@ -2420,6 +2700,7 @@ begin
 
   Bus.Publish('log.info', 'ws ' + ID + ': disconnected', ID);
   Bus.Publish('sys.ws.disconnected', Format('{"id":%s}', [JSONString(ID)]), ID);
+  FListener.Registry.Unregister(ID + '.rpc'); // the protocol executive - external teardown (still running on THIS thread, not its own - it has none), must happen before we UnregisterSelf below
   FListener.Registry.UnregisterSelf(ID); // NOT Unregister - this is our own thread, see vdrx_core.pas's UnregisterSelf comment
   // Self (and every field on it, including FTransport/FSendLock) is invalid
   // from this point on - do not touch anything after the call above.
@@ -2498,6 +2779,17 @@ end;
 
 procedure TVDRX_WSConnection.HandlePacket(const AMsg: TVDRX_Message);
 begin
+  // The protocol executive's own reply channel - already a complete,
+  // fully-formed JSON line (e.g. the "auth.ok" event) - relayed to the
+  // browser verbatim, NOT wrapped in the topic/payload/source/seq envelope
+  // below (which is this connection's own "a browser is a bus participant"
+  // wire format for genuine bus traffic, not an RPC reply) - see this
+  // class's declaration comment and TVDRX_WSProtocolExecutive's.
+  if AMsg.Topic = ID + '.rpc.out' then
+  begin
+    SendFrame(AMsg.Payload);
+    Exit;
+  end;
   Bus.Publish('log.info', 'ws ' + ID + ': -> "' + AMsg.Topic + '" ' + AMsg.Payload, ID);
   SendFrame(Format('{"topic":%s,"payload":%s,"source":%s,"seq":%d}',
     [JSONString(AMsg.Topic), AMsg.Payload, JSONString(AMsg.SourceID), AMsg.Seq]));
@@ -2525,6 +2817,7 @@ end;
 procedure TVDRX_WebSocketExecutive.AdoptConnection(ATransport: TVDRX_Transport; const AInitialRequest: string);
 var
   Conn: TVDRX_WSConnection;
+  Protocol: TVDRX_WSProtocolExecutive;
   NewID: string;
 begin
   Conn := TVDRX_WSConnection.Create(Bus, Self, ATransport);
@@ -2532,7 +2825,15 @@ begin
   NewID := NextConnID;
   Bus.Publish('sys.ws.connected', Format('{"id":%s}', [JSONString(NewID)]), ID);
   Bus.Publish('log.info', 'ws: new connection ' + NewID, ID);
-  FRegistry.Register(Conn, NewID, 'sys.none');
+  // Registered on its own "<id>.rpc.out" from the start (not the old
+  // "sys.none" placeholder) - that's how a TVDRX_WSProtocolExecutive reply
+  // (an auth.ok event, say) reaches this connection at all before the
+  // browser has subscribed to anything of its own yet. Further filters
+  // (whatever the browser 'subscribe's to) are added on top by the
+  // protocol executive below - see its HandlePacket.
+  FRegistry.Register(Conn, NewID, NewID + '.rpc.out');
+  Protocol := TVDRX_WSProtocolExecutive.Create(Bus, Self, Conn);
+  FRegistry.Register(Protocol, NewID + '.rpc', NewID + '.rpc.in');
   Conn.Initialize;
 end;
 
@@ -2845,6 +3146,12 @@ begin
   if Length(OutStr) > 0 then
     Transport.Write(OutStr[1], Length(OutStr));
 end;
+
+initialization
+  GReplyTopicLock := TCriticalSection.Create;
+
+finalization
+  GReplyTopicLock.Free;
 
 end.
 
