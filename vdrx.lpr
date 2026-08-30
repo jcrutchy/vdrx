@@ -224,31 +224,60 @@ begin
   end;
 end;
 
+// "protocol": "cgi" (default) | "bus" - see TVDRX_CLIRoute's comment in
+// vdrx_network.pas for the full contract difference. 'cgi' keeps the
+// original required fields (script_dir is where per-path script files are
+// resolved from). 'bus' only needs id/prefix/command - script_dir becomes
+// optional (just sets the process's working directory) since there's no
+// per-path file lookup: Command is the one fixed script that handles
+// everything under Prefix, and Prefix itself behaves as a URL-rewrite base
+// rather than a filesystem root - see RunBusCLIScript's sub_path/query
+// passthrough.
 procedure SetupCLIBridges(AConfig: TVDRX_Config; out ARoutes: TVDRX_CLIRoutes);
 var
   Rows: TVDRX_ConfigRows;
   Row: TStringList;
   n: Integer;
+  Protocol: string;
 begin
   SetLength(ARoutes, 0);
   Rows := AConfig.GetObjectArray('cli_bridges');
   try
     for Row in Rows do
     begin
-      if (Row.Values['id'] = '') or (Row.Values['command'] = '') or (Row.Values['prefix'] = '') or (Row.Values['script_dir'] = '') then
+      if (Row.Values['id'] = '') or (Row.Values['command'] = '') or (Row.Values['prefix'] = '') then
       begin
-        WriteLn('  Skipping cli_bridges entry - needs id, prefix, command, and script_dir.');
+        WriteLn('  Skipping cli_bridges entry - needs at least id, prefix, and command.');
         Continue;
       end;
+
+      Protocol := LowerCase(IfThen(Row.Values['protocol'] <> '', Row.Values['protocol'], 'cgi'));
+      if (Protocol <> 'cgi') and (Protocol <> 'bus') then
+      begin
+        WriteLn('  cli_bridges entry "', Row.Values['id'], '": unrecognized protocol "', Protocol, '" - using "cgi".');
+        Protocol := 'cgi';
+      end;
+      if (Protocol = 'cgi') and (Row.Values['script_dir'] = '') then
+      begin
+        WriteLn('  Skipping cli_bridges entry "', Row.Values['id'], '" - protocol "cgi" also needs script_dir.');
+        Continue;
+      end;
+
       n := Length(ARoutes);
       SetLength(ARoutes, n + 1);
       ARoutes[n].Prefix := Row.Values['prefix'];
       ARoutes[n].Command := Row.Values['command'];
-      ARoutes[n].ScriptDir := Row.Values['script_dir'];
+      ARoutes[n].ScriptDir := Row.Values['script_dir']; // optional for 'bus' - RunBusCLIScript falls back to '.'
       ARoutes[n].TimeoutMs := StrToIntDef(Row.Values['timeout_ms'], 5000);
       ARoutes[n].ContentType := IfThen(Row.Values['content_type'] <> '', Row.Values['content_type'], 'text/html');
-      WriteLn('  CLI bridge "', Row.Values['id'], '": ', ARoutes[n].Prefix, ' -> ',
-        ARoutes[n].Command, ' ', ARoutes[n].ScriptDir, '/* (timeout_ms=', ARoutes[n].TimeoutMs, ')');
+      ARoutes[n].Protocol := Protocol;
+
+      if Protocol = 'bus' then
+        WriteLn('  CLI bridge "', Row.Values['id'], '" (bus): ', ARoutes[n].Prefix, ' -> ',
+          ARoutes[n].Command, ' (timeout_ms=', ARoutes[n].TimeoutMs, ')')
+      else
+        WriteLn('  CLI bridge "', Row.Values['id'], '" (cgi): ', ARoutes[n].Prefix, ' -> ',
+          ARoutes[n].Command, ' ', ARoutes[n].ScriptDir, '/* (timeout_ms=', ARoutes[n].TimeoutMs, ')');
     end;
   finally
     Rows.Free;

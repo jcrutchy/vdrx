@@ -1,6 +1,6 @@
 <?php
 /**
- * irc_soylent.php
+ * irc_client.php
  *
  * A small IRC client protocol daemon meant to run as a VDRX-supervised
  * process (vdrx_bridge), subscribed to a TVDRX_SocketClientExecutive's
@@ -36,10 +36,10 @@ $options = getopt('', ['nick:', 'user:', 'realname:', 'channel:', 'in-topic:', '
 $nick       = $options['nick']       ?? 'vdrxbot';
 $user       = $options['user']       ?? 'vdrx';
 $realname   = $options['realname']   ?? 'VDRX IRC Bridge';
-$channel    = $options['channel']    ?? '';           // optional, auto-joined after 001
-$inTopic    = $options['in-topic']   ?? 'soylent.in';  // what the socket client writes to the socket
-$outTopic   = $options['out-topic']  ?? 'soylent.out'; // what the socket client publishes reads as
-$logFile    = $options['log']        ?? __DIR__ . '/irc_soylent.log';
+$channel    = $options['channel']    ?? '#vdrx';           // optional, auto-joined after 001
+$inTopic    = $options['in-topic']   ?? 'irc_bot.in';  // what the socket client writes to the socket
+$outTopic   = $options['out-topic']  ?? 'freenode.out'; // what the socket client publishes reads as
+$logFile    = $options['log']        ?? __DIR__ . '/irc_client.log';
 
 $registered = false;
 
@@ -92,7 +92,7 @@ function handleIrcLine(string $line): void
     // here, rather than blindly on startup (joining before registration
     // completes is rejected by the server).
     $parts = explode(' ', $line, 4);
-    if (!$registered && isset($parts[1]) && $parts[1] === '001') {
+    if (!$registered && isset($parts[1]) && $parts[1] === '376') {
         $registered = true;
         logLine('registration complete');
         if ($channel !== '') {

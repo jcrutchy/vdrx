@@ -28,13 +28,52 @@ type
   // A one-shot-per-request PHP (or anything else) invocation, as opposed to
   // TVDRX_ProxyRoute's persistent Bridge-managed backend. No Registry/Bridge
   // involved at all - just this route table, consulted per request; the
-  // process is spawned, run, and freed entirely within RunCLIScript below.
+  // process is spawned, run, and freed entirely within RunCLIScript (or
+  // RunBusCLIScript, for Protocol='bus') below.
+  //
+  // Protocol distinguishes two entirely different wire contracts sharing one
+  // route table and one prefix-matching mechanism (MatchCLIRoute):
+  //
+  //   'cgi' (default, original/unchanged behaviour) - Command is treated as
+  //   just the interpreter ("php", "c:/php/php"); the URL path beyond Prefix
+  //   is resolved to a script FILE under ScriptDir (see ResolveScriptPath)
+  //   and appended as that interpreter's one parameter. The script talks CGI
+  //   env vars (REQUEST_METHOD, QUERY_STRING, ...) and its raw stdout bytes
+  //   become the response body verbatim - see RunCLIScript.
+  //
+  //   'bus' - Command is the FULL command line for a single fixed script
+  //   that handles every request under Prefix, however deep
+  //   ("php scripts/hello_bus.php", "cmd /c scripts\hello_bus.bat",
+  //   "python3 scripts/hello_bus.py" - same free-form string TProcess.
+  //   CommandLine already parses for vdrx_bridge.pas's persistent processes,
+  //   reused here for a one-shot process instead). There's no per-path file
+  //   lookup at all - Prefix behaves like a URL-rewrite base, and whatever
+  //   comes after it (path suffix + query string) is handed to the script
+  //   as DATA, not resolved to a file, so the script decides what it means.
+  //   ScriptDir is optional here (just sets the process's working
+  //   directory, default '.') since there's no ScriptDir-relative file
+  //   resolution to do. The script reads exactly one JSON line off stdin -
+  //   {"method":...,"path":...,"prefix":...,"sub_path":...,"query":...,
+  //   "headers":{...},"body":...} - and must write exactly one JSON line
+  //   back to stdout - {"status":200,"body":"..."} or
+  //   {"status":200,"template":"name","params":{...},"rows":{...}} to have
+  //   VDRX's own TVDRX_TemplateStore render it - before exiting. Same "only
+  //   ever write the structured envelope to stdout, log anything else to a
+  //   file instead" discipline scripts/irc_soylent.php already follows for
+  //   vdrx_bridge.pas's persistent-process stdin/stdout protocol - see
+  //   RunBusCLIScript's comment for why. This is the mechanism for a
+  //   one-shot "script executed only by the HTTP request"; a long-running
+  //   daemon that answers HTTP requests via a subscribed bus filter instead
+  //   (the other half of the original design discussion) is a separate,
+  //   not-yet-built piece - a persistent TVDRX_BridgeExecutive with a
+  //   correlation-ID reply-topic scheme, not this one-shot-per-request path.
   TVDRX_CLIRoute = record
     Prefix: string;
     Command: string;
     ScriptDir: string;
     TimeoutMs: Integer;
     ContentType: string;
+    Protocol: string; // 'cgi' (default) | 'bus' - see comment above
   end;
   TVDRX_CLIRoutes = array of TVDRX_CLIRoute;
 
@@ -1532,7 +1571,17 @@ begin
     //Proc.Options := [poUsePipes, poStderrToOutPut, poSearchPath]; // poSearchPath not in process.TProcessOptions
     Proc.Options := [poUsePipes, poStderrToOutPut];
 
-    Proc.CurrentDirectory := ARoute.ScriptDir;
+    // NOT Proc.CurrentDirectory := ARoute.ScriptDir here - ScriptPath (the
+    // Parameters.Add above) was already built by ResolveScriptPath as
+    // ARoute.ScriptDir + Rel, i.e. relative to the DAEMON's own working
+    // directory. Setting CurrentDirectory to ScriptDir as well doubled that
+    // prefix - the child ended up looking for ScriptDir/ScriptPath (e.g.
+    // "phpcli/phpcli/index.php") from inside ScriptDir, which never
+    // resolved once ScriptDir was a relative path (an absolute ScriptDir
+    // masked this, since PHP would just fail to find ITS half and the
+    // symptom looked identical). Leaving CurrentDirectory unset lets the
+    // child inherit the daemon's own CWD, which is exactly the base
+    // ScriptPath was already computed against.
     Proc.Execute;
 
     Watchdog := TCLIWatchdog.Create(Proc, ARoute.TimeoutMs);
@@ -1570,6 +1619,345 @@ begin
   Result := PlainResponse('200 OK', ARoute.ContentType, Output);
 end;
 
+// Common status-code -> reason-phrase text for the handful of codes a bus
+// CLI script is realistically going to return. Falls back to a generic
+// phrase for anything else - the phrase is cosmetic (RFC 7230 says clients
+// MUST ignore it), so an approximate one for an unlisted code is harmless.
+function HTTPStatusText(ACode: Integer): string;
+begin
+  case ACode of
+    200: Result := 'OK';
+    201: Result := 'Created';
+    204: Result := 'No Content';
+    301: Result := 'Moved Permanently';
+    302: Result := 'Found';
+    303: Result := 'See Other';
+    304: Result := 'Not Modified';
+    307: Result := 'Temporary Redirect';
+    400: Result := 'Bad Request';
+    401: Result := 'Unauthorized';
+    403: Result := 'Forbidden';
+    404: Result := 'Not Found';
+    405: Result := 'Method Not Allowed';
+    500: Result := 'Internal Server Error';
+    502: Result := 'Bad Gateway';
+    504: Result := 'Gateway Timeout';
+  else
+    if (ACode >= 200) and (ACode < 300) then Result := 'OK'
+    else if (ACode >= 400) and (ACode < 500) then Result := 'Error'
+    else if ACode >= 500 then Result := 'Server Error'
+    else Result := 'Unknown';
+  end;
+end;
+
+// Everything after the blank line that ends the headers - '' if the request
+// never got that far (see ReadFullRequest, which is what actually put the
+// body there in the first place; this just re-locates it from the combined
+// string rather than threading a separate parameter through every caller).
+function ExtractBody(const ARequest: string): string;
+var
+  HeaderEnd: Integer;
+begin
+  HeaderEnd := Pos(#13#10#13#10, ARequest);
+  if HeaderEnd = 0 then Exit('');
+  Result := Copy(ARequest, HeaderEnd + 4, MaxInt);
+end;
+
+// Every "Name: Value" header line (skipping the request line itself) as one
+// flat JSON object. A repeated header name overwrites rather than
+// accumulating into an array - a simplification consistent with
+// ExtractHeaderValue's existing "first/only match wins" contract elsewhere
+// in this unit, fine for the common single-value headers a bus CLI script
+// actually cares about (Host, Content-Type, Cookie, ...).
+function HeadersToJSON(const AHeaderBlock: string): TJSONObject;
+var
+  SL: TStringList;
+  i, Colon: Integer;
+  Name, Value: string;
+begin
+  Result := TJSONObject.Create;
+  SL := TStringList.Create;
+  try
+    SL.Text := AHeaderBlock;
+    for i := 1 to SL.Count - 1 do // line 0 is the request line, not a header
+    begin
+      Colon := Pos(':', SL[i]);
+      if Colon > 0 then
+      begin
+        Name := Trim(Copy(SL[i], 1, Colon - 1));
+        Value := Trim(Copy(SL[i], Colon + 1, MaxInt));
+        if Name <> '' then
+          Result.Strings[Name] := Value;
+      end;
+    end;
+  finally
+    SL.Free;
+  end;
+end;
+
+// Find-with-type-check helper - TJSONObject.Find can return a member of any
+// JSON type (or nil), and a plain "as TJSONObject" cast on a non-nil but
+// wrong-typed result raises EInvalidCast rather than failing gracefully.
+// A bus CLI script sending malformed shapes (e.g. "params": "oops", a
+// string instead of an object) should degrade to "field absent", not crash
+// the HTTP executive's connection thread.
+function FindJSONObject(AObj: TJSONObject; const AName: string): TJSONObject;
+var
+  D: TJSONData;
+begin
+  D := AObj.Find(AName);
+  if Assigned(D) and (D is TJSONObject) then
+    Result := TJSONObject(D)
+  else
+    Result := nil;
+end;
+
+// Converts a bus CLI reply's optional "rows" object - {"loopName": [{...
+// row fields ...}, ...], ...} - into the TVDRX_TemplateNamedRows shape
+// TVDRX_TemplateStore.Fill expects for ##loop:loopName##...##endloop##
+// blocks. Only scalar fields within each row object are kept (same
+// restriction GetObjectArray already applies to config rows in
+// vdrx_config.pas - a template row is a flat Name=Value record, same as
+// there). Non-array values under a loop name, or non-object entries within
+// one, are silently skipped rather than raising - a malformed "rows" value
+// from a buggy script should render that loop as empty, not 500 the whole
+// response. Caller owns and frees the result (it owns its TVDRX_TemplateRows
+// values too, via doOwnsValues).
+function JSONRowsToTemplateRows(ARowsObj: TJSONObject): TVDRX_TemplateNamedRows;
+var
+  i, j, k: Integer;
+  Arr: TJSONArray;
+  RowObj: TJSONObject;
+  Rows: TVDRX_TemplateRows;
+  Row: TStringList;
+begin
+  Result := TVDRX_TemplateNamedRows.Create([doOwnsValues]);
+  if not Assigned(ARowsObj) then Exit;
+  for i := 0 to ARowsObj.Count - 1 do
+  begin
+    if ARowsObj.Items[i].JSONType <> jtArray then Continue;
+    Arr := TJSONArray(ARowsObj.Items[i]);
+    Rows := TVDRX_TemplateRows.Create(True);
+    for j := 0 to Arr.Count - 1 do
+    begin
+      if not (Arr[j] is TJSONObject) then Continue;
+      RowObj := TJSONObject(Arr[j]);
+      Row := TStringList.Create;
+      for k := 0 to RowObj.Count - 1 do
+        if RowObj.Items[k].JSONType in [jtString, jtNumber, jtBoolean] then
+          Row.Values[RowObj.Names[k]] := RowObj.Items[k].AsString;
+      Rows.Add(Row);
+    end;
+    Result.Add(ARowsObj.Names[i], Rows);
+  end;
+end;
+
+// Turns a bus CLI script's one-line JSON reply into an actual HTTP response.
+// Two response shapes, chosen by which fields are present:
+//   {"status":200,"content_type":"...","headers":{...},"body":"..."}
+//     - body is used verbatim.
+//   {"status":200,"template":"name","params":{...},"rows":{...}}
+//     - VDRX's own TVDRX_TemplateStore.Fill renders the body server-side
+//       (params -> %%var%% substitution, rows -> ##loop## blocks) - the
+//       script supplies data, not markup. See vdrx_templates.pas.
+// "status"/"content_type" fall back to 200/ADefaultContentType if omitted;
+// extra "headers" entries are appended as-is (last-write-wins with the
+// Content-Type/Content-Length lines this function always sets itself).
+function BuildBusCLIResponse(const AReplyLine, ADefaultContentType: string;
+  ATemplates: TVDRX_TemplateStore; ABus: TVDRX_MessageQueue; const ASourceID: string): string;
+var
+  J: TJSONData;
+  Obj, ParamsObj, RowsObj, HeadersObj: TJSONObject;
+  Status, ContentType, Body, TemplateName: string;
+  StatusCode, i: Integer;
+  Params: TStringList;
+  NamedRows: TVDRX_TemplateNamedRows;
+begin
+  if Trim(AReplyLine) = '' then
+  begin
+    ABus.Publish('log.warn', 'http bus cli: empty reply from script (nothing written to stdout before exit)', ASourceID);
+    Exit(PlainResponse('502 Bad Gateway', 'text/plain', 'Empty response from script'));
+  end;
+
+  J := nil;
+  try
+    J := GetJSON(AReplyLine);
+  except
+    J := nil; // same "nil result AND exception both mean unparseable" handling as EnsureJSONPayload in vdrx_bridge.pas
+  end;
+  if not Assigned(J) or not (J is TJSONObject) then
+  begin
+    ABus.Publish('log.warn', 'http bus cli: reply was not a JSON object: ' + AReplyLine, ASourceID);
+    if Assigned(J) then J.Free;
+    Exit(PlainResponse('502 Bad Gateway', 'text/plain', 'Malformed response from script'));
+  end;
+
+  Obj := TJSONObject(J);
+  try
+    StatusCode := Obj.Get('status', 200);
+    Status := IntToStr(StatusCode) + ' ' + HTTPStatusText(StatusCode);
+    ContentType := Obj.Get('content_type', ADefaultContentType);
+    TemplateName := Obj.Get('template', '');
+
+    if TemplateName <> '' then
+    begin
+      ParamsObj := FindJSONObject(Obj, 'params');
+      Params := TStringList.Create;
+      try
+        if Assigned(ParamsObj) then
+          for i := 0 to ParamsObj.Count - 1 do
+            if ParamsObj.Items[i].JSONType in [jtString, jtNumber, jtBoolean] then
+              Params.Values[ParamsObj.Names[i]] := ParamsObj.Items[i].AsString;
+
+        RowsObj := FindJSONObject(Obj, 'rows');
+        NamedRows := JSONRowsToTemplateRows(RowsObj);
+        try
+          Body := ATemplates.Fill(TemplateName, Params, NamedRows);
+        finally
+          NamedRows.Free;
+        end;
+      finally
+        Params.Free;
+      end;
+      if Body = '' then
+        ABus.Publish('log.warn', 'http bus cli: template "' + TemplateName + '" not found or rendered empty', ASourceID);
+    end
+    else
+      Body := Obj.Get('body', '');
+
+    Result := 'HTTP/1.1 ' + Status + #13#10 + 'Content-Type: ' + ContentType + #13#10;
+
+    HeadersObj := FindJSONObject(Obj, 'headers');
+    if Assigned(HeadersObj) then
+      for i := 0 to HeadersObj.Count - 1 do
+        if HeadersObj.Items[i].JSONType in [jtString, jtNumber, jtBoolean] then
+          Result := Result + HeadersObj.Names[i] + ': ' + HeadersObj.Items[i].AsString + #13#10;
+
+    Result := Result + 'Content-Length: ' + IntToStr(Length(Body)) + #13#10#13#10 + Body;
+  finally
+    Obj.Free;
+  end;
+end;
+
+// The 'bus' counterpart to RunCLIScript above - spawns ARoute.Command fresh
+// per request (same TCLIWatchdog-bounded lifetime), but talks the bus's own
+// JSON-envelope shape instead of CGI env vars + raw body passthrough. Prefix
+// behaves as a URL-rewrite base rather than a filesystem lookup root: the
+// path beyond it (SubPath) and the raw query string are handed to the
+// script as data in the request envelope, exactly like the original design
+// discussion's "base_uri" idea - the script decides what a request for
+// "/irc/channel/%23blah" or "/irc?channel=%23blah" under a "/irc" route
+// means, VDRX doesn't parse it for them.
+//
+// Only the FIRST non-empty line the script writes to stdout is treated as
+// its reply - same "one structured line, nothing else, ever" discipline
+// scripts/irc_soylent.php already documents for vdrx_bridge.pas's
+// persistent-process protocol (see that script's header comment). A script
+// that wants to log its own activity should write to a local file, not
+// stdout/stderr - poStderrToOutPut merges both into the same stream read
+// here, so anything printed before the JSON reply line would otherwise
+// corrupt it.
+function RunBusCLIScript(const ARequest: string; const ARoute: TVDRX_CLIRoute;
+  ATemplates: TVDRX_TemplateStore; ABus: TVDRX_MessageQueue; const ASourceID: string): string;
+var
+  Method, Path, SubPath, QueryString, HeaderBlock, Body, ReqLine, Output, FirstLine: string;
+  HeaderEnd: Integer;
+  ReqObj: TJSONObject;
+  Proc: TProcess;
+  Watchdog: TCLIWatchdog;
+  WatchdogThread: TThread;
+  Buf: array[0..4095] of Byte;
+  Received: Integer;
+begin
+  ParseRequestLine(ARequest, Method, Path);
+  QueryString := ExtractQueryString(ARequest);
+  HeaderEnd := Pos(#13#10#13#10, ARequest);
+  if HeaderEnd > 0 then HeaderBlock := Copy(ARequest, 1, HeaderEnd - 1) else HeaderBlock := ARequest;
+  Body := ExtractBody(ARequest);
+
+  if Length(Path) >= Length(ARoute.Prefix) then
+    SubPath := Copy(Path, Length(ARoute.Prefix) + 1, MaxInt)
+  else
+    SubPath := '';
+
+  ReqObj := TJSONObject.Create;
+  try
+    ReqObj.Add('method', Method);
+    ReqObj.Add('path', Path);
+    ReqObj.Add('prefix', ARoute.Prefix);
+    ReqObj.Add('sub_path', SubPath);
+    ReqObj.Add('query', QueryString);
+    ReqObj.Add('headers', HeadersToJSON(HeaderBlock));
+    ReqObj.Add('body', Body);
+    ReqLine := ReqObj.AsJSON + LineEnding;
+  finally
+    ReqObj.Free;
+  end;
+
+  Proc := TProcess.Create(nil);
+  try
+    {$WARN SYMBOL_DEPRECATED OFF} // CommandLine: same free-form "let TProcess parse the quoting" style as vdrx_bridge.pas's FCommand
+    Proc.CommandLine := ARoute.Command;
+    {$WARN SYMBOL_DEPRECATED ON}
+    Proc.CurrentDirectory := IfThen(ARoute.ScriptDir <> '', ARoute.ScriptDir, GetCurrentDir);
+    Proc.Options := [poUsePipes, poStderrToOutPut];
+    try
+      Proc.Execute;
+    except
+      on E: Exception do
+      begin
+        ABus.Publish('log.error', Format('http bus cli: failed to start "%s" - %s', [ARoute.Command, E.Message]), ASourceID);
+        Exit(PlainResponse('502 Bad Gateway', 'text/plain', 'Could not start script'));
+      end;
+    end;
+
+    Proc.Input.Write(ReqLine[1], Length(ReqLine));
+    try Proc.CloseInput; except end; // EOF hint - same as vdrx_bridge.pas's StopProcess
+
+    Watchdog := TCLIWatchdog.Create(Proc, ARoute.TimeoutMs);
+    WatchdogThread := TVDRX_WorkerThread.Create(@Watchdog.Run);
+    WatchdogThread.FreeOnTerminate := False;
+    WatchdogThread.Start;
+    try
+      Output := '';
+      repeat
+        Received := Proc.Output.Read(Buf[0], SizeOf(Buf));
+        if Received > 0 then
+        begin
+          SetLength(Output, Length(Output) + Received);
+          Move(Buf[0], Output[Length(Output) - Received + 1], Received);
+        end;
+      until Received <= 0;
+
+      Watchdog.Cancel;
+      WaitThreadOrTimeout(WatchdogThread, 500);
+
+      if Watchdog.Fired then
+      begin
+        ABus.Publish('log.error', Format('http bus cli: %s exceeded %dms, killed it', [ARoute.Command, ARoute.TimeoutMs]), ASourceID);
+        Exit(PlainResponse('504 Gateway Timeout', 'text/plain', 'Script timed out'));
+      end;
+    finally
+      WatchdogThread.Free;
+      Watchdog.Free;
+    end;
+  finally
+    Proc.Free;
+  end;
+
+  FirstLine := '';
+  with TStringList.Create do
+  try
+    Text := Output;
+    if Count > 0 then FirstLine := Trim(Strings[0]);
+  finally
+    Free;
+  end;
+
+  ABus.Publish('log.info', Format('http bus cli: %s %s (sub_path="%s") -> %d bytes', [ARoute.Command, Path, SubPath, Length(Output)]), ASourceID);
+  Result := BuildBusCLIResponse(FirstLine, ARoute.ContentType, ATemplates, ABus, ASourceID);
+end;
+
 constructor TVDRX_HTTPExecutive.Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config; ATemplates: TVDRX_TemplateStore;
   const AStaticDir: string; const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes);
 begin
@@ -1601,8 +1989,16 @@ begin
 
   if MatchCLIRoute(Path, ACLIRoutes, CLIRoute) then
   begin
-    ABus.Publish('log.info', Format('http: %s %s -> cli %s', [Method, Path, CLIRoute.Command]), ASourceID);
-    Exit(RunCLIScript(ARequest, CLIRoute, ABus, ASourceID));
+    if SameText(CLIRoute.Protocol, 'bus') then
+    begin
+      ABus.Publish('log.info', Format('http: %s %s -> bus cli %s', [Method, Path, CLIRoute.Command]), ASourceID);
+      Exit(RunBusCLIScript(ARequest, CLIRoute, ATemplates, ABus, ASourceID));
+    end
+    else
+    begin
+      ABus.Publish('log.info', Format('http: %s %s -> cli %s', [Method, Path, CLIRoute.Command]), ASourceID);
+      Exit(RunCLIScript(ARequest, CLIRoute, ABus, ASourceID));
+    end;
   end;
 
   if Method = 'GET' then
