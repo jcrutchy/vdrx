@@ -1867,7 +1867,7 @@ var
   Watchdog: TCLIWatchdog;
   WatchdogThread: TThread;
   Buf: array[0..4095] of Byte;
-  Received: Integer;
+  Received, i: Integer;
 begin
   ParseRequestLine(ARequest, Method, Path);
   QueryString := ExtractQueryString(ARequest);
@@ -1945,11 +1945,41 @@ begin
     Proc.Free;
   end;
 
+  // Take the first line that actually LOOKS like our JSON envelope, not
+  // blindly Strings[0] - two things commonly land ahead of it in practice
+  // and shouldn't sink the whole response:
+  //   1. A UTF-8 BOM (EF BB BF) at the very start of Output if the script
+  //      file itself was saved with one (common on Windows editors) - PHP
+  //      happily echoes those 3 bytes before anything else, so line 0
+  //      would start with garbage instead of '{'.
+  //   2. A PHP notice/warning/deprecation line - poStderrToOutPut merges
+  //      stderr into this same stream, and PHP's CLI SAPI writes those
+  //      immediately when triggered, i.e. potentially before the script's
+  //      final fwrite(STDOUT, ...) line even if that write comes later in
+  //      the source.
+  // So: strip a leading BOM if present, then scan lines for the first one
+  // that, trimmed, actually starts with '{' - that's the reply; anything
+  // before it is noise the script printed (or an accidental warning) and
+  // is logged in full below (at WARN, since silently discarding it would
+  // hide the real cause of a "malformed response") rather than treated as
+  // fatal on its own.
+  if (Length(Output) >= 3) and (Output[1] = #$EF) and (Output[2] = #$BB) and (Output[3] = #$BF) then
+    Delete(Output, 1, 3);
+
   FirstLine := '';
   with TStringList.Create do
   try
     Text := Output;
-    if Count > 0 then FirstLine := Trim(Strings[0]);
+    for i := 0 to Count - 1 do
+    begin
+      if Copy(TrimLeft(Strings[i]), 1, 1) = '{' then
+      begin
+        FirstLine := Trim(Strings[i]);
+        Break;
+      end;
+    end;
+    if (FirstLine = '') and (Count > 0) then
+      ABus.Publish('log.warn', Format('http bus cli: %s produced no line starting with "{" - raw output: %s', [ARoute.Command, Output]), ASourceID);
   finally
     Free;
   end;
