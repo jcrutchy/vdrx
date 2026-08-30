@@ -136,9 +136,14 @@ begin
       // JSON array into one string (see vdrx_config.pas), split back out here.
       // Each filter is registered so matching bus messages are written to the
       // child's stdin (TVDRX_BridgeExecutive.HandlePacket already does this -
-      // it just never had a real subscription routed to it before). No
-      // subscribe entries at all keeps the old behaviour: registered on
-      // 'sys.none', i.e. publish-only.
+      // it just never had a real subscription routed to it before). Omit it
+      // entirely and this falls back to "<id>.in" - a literal topic, not a
+      // wildcard, so it only ever matches something explicitly published TO
+      // this process by name. That's a change from the old default (nothing
+      // at all, registered on the unmatchable 'sys.none') - every executive
+      // type having a sensible pub/sub default, rather than requiring
+      // "subscribe" just to be reachable at all, is deliberate config
+      // consistency (see the readme's §2 note on this).
       if Row.Values['subscribe'] <> '' then
       begin
         Filters := SplitString(Row.Values['subscribe'], ',');
@@ -147,7 +152,7 @@ begin
           ARegistry.Register(Bridge, Row.Values['id'], Trim(Filters[i]));
       end
       else
-        ARegistry.Register(Bridge, Row.Values['id'], 'sys.none');
+        ARegistry.Register(Bridge, Row.Values['id'], Row.Values['id'] + '.in');
 
       if Row.Values['prefix'] <> '' then
       begin
@@ -259,9 +264,9 @@ begin
         Protocol := 'cgi';
       end;
 
-      if (Protocol = 'bus-daemon') and (Row.Values['in_topic'] = '') then
+      if (Protocol = 'bus-daemon') and (Row.Values['in_topic'] = '') and (Row.Values['id'] = '') then
       begin
-        WriteLn('  Skipping cli_bridges entry "', Row.Values['id'], '" - protocol "bus-daemon" also needs in_topic.');
+        WriteLn('  Skipping cli_bridges entry - protocol "bus-daemon" needs id (to default in_topic) or an explicit in_topic.');
         Continue;
       end;
       if (Protocol <> 'bus-daemon') and (Row.Values['command'] = '') then
@@ -283,7 +288,9 @@ begin
       ARoutes[n].TimeoutMs := StrToIntDef(Row.Values['timeout_ms'], 5000);
       ARoutes[n].ContentType := IfThen(Row.Values['content_type'] <> '', Row.Values['content_type'], 'text/html');
       ARoutes[n].Protocol := Protocol;
-      ARoutes[n].InTopic := Row.Values['in_topic'];
+      // Same "<id>.in" fallback as every other executive type - see
+      // SetupProcesses' comment for why.
+      ARoutes[n].InTopic := IfThen(Row.Values['in_topic'] <> '', Row.Values['in_topic'], Row.Values['id'] + '.in');
 
       case Protocol of
         'bus':
@@ -330,15 +337,18 @@ begin
   try
     for Row in Rows do
     begin
-      if (Row.Values['id'] = '') or (Row.Values['dir'] = '') or (Row.Values['subscribe'] = '') then
+      if (Row.Values['id'] = '') or (Row.Values['dir'] = '') then
       begin
-        WriteLn('  Skipping templates entry - needs at least id, dir, and subscribe.');
+        WriteLn('  Skipping templates entry - needs at least id and dir.');
         Continue;
       end;
       Store := TVDRX_TemplateStore.Create(AConfig, Row.Values['dir']);
       Exec := TVDRX_TemplateExecutive.Create(Kernel.Queue, Store); // owns Store - see TVDRX_TemplateExecutive.Destroy
-      ARegistry.Register(Exec, Row.Values['id'], Row.Values['subscribe']);
-      WriteLn('  Template executive "', Row.Values['id'], '": dir="', Store.Dir, '", subscribe="', Row.Values['subscribe'], '"');
+      // Same "<id>.in" fallback as every other executive type - see
+      // SetupProcesses' comment for why.
+      ARegistry.Register(Exec, Row.Values['id'], IfThen(Row.Values['subscribe'] <> '', Row.Values['subscribe'], Row.Values['id'] + '.in'));
+      WriteLn('  Template executive "', Row.Values['id'], '": dir="', Store.Dir, '", subscribe="',
+        IfThen(Row.Values['subscribe'] <> '', Row.Values['subscribe'], Row.Values['id'] + '.in'), '"');
     end;
   finally
     Rows.Free;
@@ -445,7 +455,9 @@ begin
       Client.ReconnectPolicy := ReconnectRaw;
       Client.ReconnectDelayMs := StrToIntDef(Row.Values['reconnect_delay_ms'], 500);
       Client.MaxReconnectDelayMs := StrToIntDef(Row.Values['max_reconnect_delay_ms'], 30000);
+      Client.PublishTopic := IfThen(Row.Values['publish'] <> '', Row.Values['publish'], Row.Values['id'] + '.out');
 
+      // Same "<id>.in" fallback as SetupProcesses - see its comment for why.
       if Row.Values['subscribe'] <> '' then
       begin
         Filters := SplitString(Row.Values['subscribe'], ',');
@@ -454,7 +466,7 @@ begin
           ARegistry.Register(Client, Row.Values['id'], Trim(Filters[i]));
       end
       else
-        ARegistry.Register(Client, Row.Values['id'], 'sys.none');
+        ARegistry.Register(Client, Row.Values['id'], Row.Values['id'] + '.in');
 
       WriteLn('  Socket client "', Row.Values['id'], '": ', Row.Values['host'], ':', Client.Port,
         IfThen(Client.TLS, ' (TLS, verify=' + BoolToStr(Client.TLSVerify, True) + ')', ''),
@@ -508,6 +520,7 @@ begin
       WS := TVDRX_WebSocketExecutive.Create(Kernel.Queue, Config, Kernel.Registry);
       WS.Port := Config.GetInteger('executives.ws.port', 8082);
       WS.GracefulTimeoutMs := ShutdownGraceMs;
+      WS.DefaultSubscribe := Config.GetString('executives.ws.default_subscribe', '');
       ConfigureListenerTLS(WS, 'executives.ws');
       Kernel.Registry.Register(WS, 'ws', 'sys.none'); // each connection registers itself
     end;

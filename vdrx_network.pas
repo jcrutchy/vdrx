@@ -352,6 +352,29 @@ type
   // protocol executive is subscribed there to interpret (see AdoptConnection
   // in TVDRX_WebSocketExecutive, which creates one alongside every
   // connection); this class never parses it. The one thing this class keeps
+  // Common ancestor for any executive that owns exactly one live transport
+  // for its whole lifetime - today TVDRX_SocketClientExecutive (a dialer:
+  // connects itself, can reconnect) and TVDRX_WSConnection (an acceptor:
+  // handed an already-connected transport by a listener, never reconnects -
+  // if it drops, the connection is just over). Those two lifecycles are
+  // different enough that connecting/reconnecting/framing all stay on the
+  // subclasses - what's genuinely identical between them is narrower than
+  // it first looks: "holds a TVDRX_Transport, frees it on teardown."
+  // Deliberately NOT a shared write-lock or ReadFrame contract - socket_client's
+  // lock guards transport pointer SWAPS across reconnects (a state-machine
+  // concern), WS's guards concurrent frame WRITES to a transport that never
+  // moves (a serialization concern); those are different enough in meaning
+  // that forcing one lock semantics onto both would risk quietly changing
+  // socket_client's reconnect correctness for a cosmetic win. If a third
+  // connection-owning executive shows up wanting the exact same locking
+  // shape as one of these two, that's the moment to reconsider - not before.
+  TVDRX_ConnectionExecutive = class(TVDRX_Executive)
+  protected
+    FTransport: TVDRX_Transport;
+  public
+    destructor Destroy; override;
+  end;
+
   // that could be argued as "protocol" is HandlePacket's ordinary bus->socket
   // forwarding envelope - {"topic":...,"payload":...,"source":...,"seq":...}
   // - but that's the wire format for "a browser is a bus participant" itself
@@ -359,10 +382,9 @@ type
   // it stays here; a "<ID>.rpc.out" topic is special-cased instead, to let
   // the protocol executive send an already-fully-formed reply line (e.g.
   // "auth.ok") verbatim rather than have it wrapped in that envelope too.
-  TVDRX_WSConnection = class(TVDRX_Executive)
+  TVDRX_WSConnection = class(TVDRX_ConnectionExecutive)
   private
     FListener: TVDRX_WebSocketExecutive;
-    FTransport: TVDRX_Transport;
     FThread: TThread;
     FSendLock: TCriticalSection;
     FPendingRequest: string;
@@ -419,6 +441,7 @@ type
     FRegistry: TVDRX_Registry;
     FConnCounter: Integer;
     FPingIntervalMs, FPongTimeoutMs: Integer;
+    FDefaultSubscribe: string; // comma-joined filters - see property comment
   protected
     procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
@@ -430,6 +453,14 @@ type
     procedure AdoptConnection(ATransport: TVDRX_Transport; const AInitialRequest: string);
     property PingIntervalMs: Integer read FPingIntervalMs write FPingIntervalMs;
     property PongTimeoutMs: Integer read FPongTimeoutMs write FPongTimeoutMs;
+    // Filters (comma-joined, same GetObjectArray shape as everywhere else)
+    // every new connection is registered on automatically, in addition to
+    // its own "<id>.rpc.out" - e.g. a server-wide announcements topic every
+    // browser should see without having to know to ask for it. Client-driven
+    // subscribe/unsubscribe (TVDRX_WSProtocolExecutive) can still add or
+    // remove filters on top of these same as any other - this only seeds
+    // what a connection starts with.
+    property DefaultSubscribe: string read FDefaultSubscribe write FDefaultSubscribe;
   end;
 
   // Generic outbound socket client - the dialer counterpart to
@@ -452,7 +483,7 @@ type
   // to add later against a second real use case rather than guessed at now.
   // Reading is deliberately more lenient than writing in delimiter mode -
   // see ReaderLoop.
-  TVDRX_SocketClientExecutive = class(TVDRX_Executive)
+  TVDRX_SocketClientExecutive = class(TVDRX_ConnectionExecutive)
   private
     FHost: string;
     FPort: Word;
@@ -466,8 +497,8 @@ type
     FReconnectPolicy: string; // 'auto' (default, backoff-retry) | 'none' (dial once, stay down)
     FReconnectDelayMs, FMaxReconnectDelayMs: Integer;
     FGracefulTimeoutMs: Integer;
+    FPublishTopic: string; // where read data is published - see PublishTopic property
 
-    FTransport: TVDRX_Transport;
     FTransportLock: TCriticalSection;
     FConnected: Boolean; // reader loop's substitute for "process still running" -
                           // there's no exit code for a dropped socket, just
@@ -493,6 +524,11 @@ type
     property Delimiter: string read FDelimiter write FDelimiter;
     property ChunkSize: Integer read FChunkSize write FChunkSize;
     property ReconnectPolicy: string read FReconnectPolicy write FReconnectPolicy;
+    // Where read data is published - "<id>.out" if left blank (SetupSocketClients
+    // in vdrx.lpr applies that fallback; this class has no ID to default against
+    // on its own, since ID is only assigned once Registry.Register runs, after
+    // this property would already need a value).
+    property PublishTopic: string read FPublishTopic write FPublishTopic;
     property ReconnectDelayMs: Integer read FReconnectDelayMs write FReconnectDelayMs;
     property MaxReconnectDelayMs: Integer read FMaxReconnectDelayMs write FMaxReconnectDelayMs;
     property GracefulTimeoutMs: Integer read FGracefulTimeoutMs write FGracefulTimeoutMs;
@@ -2387,6 +2423,21 @@ begin
   FConn.RunLoop;
 end;
 
+{ TVDRX_ConnectionExecutive }
+
+destructor TVDRX_ConnectionExecutive.Destroy;
+begin
+  // Nil-guarded: both subclasses normally already own+nil FTransport
+  // themselves before Destroy is ever reached (WS's own Destroy used to
+  // free it unconditionally right here; socket_client's DoDisconnect always
+  // nils it after freeing) - this is a safety net for whatever teardown
+  // path DIDN'T get there first, not the primary way either subclass
+  // expects its transport to go away.
+  if Assigned(FTransport) then
+    FTransport.Free;
+  inherited Destroy;
+end;
+
 { TVDRX_WSConnection }
 
 constructor TVDRX_WSConnection.Create(ABus: TVDRX_MessageQueue; AListener: TVDRX_WebSocketExecutive; ATransport: TVDRX_Transport);
@@ -2411,9 +2462,8 @@ begin
     WaitThreadOrTimeout(FPingThread, 500);
     FreeAndNil(FPingThread);
   end;
-  FTransport.Free;
   FSendLock.Free;
-  inherited Destroy;
+  inherited Destroy; // frees FTransport - see TVDRX_ConnectionExecutive.Destroy
 end;
 
 class function TVDRX_WSConnection.IsUpgradeRequest(const ARequest: string): Boolean;
@@ -2819,6 +2869,7 @@ var
   Conn: TVDRX_WSConnection;
   Protocol: TVDRX_WSProtocolExecutive;
   NewID: string;
+  Filter: string;
 begin
   Conn := TVDRX_WSConnection.Create(Bus, Self, ATransport);
   Conn.PendingRequest := AInitialRequest;
@@ -2832,6 +2883,9 @@ begin
   // (whatever the browser 'subscribe's to) are added on top by the
   // protocol executive below - see its HandlePacket.
   FRegistry.Register(Conn, NewID, NewID + '.rpc.out');
+  if FDefaultSubscribe <> '' then
+    for Filter in SplitString(FDefaultSubscribe, ',') do
+      FRegistry.Register(Conn, NewID, Trim(Filter));
   Protocol := TVDRX_WSProtocolExecutive.Create(Bus, Self, Conn);
   FRegistry.Register(Protocol, NewID + '.rpc', NewID + '.rpc.in');
   Conn.Initialize;
@@ -3016,7 +3070,7 @@ begin
       SetLength(ChunkBuf, FChunkSize);
       Received := Transport.Read(ChunkBuf[1], FChunkSize);
       if Received > 0 then
-        Bus.Publish(ID + '.out', Copy(ChunkBuf, 1, Received), ID)
+        Bus.Publish(FPublishTopic, Copy(ChunkBuf, 1, Received), ID)
       else
       begin
         FTransportLock.Enter;
@@ -3038,7 +3092,7 @@ begin
             Line := LineBuf;
             LineBuf := '';
             if Line <> '' then
-              Bus.Publish(ID + '.out', Line, ID);
+              Bus.Publish(FPublishTopic, Line, ID);
           end
           else if Ch <> #13 then
             LineBuf := LineBuf + Ch;
