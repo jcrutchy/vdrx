@@ -144,12 +144,11 @@ the socket_clients entry (and adjust the `processes` entry's `subscribe`)
 rather than changing any protocol code - that's the actual difference
 between the `soylent`/`freenode` entries already in `vdrx.conf`.
 
-**Gotcha that cost real time here**: some IRC networks are picky about TLS
+**Gotcha**: some IRC networks are picky about TLS
 verification, cert chains, or just flaky from a given host - if a
 connection silently won't come up, try `tls_verify: "false"` temporarily
 to isolate whether it's a TLS-handshake problem versus a protocol-level
-one, and try a different network entirely (this project moved from
-`irc.soylentnews.org` to `irc.libera.chat` for exactly that reason) before
+one, and try a different network entirely before
 assuming the bug is in your Pascal or PHP.
 
 ---
