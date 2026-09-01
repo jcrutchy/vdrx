@@ -1,4 +1,5 @@
 *.log
+*.jsonl
 *.exe
 *.compiled
 *.ppu

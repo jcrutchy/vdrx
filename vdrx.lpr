@@ -22,6 +22,22 @@ uses
   vdrx_procutil;
 
 type
+  // Polls GShutdownRequested (vdrx_procutil.pas) from ordinary thread
+  // context and drives Kernel.Terminate itself once it flips - see
+  // InstallShutdownSignalHandler's comment for why the signal/console
+  // handler that sets that flag doesn't just call Terminate directly.
+  // 200ms poll is a deliberate trade-off: fast enough that Ctrl+C feels
+  // responsive, slow enough not to matter as a busy-loop over what's
+  // hopefully the whole remaining runtime of the process.
+  TVDRX_ShutdownWatcherThread = class(TThread)
+  private
+    FKernel: TVDRX_Kernel;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AKernel: TVDRX_Kernel);
+  end;
+
   TVDRX_HTTPSite = record
     ID: string;
     HTTP: TVDRX_HTTPExecutive;
@@ -43,6 +59,35 @@ var
   NewProc: TProcess;
   i: Integer;
   HTTPSites: TVDRX_HTTPSites;
+  ShutdownWatcher: TVDRX_ShutdownWatcherThread;
+
+constructor TVDRX_ShutdownWatcherThread.Create(AKernel: TVDRX_Kernel);
+begin
+  inherited Create(False);
+  FKernel := AKernel;
+  FreeOnTerminate := False;
+end;
+
+procedure TVDRX_ShutdownWatcherThread.Execute;
+begin
+  while not Terminated do
+  begin
+    if GShutdownRequested then
+    begin
+      // Ordinary thread context from here on - safe to do everything the
+      // signal/console handler itself deliberately didn't (see
+      // GShutdownRequested's comment in vdrx_procutil.pas). Kernel.Terminate
+      // is the exact same call 'quit'/sys.quit already makes - Ctrl+C now
+      // drives the identical clean-shutdown path (kernel.shutdown ->
+      // Registry.ShutdownAll -> every executive's own Shutdown, including
+      // Bridge's TryGracefulTerminate-then-wait-then-ForceKillProcess for
+      // each supervised child) rather than the OS's own default behaviour.
+      FKernel.Terminate;
+      Exit; // one-shot - Kernel.Execute's own loop takes it from here
+    end;
+    Sleep(200);
+  end;
+end;
 
 procedure ConfigureListenerTLS(AListener: TVDRX_SocketListenerExecutive; const AKeyPrefix: string);
 begin
@@ -480,6 +525,7 @@ end;
 begin
 
   try
+    InstallShutdownSignalHandler; // Ctrl+C/SIGINT/SIGTERM - see vdrx_procutil.pas
     Kernel := TVDRX_Kernel.Create;
     Config := TVDRX_Config.Create('vdrx.conf');
 
@@ -544,9 +590,15 @@ begin
     if Assigned(Stdin) then
       WriteLn('  Type quit / restart / reload / kill <pid-or-id> / killall [type] and press Enter to control the daemon.');
     WriteLn('  Shutdown grace period: ', ShutdownGraceMs, 'ms before hung threads/processes are force-killed.');
+    WriteLn('  Ctrl+C for a clean shutdown - every supervised process gets its own graceful-then-forced teardown, same as typing quit.');
 
-    Kernel.WaitFor; // returns once sys.quit/sys.restart has driven Kernel.Terminate
+    ShutdownWatcher := TVDRX_ShutdownWatcherThread.Create(Kernel);
+
+    Kernel.WaitFor; // returns once sys.quit/sys.restart/Ctrl+C has driven Kernel.Terminate
                      // and ShutdownAll has finished tearing everything down cleanly
+    ShutdownWatcher.Terminate;
+    WaitThreadOrTimeout(ShutdownWatcher, 500);
+    ShutdownWatcher.Free;
     DoRestart := Kernel.RestartRequested; // read before Free below
     Kernel.Free;
     for i := 0 to High(HTTPSites) do

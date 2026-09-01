@@ -375,6 +375,58 @@ type
     destructor Destroy; override;
   end;
 
+  // The third member of the connection-executive family, alongside
+  // TVDRX_SocketClientExecutive and TVDRX_WSConnection - previously the only
+  // per-connection network handler in this unit that WASN'T a class at all
+  // (TVDRX_HTTPExecutive.HandleConnection and TVDRX_WebListenerExecutive.
+  // HandleConnection each independently read/parsed/responded inline, with
+  // the transport as a bare local variable, manually Freed at the end of a
+  // plain procedure). Doesn't need a persistent read loop, ping/pong, or
+  // Registry registration the way WS/socket_client do - HTTP is
+  // request/response, not a standing connection - so Run() just does
+  // exactly one read-build-write-close cycle and the caller frees it
+  // immediately after. What it DOES get from deriving from
+  // TVDRX_ConnectionExecutive rather than staying a bare procedure: a real
+  // owner for the transport (freed safely by the base's Destroy, same as
+  // every other connection type, instead of a hand-rolled Free at the end
+  // of whichever procedure happened to accept it), and - the actual prize -
+  // ONE shared implementation of "read a full HTTP request and dispatch it"
+  // instead of two independently-maintained copies that had quietly drifted:
+  // TVDRX_WebListenerExecutive's old inline version read a single fixed
+  // 2048-byte buffer rather than using ReadFullRequest, which could
+  // silently truncate any request with a body, or with enough headers, to
+  // cross that size - a real bug on a combined HTTP+WS site that plain
+  // TVDRX_HTTPExecutive's connections never had, purely because the two
+  // listener types had drifted rather than shared code.
+  TVDRX_HTTPConnection = class(TVDRX_ConnectionExecutive)
+  private
+    FTemplates: TVDRX_TemplateStore;
+    FConfig: TVDRX_Config;
+    FStaticDir: string;
+    FProxyRoutes: TVDRX_ProxyRoutes;
+    FCLIRoutes: TVDRX_CLIRoutes;
+    FRegistry: TVDRX_Registry;
+    FSourceID: string; // for log attribution - this object is never itself
+                        // Registry-registered (a one-shot request/response
+                        // has nothing to address it BY later, unlike a
+                        // standing WS connection), so it borrows its
+                        // owning listener's own ID for Bus.Publish calls,
+                        // matching the log lines' previous "http"/"ws"
+                        // attribution exactly.
+  public
+    constructor Create(ABus: TVDRX_MessageQueue; ATransport: TVDRX_Transport;
+      ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
+      const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
+      ARegistry: TVDRX_Registry; const ASourceID: string); reintroduce;
+    procedure HandlePacket(const AMsg: TVDRX_Message); override;
+    // ARequest: pass the full request text if the caller already read it
+    // (TVDRX_WebListenerExecutive has to, to decide WS-upgrade-vs-not
+    // BEFORE it knows which of the two this connection even is) - leave it
+    // blank and Run reads it itself (TVDRX_HTTPExecutive, which never needs
+    // to peek before deciding).
+    procedure Run(const ARequest: string = '');
+  end;
+
   // that could be argued as "protocol" is HandlePacket's ordinary bus->socket
   // forwarding envelope - {"topic":...,"payload":...,"source":...,"seq":...}
   // - but that's the wire format for "a browser is a bus participant" itself
@@ -572,6 +624,13 @@ function ConnectTCPHost(const AHost: string; APort: Word): TVDRX_Transport;
 procedure ApplyOpenSSLDLLOverrides(AConfig: TVDRX_Config);
 
 implementation
+
+// Forward declaration - TVDRX_WebListenerExecutive.HandleConnection (below)
+// needs to call this before its real definition's textual position later in
+// this file's implementation section (Object Pascal compiles top-to-bottom
+// within a unit; a standalone routine with no interface-section declaration
+// needs a forward decl to be callable from earlier code in the same file).
+function ReadFullRequest(ATransport: TVDRX_Transport): string; forward;
 
 // Parses a plain "a.b.c.d" IPv4 address into the 4 bytes sockaddr_in.sin_addr
 // needs, in the correct (network) byte order - dotted-quad notation is
@@ -1268,27 +1327,36 @@ end;
 
 procedure TVDRX_WebListenerExecutive.HandleConnection(ATransport: TVDRX_Transport);
 var
-  Buf: array[0..2047] of Byte;
-  Received: Integer;
-  Request, Response: string;
+  Request: string;
+  Conn: TVDRX_HTTPConnection;
 begin
-  Received := ATransport.Read(Buf[0], SizeOf(Buf));
-  if Received <= 0 then
+  // ReadFullRequest, not a fixed-size single read - a WS handshake has no
+  // Content-Length body (so this returns as soon as the header block ends,
+  // no different from before for that case), but a genuine HTTP request
+  // with a body, or just enough headers, could exceed a fixed 2048-byte
+  // buffer and get silently truncated by the old single-read version - a
+  // real gap this listener had that plain TVDRX_HTTPExecutive's connections
+  // never did, purely from the two having drifted - see TVDRX_HTTPConnection's
+  // class comment.
+  Request := ReadFullRequest(ATransport);
+  if Request = '' then
   begin
     ATransport.Close;
     ATransport.Free;
     Exit;
   end;
-  SetString(Request, PAnsiChar(@Buf[0]), Received);
 
   if TVDRX_WSConnection.IsUpgradeRequest(Request) then
     FWebSocket.AdoptConnection(ATransport, Request)
   else
   begin
-    Response := TVDRX_HTTPExecutive.BuildResponse(Request, FTemplates, FConfig, FStaticDir, FProxyRoutes, FCLIRoutes, Bus, FWebSocket.Registry, ID);
-    ATransport.Write(Response[1], Length(Response));
-    ATransport.Close;
-    ATransport.Free;
+    Conn := TVDRX_HTTPConnection.Create(Bus, ATransport, FTemplates, FConfig, FStaticDir,
+      FProxyRoutes, FCLIRoutes, FWebSocket.Registry, ID);
+    try
+      Conn.Run(Request); // already read above - don't read it twice
+    finally
+      Conn.Free; // frees ATransport too - see TVDRX_ConnectionExecutive.Destroy
+    end;
   end;
 end;
 
@@ -2337,22 +2405,64 @@ begin
   end;
 end;
 
-procedure TVDRX_HTTPExecutive.HandleConnection(ATransport: TVDRX_Transport);
+{ TVDRX_HTTPConnection }
+
+constructor TVDRX_HTTPConnection.Create(ABus: TVDRX_MessageQueue; ATransport: TVDRX_Transport;
+  ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
+  const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
+  ARegistry: TVDRX_Registry; const ASourceID: string);
+begin
+  inherited Create(ABus);
+  FTransport := ATransport;
+  FTemplates := ATemplates;
+  FConfig := AConfig;
+  FStaticDir := AStaticDir;
+  FProxyRoutes := AProxyRoutes;
+  FCLIRoutes := ACLIRoutes;
+  FRegistry := ARegistry;
+  FSourceID := ASourceID;
+end;
+
+procedure TVDRX_HTTPConnection.HandlePacket(const AMsg: TVDRX_Message);
+begin
+  // HTTP is request/response, not bus-driven - nothing to do here. Present
+  // only because TVDRX_Executive declares it abstract; this object is never
+  // Registry-registered, so it's never actually called.
+end;
+
+procedure TVDRX_HTTPConnection.Run(const ARequest: string);
 var
   Request, Response, Method, Path: string;
 begin
-  Request := ReadFullRequest(ATransport);
+  if ARequest <> '' then
+    Request := ARequest
+  else
+    Request := ReadFullRequest(FTransport);
+
   if Request <> '' then
   begin
     ParseRequestLine(Request, Method, Path);
-    Response := BuildResponse(Request, FTemplates, FConfig, FStaticDir, FProxyRoutes, FCLIRoutes, Bus, FRegistry, ID);
-    Bus.Publish('log.info', Format('http: %s %s -> %s', [Method, Path, StatusOf(Response)]), ID);
-    ATransport.Write(Response[1], Length(Response));
+    Response := TVDRX_HTTPExecutive.BuildResponse(Request, FTemplates, FConfig, FStaticDir,
+      FProxyRoutes, FCLIRoutes, Bus, FRegistry, FSourceID);
+    Bus.Publish('log.info', Format('http: %s %s -> %s', [Method, Path, StatusOf(Response)]), FSourceID);
+    FTransport.Write(Response[1], Length(Response));
   end
   else
-    Bus.Publish('log.warn', 'http: connection closed before a request arrived', ID);
-  ATransport.Close;
-  ATransport.Free;
+    Bus.Publish('log.warn', 'http: connection closed before a request arrived', FSourceID);
+  FTransport.Close;
+end;
+
+procedure TVDRX_HTTPExecutive.HandleConnection(ATransport: TVDRX_Transport);
+var
+  Conn: TVDRX_HTTPConnection;
+begin
+  Conn := TVDRX_HTTPConnection.Create(Bus, ATransport, FTemplates, FConfig, FStaticDir,
+    FProxyRoutes, FCLIRoutes, FRegistry, ID);
+  try
+    Conn.Run;
+  finally
+    Conn.Free; // frees ATransport too - see TVDRX_ConnectionExecutive.Destroy
+  end;
 end;
 
 procedure TVDRX_HTTPExecutive.HandlePacket(const AMsg: TVDRX_Message);
@@ -2360,16 +2470,57 @@ begin
   // HTTP is request/response, not bus-driven - nothing to do here.
 end;
 
+// TVDRX_HTTPExecutive.ApplyConfig ('sys.reload') needs to re-find ITS OWN
+// http_sites row by ID on every reload, not read a flat "executives.http.*"
+// key - that shape predates the multi-site http_sites array and, left as
+// it was, meant every site's ApplyConfig defaulted port/tls_port/tls_cert/
+// tls_key back to the SAME hardcoded fallbacks (8081, none) on every
+// reload, since "executives.http.port" was never actually present in a
+// http_sites-based config - a real port-collision/silent-misconfiguration
+// risk with more than one site, not just a documentation gap. Shared here
+// (rather than duplicated inline in ApplyConfig) since nothing else in this
+// unit needs GetObjectArray's row-matching logic yet.
+function FindConfigRowByID(AConfig: TVDRX_Config; const AArrayKey, AID: string;
+  out ARow: TStringList): Boolean;
+var
+  Rows: TVDRX_ConfigRows;
+  Row: TStringList;
+begin
+  Result := False;
+  Rows := AConfig.GetObjectArray(AArrayKey);
+  try
+    for Row in Rows do
+      if Row.Values['id'] = AID then
+      begin
+        ARow := TStringList.Create;
+        ARow.Assign(Row);
+        Exit(True);
+      end;
+  finally
+    Rows.Free;
+  end;
+end;
+
 procedure TVDRX_HTTPExecutive.ApplyConfig;
 var
   NewPort, NewTLSPort: Integer;
   CertFile, KeyFile: string;
+  SiteRow: TStringList;
 begin
-  FStaticDir := FConfig.GetString('static_dir', FStaticDir);
-  NewPort := FConfig.GetInteger('executives.http.port', 8081);
-  NewTLSPort := FConfig.GetInteger('executives.http.tls_port', 0);
-  CertFile := FConfig.GetString('executives.http.tls_cert', '');
-  KeyFile := FConfig.GetString('executives.http.tls_key', '');
+  if not FindConfigRowByID(FConfig, 'http_sites', ID, SiteRow) then
+  begin
+    Bus.Publish('log.warn', 'http ' + ID + ': no matching http_sites entry found on reload - config for this site is unchanged', ID);
+    Exit;
+  end;
+  try
+    FStaticDir := ExpandFileName(IfThen(SiteRow.Values['static_dir'] <> '', SiteRow.Values['static_dir'], 'static'));
+    NewPort := StrToIntDef(SiteRow.Values['port'], Port);
+    NewTLSPort := StrToIntDef(SiteRow.Values['tls_port'], 0);
+    CertFile := SiteRow.Values['tls_cert'];
+    KeyFile := SiteRow.Values['tls_key'];
+  finally
+    SiteRow.Free;
+  end;
   if (NewPort <> Port) or (NewTLSPort <> TLSPort) then
   begin
     Shutdown;
@@ -2377,10 +2528,10 @@ begin
     ConfigureTLS(NewTLSPort, CertFile, KeyFile);
     Initialize;
   end;
-  // NB: FProxyRoutes is NOT rebuilt here yet - proxy_bridges is only read at
-  // startup (see vdrx_daemon.lpr's SetupProxyBridges). A 'sys.reload' picks
-  // up template/board-nav/port changes live but not new/changed proxy
-  // routes - restart the daemon (or 'sys.restart') for those.
+  // NB: FProxyRoutes/FCLIRoutes are NOT rebuilt here yet - cli_bridges and
+  // proxy routes are only read at startup (see vdrx.lpr's SetupCLIBridges).
+  // A 'sys.reload' picks up template/static-dir/port changes live but not
+  // new/changed routes - restart the daemon (or 'sys.restart') for those.
 end;
 
 function ComputeAcceptKey(const AClientKey: string): string;
