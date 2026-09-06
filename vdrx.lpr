@@ -10,6 +10,8 @@ uses
   StrUtils,
   SysUtils,
   Process,
+  fpjson,
+  jsonparser,
   vdrx_core,
   vdrx_config,
   vdrx_admin,
@@ -107,17 +109,6 @@ begin
       ') but failed to come up - check tls_cert/tls_key and that libssl is loadable.');
 end;
 
-// Generalized from the old SetupProxyBridges: every entry in "processes" gets
-// a supervised TVDRX_BridgeExecutive (spawn, restart-on-crash, graceful-then-
-// force shutdown - see vdrx_bridge.pas) regardless of what it's for. prefix/
-// host/port are now OPTIONAL - give them and the process also gets an HTTP
-// reverse-proxy route (same as the old proxy_bridges did); omit them for a
-// bare supervised background process with no HTTP surface at all (a SOMA
-// worker, a future Cartographica island process, etc). id and command are the
-// only two required fields. Deliberately NOT merged with cli_bridges below -
-// that's a genuinely different mechanism (invoke-per-request script
-// execution, no persistent process, no Bridge involved), not another flavour
-// of this one.
 procedure SetupProcesses(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry;
   AGracefulMs: Integer; out ARoutes: TVDRX_ProxyRoutes);
 var
@@ -138,10 +129,6 @@ begin
         WriteLn('  Skipping processes entry - needs at least id and command.');
         Continue;
       end;
-      // "enabled": false (default true) - skip standing this one up entirely,
-      // without having to delete/comment it out of the config. Checked here,
-      // same place as the id/command validation above, so a disabled entry
-      // costs nothing beyond this one string compare.
       if (Row.Values['enabled'] = 'False') or (Row.Values['enabled'] = 'false') or (Row.Values['enabled'] = '0') then
       begin
         WriteLn('  Process "', Row.Values['id'], '": disabled (enabled=false) - skipping.');
@@ -149,20 +136,9 @@ begin
       end;
       Bridge := TVDRX_BridgeExecutive.Create(Kernel.Queue);
       Bridge.Command := Row.Values['command'];
-      // Most simple dev web servers (php -S included) don't respond to a
-      // graceful-shutdown hint at all - SIGTERM does work on Unix, but
-      // there's genuinely no equivalent on Windows (see vdrx_procutil.pas's
-      // TryGracefulTerminate). Waiting the full shutdown_grace_ms on every
-      // quit/restart just to then force-kill it anyway wastes real time -
-      // override per-process via "graceful_timeout_ms" in its processes
-      // entry; falls back to the daemon-wide default if not set.
       BridgeGraceMs := StrToIntDef(Row.Values['graceful_timeout_ms'], AGracefulMs);
       Bridge.GracefulTimeoutMs := BridgeGraceMs;
 
-      // "restart": "always" (default) | "on-failure" | "never" - see
-      // TVDRX_BridgeExecutive.RestartPolicy in vdrx_bridge.pas. An unrecognized
-      // value falls back to "always" with a warning, rather than silently
-      // guessing wrong about how badly this one wants to keep running.
       RestartRaw := Row.Values['restart'];
       if RestartRaw = '' then RestartRaw := 'always';
       if (RestartRaw <> 'always') and (RestartRaw <> 'on-failure') and (RestartRaw <> 'never') then
@@ -172,23 +148,8 @@ begin
       end;
       Bridge.RestartPolicy := RestartRaw;
 
-      // "publish": ["topic.filter", ...] - see PublishPatterns in
-      // vdrx_bridge.pas. Omit it (the default) and this process can never
-      // override <id>.out, no matter what its stdout looks like.
       Bridge.PublishPatterns := Row.Values['publish'];
 
-      // "subscribe": ["topic.filter", ...] - GetObjectArray comma-joins the
-      // JSON array into one string (see vdrx_config.pas), split back out here.
-      // Each filter is registered so matching bus messages are written to the
-      // child's stdin (TVDRX_BridgeExecutive.HandlePacket already does this -
-      // it just never had a real subscription routed to it before). Omit it
-      // entirely and this falls back to "<id>.in" - a literal topic, not a
-      // wildcard, so it only ever matches something explicitly published TO
-      // this process by name. That's a change from the old default (nothing
-      // at all, registered on the unmatchable 'sys.none') - every executive
-      // type having a sensible pub/sub default, rather than requiring
-      // "subscribe" just to be reachable at all, is deliberate config
-      // consistency (see the readme's §2 note on this).
       if Row.Values['subscribe'] <> '' then
       begin
         Filters := SplitString(Row.Values['subscribe'], ',');
@@ -219,14 +180,6 @@ begin
   end;
 end;
 
-// Generalized the same way SetupProcesses generalized proxy bridges: every
-// entry in "http_sites" gets its own TVDRX_HTTPExecutive + TVDRX_TemplateStore,
-// each on its own port with its own static/template roots. Previously there
-// was exactly one of each, wired from top-level static_dir/template_dir/
-// executives.http.* keys - fine when VDRX only ever served itself, not once
-// a second app (Kyzu) wants its own site. ProxyRoutes/CLIRoutes stay shared
-// across all sites for now - genuinely global concerns (any site can proxy
-// to any bridge), not per-site ones.
 function SetupHTTPSites(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry;
   AGracefulMs: Integer; const AProxyRoutes: TVDRX_ProxyRoutes;
   const ACLIRoutes: TVDRX_CLIRoutes): TVDRX_HTTPSites;
@@ -234,7 +187,10 @@ var
   Rows: TVDRX_ConfigRows;
   Row: TStringList;
   Site: TVDRX_HTTPSite;
-  n: Integer;
+  n, i: Integer;
+  RawHeaders: string;
+  HeadersJSON: TJSONData;
+  HeadersObj: TJSONObject;
 begin
   SetLength(Result, 0);
   Rows := AConfig.GetObjectArray('http_sites');
@@ -256,11 +212,40 @@ begin
       Site.HTTP.Port := StrToIntDef(Row.Values['port'], 8081);
       Site.HTTP.GracefulTimeoutMs := AGracefulMs;
 
+      // Default CORS headers if "cors": true is declared
+      if (Row.Values['cors'] = 'True') or (Row.Values['cors'] = 'true') or (Row.Values['cors'] = '1') then
+      begin
+        Site.HTTP.CustomHeaders.Values['Access-Control-Allow-Origin'] := '*';
+        Site.HTTP.CustomHeaders.Values['Access-Control-Allow-Methods'] := 'GET, POST, OPTIONS';
+        Site.HTTP.CustomHeaders.Values['Access-Control-Allow-Headers'] := '*';
+      end;
+
+      // Explicit custom response headers if "headers": { ... } object is provided
+      RawHeaders := Row.Values['headers'];
+      if RawHeaders <> '' then
+      begin
+        try
+          HeadersJSON := GetJSON(RawHeaders);
+          try
+            if HeadersJSON is TJSONObject then
+            begin
+              HeadersObj := TJSONObject(HeadersJSON);
+              for i := 0 to HeadersObj.Count - 1 do
+                Site.HTTP.CustomHeaders.Values[HeadersObj.Names[i]] := HeadersObj.Items[i].AsString;
+            end;
+          finally
+            HeadersJSON.Free;
+          end;
+        except
+          // Ignore malformed JSON headers block
+        end;
+      end;
+
       if Row.Values['tls_port'] <> '' then
         Site.HTTP.ConfigureTLS(StrToIntDef(Row.Values['tls_port'], 0),
           Row.Values['tls_cert'], Row.Values['tls_key']);
 
-      ARegistry.Register(Site.HTTP, Site.ID, 'sys.none'); // serves requests directly, doesn't consume bus messages
+      ARegistry.Register(Site.HTTP, Site.ID, 'sys.none');
 
       n := Length(Result);
       SetLength(Result, n + 1);
@@ -268,22 +253,14 @@ begin
 
       WriteLn('  HTTP site "', Site.ID, '": port ', Site.HTTP.Port,
         ', static="', ExpandFileName(IfThen(Row.Values['static_dir'] <> '', Row.Values['static_dir'], 'static')),
-        '", templates="', Site.Templates.Dir, '"');
+        '", templates="', Site.Templates.Dir, '"',
+        IfThen(Site.HTTP.CustomHeaders.Count > 0, ' (' + IntToStr(Site.HTTP.CustomHeaders.Count) + ' custom headers/CORS)', ''));
     end;
   finally
     Rows.Free;
   end;
 end;
 
-// "protocol": "cgi" (default) | "bus" | "bus-daemon" - see TVDRX_CLIRoute's
-// comment in vdrx_network.pas for the full contract differences.
-//   'cgi'        - needs id/prefix/command/script_dir (original behaviour).
-//   'bus'        - needs id/prefix/command; script_dir optional (just sets
-//                  the spawned process's CWD, defaults to '.').
-//   'bus-daemon' - needs id/prefix/in_topic; command/script_dir are unused
-//                  (nothing is spawned - requests are published to in_topic
-//                  for whatever's already subscribed there, typically a
-//                  persistent `processes` entry, to answer).
 procedure SetupCLIBridges(AConfig: TVDRX_Config; out ARoutes: TVDRX_CLIRoutes);
 var
   Rows: TVDRX_ConfigRows;
@@ -329,12 +306,10 @@ begin
       SetLength(ARoutes, n + 1);
       ARoutes[n].Prefix := Row.Values['prefix'];
       ARoutes[n].Command := Row.Values['command'];
-      ARoutes[n].ScriptDir := Row.Values['script_dir']; // optional for 'bus' - RunBusCLIScript falls back to '.'; unused for 'bus-daemon'
+      ARoutes[n].ScriptDir := Row.Values['script_dir'];
       ARoutes[n].TimeoutMs := StrToIntDef(Row.Values['timeout_ms'], 5000);
       ARoutes[n].ContentType := IfThen(Row.Values['content_type'] <> '', Row.Values['content_type'], 'text/html');
       ARoutes[n].Protocol := Protocol;
-      // Same "<id>.in" fallback as every other executive type - see
-      // SetupProcesses' comment for why.
       ARoutes[n].InTopic := IfThen(Row.Values['in_topic'] <> '', Row.Values['in_topic'], Row.Values['id'] + '.in');
 
       case Protocol of
@@ -355,22 +330,6 @@ begin
   end;
 end;
 
-// One TVDRX_TemplateExecutive per "templates" config entry, registered on
-// whatever "subscribe" filter it declares (same comma/array-joined pattern
-// GetObjectArray already flattens everywhere else - "processes"' subscribe,
-// "buckets"' topics). Each entry owns its own TVDRX_TemplateStore rooted at
-// "dir" - completely independent of any http_sites entry's own
-// template_dir, which is the point: a bus-CLI reply's "template_topic"
-// names one of THESE explicitly, rather than implicitly inheriting whatever
-// HTTP site's connection happened to answer the request - see
-// BuildBusCLIResponse's comment in vdrx_network.pas.
-//
-//   { "id": "admin_templates", "dir": "templates", "subscribe": "template.admin.render" }
-//
-// Deliberately not tied to http_sites at all in config - an included app's
-// own config (see the "includes" mechanism) can define its own template
-// executive alongside its own cli_bridges routes, with no coordination
-// needed with vdrx.conf's own http_sites beyond agreeing on a topic name.
 procedure SetupTemplateExecutives(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry);
 var
   Rows: TVDRX_ConfigRows;
@@ -388,9 +347,7 @@ begin
         Continue;
       end;
       Store := TVDRX_TemplateStore.Create(AConfig, Row.Values['dir']);
-      Exec := TVDRX_TemplateExecutive.Create(Kernel.Queue, Store); // owns Store - see TVDRX_TemplateExecutive.Destroy
-      // Same "<id>.in" fallback as every other executive type - see
-      // SetupProcesses' comment for why.
+      Exec := TVDRX_TemplateExecutive.Create(Kernel.Queue, Store);
       ARegistry.Register(Exec, Row.Values['id'], IfThen(Row.Values['subscribe'] <> '', Row.Values['subscribe'], Row.Values['id'] + '.in'));
       WriteLn('  Template executive "', Row.Values['id'], '": dir="', Store.Dir, '", subscribe="',
         IfThen(Row.Values['subscribe'] <> '', Row.Values['subscribe'], Row.Values['id'] + '.in'), '"');
@@ -399,9 +356,7 @@ begin
     Rows.Free;
   end;
 end;
-// "file"). See vdrx_bucket.pas for why this is full history rather than
-// latest-value-per-topic, and vdrx_admin.pas's DoHistory for how it's read
-// back (the "history" console command - there's no automatic replay).
+
 procedure SetupBuckets(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry);
 var
   Rows: TVDRX_ConfigRows;
@@ -435,15 +390,6 @@ begin
   end;
 end;
 
-// Every entry in "socket_clients" gets its own TVDRX_SocketClientExecutive -
-// a supervised outbound TCP/TLS connection, the dialer counterpart to
-// SetupProcesses' spawned children. id/host/port are the only required
-// fields; everything else falls back to sane defaults (see
-// TVDRX_SocketClientExecutive.Create) exactly like SetupProcesses does for
-// "processes". "subscribe" uses the same comma-joined-filter convention as
-// "processes" - filters this instance's socket writes, not its own inbound
-// data (that always publishes to "<id>.out", unconditionally, same as
-// Bridge's stdout).
 procedure SetupSocketClients(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry;
   AGracefulMs: Integer);
 var
@@ -477,7 +423,6 @@ begin
       Client.TLSPeerName := Row.Values['tls_peer_name'];
       Client.GracefulTimeoutMs := StrToIntDef(Row.Values['graceful_timeout_ms'], AGracefulMs);
 
-      // "framing": "delimiter" (default) | "chunk" - see TVDRX_SocketClientExecutive
       FramingRaw := Row.Values['framing'];
       if FramingRaw = '' then FramingRaw := 'delimiter';
       if (FramingRaw <> 'delimiter') and (FramingRaw <> 'chunk') then
@@ -489,7 +434,6 @@ begin
       Client.Delimiter := IfThen(Row.Values['delimiter'] <> '', Row.Values['delimiter'], #13#10);
       Client.ChunkSize := StrToIntDef(Row.Values['chunk_size'], 4096);
 
-      // "reconnect": "auto" (default) | "none" - see TVDRX_SocketClientExecutive
       ReconnectRaw := Row.Values['reconnect'];
       if ReconnectRaw = '' then ReconnectRaw := 'auto';
       if (ReconnectRaw <> 'auto') and (ReconnectRaw <> 'none') then
@@ -502,7 +446,6 @@ begin
       Client.MaxReconnectDelayMs := StrToIntDef(Row.Values['max_reconnect_delay_ms'], 30000);
       Client.PublishTopic := IfThen(Row.Values['publish'] <> '', Row.Values['publish'], Row.Values['id'] + '.out');
 
-      // Same "<id>.in" fallback as SetupProcesses - see its comment for why.
       if Row.Values['subscribe'] <> '' then
       begin
         Filters := SplitString(Row.Values['subscribe'], ',');
@@ -525,40 +468,24 @@ end;
 begin
 
   try
-    InstallShutdownSignalHandler; // Ctrl+C/SIGINT/SIGTERM - see vdrx_procutil.pas
+    InstallShutdownSignalHandler;
     Kernel := TVDRX_Kernel.Create;
     Config := TVDRX_Config.Create('vdrx.conf');
 
-    // Must run before Registry.InitializeAll (Kernel.Start below) - any
-    // executive whose Initialize does a TLS handshake needs the right DLLs
-    // already pointed at before that call. See ApplyOpenSSLDLLOverrides'
-    // comment in vdrx_network.pas.
     ApplyOpenSSLDLLOverrides(Config);
 
     ShutdownGraceMs := Config.GetInteger('shutdown_grace_ms', 5000);
 
-    // Subscribes to everything under log.* - any executive's Bus.Publish of a
-    // log.info/log.warn/log.error topic ends up here, colored on the console and
-    // plain in vdrx_daemon.log.
     Logger := TVDRX_LoggerExecutive.Create(Kernel.Queue, 'vdrx_daemon.log', lvlINFO);
-    //Kernel.Registry.Register(Logger, 'logger', 'log.>');
-    //Kernel.Registry.Register(Logger, 'logger', 'irc.>');
     Kernel.Registry.Register(Logger, 'logger', '>');
 
-    // Listens on 'sys.>' - reload/quit/restart/kill/killall. See vdrx_admin.pas
-    // and vdrx_admincmd.pas for the full command set and who can trigger it
-    // (stdin below is the only source right now; DispatchAdminCommandLine in
-    // vdrx_admincmd.pas is written to be reusable by any future text-command
-    // source the same way).
     Admin := TVDRX_AdminExecutive.Create(Kernel.Queue, Config, Kernel.Registry, Kernel);
     Kernel.Registry.Register(Admin, 'admin', 'sys.>');
 
-    // Reads quit/restart/reload/kill/killall commands typed at the console.
-    // Replaces the old "press ENTER to stop" main-thread ReadLn.
     if Config.GetBoolean('stdin_admin_enabled', True) then
     begin
       Stdin := TVDRX_StdinExecutive.Create(Kernel.Queue);
-      Kernel.Registry.Register(Stdin, 'stdin', 'sys.none'); // doesn't consume bus messages, only publishes
+      Kernel.Registry.Register(Stdin, 'stdin', 'sys.none');
     end;
 
     if Config.GetBoolean('executives.ws.enabled', False) then
@@ -568,7 +495,7 @@ begin
       WS.GracefulTimeoutMs := ShutdownGraceMs;
       WS.DefaultSubscribe := Config.GetString('executives.ws.default_subscribe', '');
       ConfigureListenerTLS(WS, 'executives.ws');
-      Kernel.Registry.Register(WS, 'ws', 'sys.none'); // each connection registers itself
+      Kernel.Registry.Register(WS, 'ws', 'sys.none');
     end;
 
     SetupProcesses(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes);
@@ -579,8 +506,7 @@ begin
 
     HTTPSites := SetupHTTPSites(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes, CLIRoutes);
 
-    Kernel.Start; // Execute() calls Registry.InitializeAll - this is what actually
-                  // binds every listener's socket(s) and starts its accept thread(s)
+    Kernel.Start;
 
     WriteLn('VDRX daemon running.');
     if Assigned(WS) then ReportListener(WS, 'WebSocket');
@@ -594,15 +520,14 @@ begin
 
     ShutdownWatcher := TVDRX_ShutdownWatcherThread.Create(Kernel);
 
-    Kernel.WaitFor; // returns once sys.quit/sys.restart/Ctrl+C has driven Kernel.Terminate
-                     // and ShutdownAll has finished tearing everything down cleanly
+    Kernel.WaitFor;
     ShutdownWatcher.Terminate;
     WaitThreadOrTimeout(ShutdownWatcher, 500);
     ShutdownWatcher.Free;
-    DoRestart := Kernel.RestartRequested; // read before Free below
+    DoRestart := Kernel.RestartRequested;
     Kernel.Free;
     for i := 0 to High(HTTPSites) do
-      HTTPSites[i].Templates.Free; // HTTP executives themselves are Registry-owned, freed by Kernel.Free above
+      HTTPSites[i].Templates.Free;
     Config.Free;
 
     WriteLn('Daemon stopped.');
@@ -616,12 +541,10 @@ begin
         for i := 1 to ParamCount do
           NewProc.Parameters.Add(ParamStr(i));
         NewProc.CurrentDirectory := GetCurrentDir;
-        NewProc.Options := []; // detached - don't wait, don't inherit our pipes;
-                                // the new instance keeps running independently
-                                // once Execute returns
+        NewProc.Options := [];
         NewProc.Execute;
       finally
-        NewProc.Free; // doesn't own/stop the spawned OS process
+        NewProc.Free;
       end;
     end;
 
@@ -634,4 +557,3 @@ begin
   end;
 
 end.
-

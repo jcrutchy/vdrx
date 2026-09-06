@@ -329,7 +329,9 @@ begin
           if Obj.Items[j].JSONType in [jtString, jtNumber, jtBoolean] then
             Row.Values[Obj.Names[j]] := Obj.Items[j].AsString
           else if Obj.Items[j].JSONType = jtArray then
-            Row.Values[Obj.Names[j]] := JoinJSONStringArray(TJSONArray(Obj.Items[j]));
+            Row.Values[Obj.Names[j]] := JoinJSONStringArray(TJSONArray(Obj.Items[j]))
+          else if Obj.Items[j].JSONType = jtObject then
+            Row.Values[Obj.Names[j]] := Obj.Items[j].AsJSON;
         Result.Add(Row);
       end;
   finally

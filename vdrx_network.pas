@@ -14,10 +14,6 @@ type
   TVDRX_SocketListenerExecutive = class;
   TVDRX_WebSocketExecutive = class;
 
-  // One configured reverse-proxy target - see vdrx_daemon.conf's
-  // "proxy_bridges" and vdrx_daemon.lpr's SetupProxyBridges. Prefix match is
-  // longest-prefix-wins (like nginx location blocks), so overlapping
-  // prefixes (e.g. "/app/" and "/app/admin/") behave predictably.
   TVDRX_ProxyRoute = record
     Prefix: string;
     Host: string;
@@ -25,76 +21,17 @@ type
   end;
   TVDRX_ProxyRoutes = array of TVDRX_ProxyRoute;
 
-  // A one-shot-per-request PHP (or anything else) invocation, as opposed to
-  // TVDRX_ProxyRoute's persistent Bridge-managed backend. No Registry/Bridge
-  // involved at all - just this route table, consulted per request; the
-  // process is spawned, run, and freed entirely within RunCLIScript (or
-  // RunBusCLIScript, for Protocol='bus') below.
-  //
-  // Protocol distinguishes two entirely different wire contracts sharing one
-  // route table and one prefix-matching mechanism (MatchCLIRoute):
-  //
-  //   'cgi' (default, original/unchanged behaviour) - Command is treated as
-  //   just the interpreter ("php", "c:/php/php"); the URL path beyond Prefix
-  //   is resolved to a script FILE under ScriptDir (see ResolveScriptPath)
-  //   and appended as that interpreter's one parameter. The script talks CGI
-  //   env vars (REQUEST_METHOD, QUERY_STRING, ...) and its raw stdout bytes
-  //   become the response body verbatim - see RunCLIScript.
-  //
-  //   'bus' - Command is the FULL command line for a single fixed script
-  //   that handles every request under Prefix, however deep
-  //   ("php scripts/hello_bus.php", "cmd /c scripts\hello_bus.bat",
-  //   "python3 scripts/hello_bus.py" - same free-form string TProcess.
-  //   CommandLine already parses for vdrx_bridge.pas's persistent processes,
-  //   reused here for a one-shot process instead). There's no per-path file
-  //   lookup at all - Prefix behaves like a URL-rewrite base, and whatever
-  //   comes after it (path suffix + query string) is handed to the script
-  //   as DATA, not resolved to a file, so the script decides what it means.
-  //   ScriptDir is optional here (just sets the process's working
-  //   directory, default '.') since there's no ScriptDir-relative file
-  //   resolution to do. The script reads exactly one JSON line off stdin -
-  //   {"method":...,"path":...,"prefix":...,"sub_path":...,"query":...,
-  //   "headers":{...},"body":...} - and must write exactly one JSON line
-  //   back to stdout - {"status":200,"body":"..."} or
-  //   {"status":200,"template":"name","params":{...},"rows":{...}} to have
-  //   VDRX's own TVDRX_TemplateStore render it - before exiting. Same "only
-  //   ever write the structured envelope to stdout, log anything else to a
-  //   file instead" discipline scripts/irc_soylent.php already follows for
-  //   vdrx_bridge.pas's persistent-process stdin/stdout protocol - see
-  //   RunBusCLIScript's comment for why. This is the mechanism for a
-  //   one-shot "script executed only by the HTTP request"; a long-running
-  //   daemon that answers HTTP requests via a subscribed bus filter instead
-  //   (the other half of the original design discussion) is a separate,
-  //   not-yet-built piece - a persistent TVDRX_BridgeExecutive with a
-  //   correlation-ID reply-topic scheme, not this one-shot-per-request path.
-  //   'bus-daemon' - the persistent-subscriber counterpart to 'bus': instead
-  //   of spawning a fresh process per request, the request envelope (same
-  //   shape as 'bus' - see above) is published onto InTopic with a
-  //   per-request "reply_to" added, and this route just waits (via
-  //   TVDRX_OneShotWaiter, TimeoutMs-bounded) for a reply on that topic -
-  //   see RunBusDaemonRoute. Whatever's subscribed to InTopic answers it;
-  //   typically a persistent `processes` entry (the same kind already used
-  //   for irc_bot), so many concurrent requests share one already-running
-  //   process instead of paying spawn cost per request. Command/ScriptDir
-  //   are unused for this protocol - InTopic is the only routing
-  //   information needed, since VDRX isn't starting anything itself here.
   TVDRX_CLIRoute = record
     Prefix: string;
     Command: string;
     ScriptDir: string;
     TimeoutMs: Integer;
     ContentType: string;
-    Protocol: string; // 'cgi' (default) | 'bus' | 'bus-daemon' - see comment above
-    InTopic: string;  // only used by 'bus-daemon'
+    Protocol: string;
+    InTopic: string;
   end;
   TVDRX_CLIRoutes = array of TVDRX_CLIRoute;
 
-  // Byte-stream abstraction over an accepted connection - lets every protocol
-  // executive (HTTP, WebSocket) do its reads/writes without caring whether
-  // the underlying socket is plaintext or TLS. Deliberately mirrors fpRecv/fpSend's
-  // blocking, synchronous style - no event-loop rewrite needed anywhere else; every
-  // existing "one thread per connection" executive keeps working exactly as before,
-  // just talking to ATransport instead of a raw TSocket.
   TVDRX_Transport = class
   public
     function Read(var ABuf; ALen: Integer): Integer; virtual; abstract;
@@ -114,44 +51,22 @@ type
     procedure SetReadTimeout(ATimeoutMs: Integer); override;
   end;
 
-  // One shared SSL_CTX per listener (holds the loaded cert/key) hands out one SSL*
-  // per connection. The handshake runs in Create, on that connection's own thread -
-  // same reasoning as everywhere else in this codebase: a slow/stalled TLS client
-  // only blocks its own thread, never the accept loop or any other connection.
-  //
-  // Built against fpc's actual bundled openssl.pas (packages/openssl/src) - this is
-  // a dynamically-loaded (dlopen-style) binding with Pascal-cased names (SslNew,
-  // SslCtxNew, etc), NOT the raw C names (SSL_new, SSL_CTX_new). Every wrapper
-  // function here lazily calls InitSSLInterface itself, so no explicit init call is
-  // required - it'll just return failure/nil if libssl isn't found at runtime.
   TVDRX_TLSTransport = class(TVDRX_Transport)
   private
     FSocket: TSocket;
     FSSL: PSSL;
     FOK: Boolean;
   public
-    // Server role (accept side) - unchanged from before.
     constructor Create(ASocket: TSocket; ACtx: PSSL_CTX); overload;
-    // Client role (connect side) - SslConnect instead of SslAccept, plus SNI
-    // (SSL_CTRL_SET_TLSEXT_HOSTNAME via SslCtrl - FPC's openssl unit has no
-    // higher-level wrapper for this) so name-based virtual hosting on the
-    // remote end works. AHostname drives SNI only; whether the resulting
-    // cert is actually checked against it is governed by ACtx's own
-    // verify-mode (see TVDRX_TLSClientContext) - this constructor doesn't
-    // duplicate that decision.
     constructor Create(ASocket: TSocket; ACtx: PSSL_CTX; const AHostname: string); overload;
     destructor Destroy; override;
-    property Handshook: Boolean read FOK; // caller checks this and drops the connection if False
+    property Handshook: Boolean read FOK;
     function Read(var ABuf; ALen: Integer): Integer; override;
     function Write(const ABuf; ALen: Integer): Integer; override;
     procedure Close; override;
     procedure SetReadTimeout(ATimeoutMs: Integer); override;
   end;
 
-  // One per TLS-enabled listener - loads the cert/key once at Initialize time and
-  // hands out the resulting context for TVDRX_TLSTransport to wrap each accepted
-  // connection in. Deliberately doesn't crash the daemon if the cert/key don't load
-  // - check .OK and skip bringing the TLS listener up if false.
   TVDRX_TLSContext = class
   private
     FCtx: PSSL_CTX;
@@ -163,21 +78,6 @@ type
     property Ctx: PSSL_CTX read FCtx;
   end;
 
-  // Client-role counterpart to TVDRX_TLSContext - no cert/key to load (we're
-  // not presenting one), instead configures whether/how the REMOTE peer's
-  // cert gets checked. AVerifyPeer=False (SSL_VERIFY_NONE) means TLS
-  // encrypts the link but authenticates nobody - fine for quick testing
-  // against a self-signed dev server, not fine for anything talking to the
-  // open internet (see the MITM discussion in session notes). AVerifyPeer=
-  // True with no ACAFile relies on whatever default paths FPC's openssl
-  // unit's underlying libssl was built with - on Windows (which has no
-  // system-wide CA bundle location the way most Linux distros do) that
-  // usually means nothing is found and every handshake fails outright, so
-  // supplying a real ACAFile is effectively mandatory there - see
-  // ApplyOpenSSLDLLOverrides's unit comment for the parallel DLL-location
-  // problem. FOK reflects only "was the context itself constructable" -
-  // whether verification succeeds is a per-handshake outcome, checked via
-  // TVDRX_TLSTransport.Handshook after Create.
   TVDRX_TLSClientContext = class
   private
     FCtx: PSSL_CTX;
@@ -197,8 +97,6 @@ type
     procedure Execute; override;
   public
     constructor Create(AOwner: TVDRX_SocketListenerExecutive; ATransport: TVDRX_Transport);
-    // Exposed so Shutdown can force-close a hung connection's transport to
-    // unblock a blocking Read/Write that FStopping alone can't interrupt.
     property Transport: TVDRX_Transport read FTransport;
   end;
 
@@ -216,23 +114,15 @@ type
     FTLSThread: TThread;
     FStopping: Boolean;
     FGracefulTimeoutMs: Integer;
-
-    // Thread tracking synchronization
     FCriticalSection: TCriticalSection;
     FActiveConnections: TList;
 
     function BindListenSocket(APort: Word): TSocket;
     procedure AcceptLoopPlain;
     procedure AcceptLoopTLS;
-    // Polls FActiveConnections membership (rather than AThread.Finished/Free)
-    // to learn when a connection thread is done - see the long comment on
-    // Shutdown below for why touching the TThread object itself after it may
-    // have self-freed via FreeOnTerminate is unsafe.
     function WaitConnGone(AThread: TVDRX_ListenerConnThread; ATimeoutMs: Integer): Boolean;
   protected
     procedure HandleConnection(ATransport: TVDRX_Transport); virtual; abstract;
-
-    // Called by TVDRX_ListenerConnThread during life cycle
     procedure RegisterConnection(AThread: TVDRX_ListenerConnThread);
     procedure UnregisterConnection(AThread: TVDRX_ListenerConnThread);
   public
@@ -244,10 +134,6 @@ type
     procedure ConfigureTLS(ATLSPort: Word; const ACertFile, AKeyFile: string);
     property Backlog: Integer read FBacklog write FBacklog;
     property Stopping: Boolean read FStopping;
-    // How long Shutdown waits for accept/connection threads to exit on their
-    // own before force-closing their sockets to unblock a hung blocking
-    // Read/Write. Defaults to 5000ms; set from vdrx_daemon.conf's top-level
-    // "shutdown_grace_ms" in vdrx_daemon.lpr.
     property GracefulTimeoutMs: Integer read FGracefulTimeoutMs write FGracefulTimeoutMs;
     procedure Initialize; override;
     procedure Shutdown; override;
@@ -271,9 +157,6 @@ type
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
   end;
 
-  // Bounds RunCLIScript's wall-clock time WITHOUT blocking the read loop that
-  // drains the child's stdout - see RunCLIScript's comment for why those two
-  // things have to happen concurrently, not one after the other.
   TCLIWatchdog = class
   private
     FProc: TProcess;
@@ -287,23 +170,6 @@ type
     property Fired: Boolean read FFired;
   end;
 
-  // Generic "publish a request, block this thread until a correlated reply
-  // arrives (or a timeout), tear down" primitive - the building block behind
-  // both RunBusDaemonRoute (a persistent, subscribed process answering many
-  // HTTP requests, rather than one spawned per request - see
-  // TVDRX_CLIRoute's "bus-daemon" protocol) and a bus-mode reply's optional
-  // "template_topic" field (routing template rendering through a specific,
-  // explicitly-named TVDRX_TemplateExecutive rather than whichever HTTP
-  // site's own TVDRX_TemplateStore happened to answer the connection - see
-  // vdrx_templates.pas).
-  //
-  // Deliberately NOT a long-lived subscriber: one instance answers exactly
-  // one reply, on a reply topic minted uniquely per call (see
-  // NextReplyTopic) so concurrent callers never collide, then it's torn
-  // down. This mirrors what a WS connection or a Bridge already is
-  // (registered-with-the-Registry, delivered to via HandlePacket) but for a
-  // single request/response instead of a connection's whole lifetime -
-  // the same Registry filter-match mechanism, just used for one round trip.
   TVDRX_OneShotWaiter = class(TVDRX_Executive)
   private
     FEvent: TEvent;
@@ -313,11 +179,6 @@ type
     constructor Create(ABus: TVDRX_MessageQueue);
     destructor Destroy; override;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
-    // Blocks the CALLING thread (not a thread of the waiter's own - it has
-    // none) until HandlePacket fires or ATimeoutMs elapses. Caller is
-    // responsible for Registry.Unregister(ID)'ing this waiter afterwards
-    // either way - see PublishAndWait below, which always does both
-    // regardless of which one happened.
     function WaitForReply(ATimeoutMs: Integer; out APayload: string): Boolean;
   end;
 
@@ -329,6 +190,7 @@ type
     FProxyRoutes: TVDRX_ProxyRoutes;
     FCLIRoutes: TVDRX_CLIRoutes;
     FRegistry: TVDRX_Registry;
+    FCustomHeaders: TStringList;
   protected
     procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
@@ -336,38 +198,17 @@ type
       ATemplates: TVDRX_TemplateStore;
       const AStaticDir: string; const AProxyRoutes: TVDRX_ProxyRoutes;
       const ACLIRoutes: TVDRX_CLIRoutes; ARegistry: TVDRX_Registry); reintroduce;
+    destructor Destroy; override;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
     procedure ApplyConfig; override;
+    property CustomHeaders: TStringList read FCustomHeaders;
     class function BuildResponse(const ARequest: string;
       ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
       const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
-      ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string): string;
+      ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string;
+      ACustomHeaders: TStringList = nil): string;
   end;
 
-  // Pure connectivity - the WS handshake, frame read/write, ping/pong
-  // keepalive, and relaying bus traffic to/from the socket. Deliberately
-  // contains NO interpretation of what a client's text frame MEANS - see
-  // TVDRX_WSProtocolExecutive below for that half of the split. A text
-  // frame's raw JSON is simply republished onto "<ID>.rpc.in" for whichever
-  // protocol executive is subscribed there to interpret (see AdoptConnection
-  // in TVDRX_WebSocketExecutive, which creates one alongside every
-  // connection); this class never parses it. The one thing this class keeps
-  // Common ancestor for any executive that owns exactly one live transport
-  // for its whole lifetime - today TVDRX_SocketClientExecutive (a dialer:
-  // connects itself, can reconnect) and TVDRX_WSConnection (an acceptor:
-  // handed an already-connected transport by a listener, never reconnects -
-  // if it drops, the connection is just over). Those two lifecycles are
-  // different enough that connecting/reconnecting/framing all stay on the
-  // subclasses - what's genuinely identical between them is narrower than
-  // it first looks: "holds a TVDRX_Transport, frees it on teardown."
-  // Deliberately NOT a shared write-lock or ReadFrame contract - socket_client's
-  // lock guards transport pointer SWAPS across reconnects (a state-machine
-  // concern), WS's guards concurrent frame WRITES to a transport that never
-  // moves (a serialization concern); those are different enough in meaning
-  // that forcing one lock semantics onto both would risk quietly changing
-  // socket_client's reconnect correctness for a cosmetic win. If a third
-  // connection-owning executive shows up wanting the exact same locking
-  // shape as one of these two, that's the moment to reconsider - not before.
   TVDRX_ConnectionExecutive = class(TVDRX_Executive)
   protected
     FTransport: TVDRX_Transport;
@@ -375,29 +216,6 @@ type
     destructor Destroy; override;
   end;
 
-  // The third member of the connection-executive family, alongside
-  // TVDRX_SocketClientExecutive and TVDRX_WSConnection - previously the only
-  // per-connection network handler in this unit that WASN'T a class at all
-  // (TVDRX_HTTPExecutive.HandleConnection and TVDRX_WebListenerExecutive.
-  // HandleConnection each independently read/parsed/responded inline, with
-  // the transport as a bare local variable, manually Freed at the end of a
-  // plain procedure). Doesn't need a persistent read loop, ping/pong, or
-  // Registry registration the way WS/socket_client do - HTTP is
-  // request/response, not a standing connection - so Run() just does
-  // exactly one read-build-write-close cycle and the caller frees it
-  // immediately after. What it DOES get from deriving from
-  // TVDRX_ConnectionExecutive rather than staying a bare procedure: a real
-  // owner for the transport (freed safely by the base's Destroy, same as
-  // every other connection type, instead of a hand-rolled Free at the end
-  // of whichever procedure happened to accept it), and - the actual prize -
-  // ONE shared implementation of "read a full HTTP request and dispatch it"
-  // instead of two independently-maintained copies that had quietly drifted:
-  // TVDRX_WebListenerExecutive's old inline version read a single fixed
-  // 2048-byte buffer rather than using ReadFullRequest, which could
-  // silently truncate any request with a body, or with enough headers, to
-  // cross that size - a real bug on a combined HTTP+WS site that plain
-  // TVDRX_HTTPExecutive's connections never had, purely because the two
-  // listener types had drifted rather than shared code.
   TVDRX_HTTPConnection = class(TVDRX_ConnectionExecutive)
   private
     FTemplates: TVDRX_TemplateStore;
@@ -406,46 +224,28 @@ type
     FProxyRoutes: TVDRX_ProxyRoutes;
     FCLIRoutes: TVDRX_CLIRoutes;
     FRegistry: TVDRX_Registry;
-    FSourceID: string; // for log attribution - this object is never itself
-                        // Registry-registered (a one-shot request/response
-                        // has nothing to address it BY later, unlike a
-                        // standing WS connection), so it borrows its
-                        // owning listener's own ID for Bus.Publish calls,
-                        // matching the log lines' previous "http"/"ws"
-                        // attribution exactly.
+    FSourceID: string;
+    FCustomHeaders: TStringList;
   public
     constructor Create(ABus: TVDRX_MessageQueue; ATransport: TVDRX_Transport;
       ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
       const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
-      ARegistry: TVDRX_Registry; const ASourceID: string); reintroduce;
+      ARegistry: TVDRX_Registry; const ASourceID: string;
+      ACustomHeaders: TStringList = nil); reintroduce;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
-    // ARequest: pass the full request text if the caller already read it
-    // (TVDRX_WebListenerExecutive has to, to decide WS-upgrade-vs-not
-    // BEFORE it knows which of the two this connection even is) - leave it
-    // blank and Run reads it itself (TVDRX_HTTPExecutive, which never needs
-    // to peek before deciding).
     procedure Run(const ARequest: string = '');
   end;
 
-  // that could be argued as "protocol" is HandlePacket's ordinary bus->socket
-  // forwarding envelope - {"topic":...,"payload":...,"source":...,"seq":...}
-  // - but that's the wire format for "a browser is a bus participant" itself
-  // (see the readme's §5), not any one RPC method's interpretation of it, so
-  // it stays here; a "<ID>.rpc.out" topic is special-cased instead, to let
-  // the protocol executive send an already-fully-formed reply line (e.g.
-  // "auth.ok") verbatim rather than have it wrapped in that envelope too.
   TVDRX_WSConnection = class(TVDRX_ConnectionExecutive)
   private
     FListener: TVDRX_WebSocketExecutive;
     FThread: TThread;
     FSendLock: TCriticalSection;
     FPendingRequest: string;
-
     FPingThread: TThread;
     FStopping: Boolean;
     FLastPong: TDateTime;
     procedure PingLoop;
-
     function DoHandshake: Boolean;
     function ReadFrame(out APayload: string; out AOpcode: Byte): Boolean;
   public
@@ -460,23 +260,6 @@ type
     class function IsUpgradeRequest(const ARequest: string): Boolean;
   end;
 
-  // The "protocol" half of the split above - all of what used to be
-  // TVDRX_WSConnection.HandleRPC, now living in its own Registry-registered
-  // executive, subscribed only to its connection's "<ID>.rpc.in" topic
-  // (never touching FTransport, never seeing raw WS frames or opcodes).
-  // sys.auth/subscribe/unsubscribe/unsubscribe_all/publish - the entire
-  // client-facing JSON-RPC surface - is interpreted here.
-  //
-  // The one unavoidable coupling to the connectivity object: subscribe/
-  // unsubscribe/unsubscribe_all have to call Registry.Register/
-  // UnregisterFilter/ClearFilters against the CONNECTIVITY object's own ID
-  // (it's the one whose HandlePacket can actually reach the socket) - and
-  // Register's signature needs an actual TVDRX_Executive reference, not
-  // just an ID string, the one time a NEW filter is being added. FConn
-  // exists solely to satisfy that - this class never calls a method on it
-  // that touches the transport (SendFrame included: an outgoing reply is
-  // published to "<ID>.rpc.out" instead, for the connectivity object's own
-  // HandlePacket to relay - see its comment above).
   TVDRX_WSProtocolExecutive = class(TVDRX_Executive)
   private
     FListener: TVDRX_WebSocketExecutive;
@@ -493,7 +276,7 @@ type
     FRegistry: TVDRX_Registry;
     FConnCounter: Integer;
     FPingIntervalMs, FPongTimeoutMs: Integer;
-    FDefaultSubscribe: string; // comma-joined filters - see property comment
+    FDefaultSubscribe: string;
   protected
     procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
@@ -505,36 +288,9 @@ type
     procedure AdoptConnection(ATransport: TVDRX_Transport; const AInitialRequest: string);
     property PingIntervalMs: Integer read FPingIntervalMs write FPingIntervalMs;
     property PongTimeoutMs: Integer read FPongTimeoutMs write FPongTimeoutMs;
-    // Filters (comma-joined, same GetObjectArray shape as everywhere else)
-    // every new connection is registered on automatically, in addition to
-    // its own "<id>.rpc.out" - e.g. a server-wide announcements topic every
-    // browser should see without having to know to ask for it. Client-driven
-    // subscribe/unsubscribe (TVDRX_WSProtocolExecutive) can still add or
-    // remove filters on top of these same as any other - this only seeds
-    // what a connection starts with.
     property DefaultSubscribe: string read FDefaultSubscribe write FDefaultSubscribe;
   end;
 
-  // Generic outbound socket client - the dialer counterpart to
-  // TVDRX_SocketListenerExecutive's accept side. Deliberately protocol-blind:
-  // it moves bytes/lines between one remote TCP/TLS connection and the bus,
-  // publishing to "<ID>.out" and writing whatever this executive is
-  // registered to receive straight to the socket (see HandlePacket) -
-  // exactly mirroring TVDRX_BridgeExecutive's "<ID>.out"/stdin convention,
-  // so a bus consumer can't tell an IRC-over-TLS socket client from a
-  // bridged PHP process. All actual protocol handling (IRC's NICK/USER,
-  // PING/PONG, etc.) lives entirely in whatever's subscribed to this
-  // executive's output - same "VDRX owns the wire, something else owns the
-  // protocol" split as Bridge, just for a connection VDRX dials itself
-  // instead of one it spawns.
-  //
-  // Framing is deliberately limited to two modes rather than an open-ended
-  // plugin system - see session notes for why: line-oriented protocols
-  // (IRC, SMTP, ...) and raw byte-chunk protocols cover every case actually
-  // in front of this, and a fancier scheme (length-prefixed, etc.) is easy
-  // to add later against a second real use case rather than guessed at now.
-  // Reading is deliberately more lenient than writing in delimiter mode -
-  // see ReaderLoop.
   TVDRX_SocketClientExecutive = class(TVDRX_ConnectionExecutive)
   private
     FHost: string;
@@ -542,19 +298,17 @@ type
     FTLS: Boolean;
     FTLSVerify: Boolean;
     FTLSCAFile: string;
-    FTLSPeerName: string; // SNI hostname; falls back to FHost if left blank
-    FFraming: string;     // 'delimiter' (default) | 'chunk'
-    FDelimiter: string;   // write-side terminator; default #13#10
-    FChunkSize: Integer;  // used when FFraming = 'chunk'
-    FReconnectPolicy: string; // 'auto' (default, backoff-retry) | 'none' (dial once, stay down)
+    FTLSPeerName: string;
+    FFraming: string;
+    FDelimiter: string;
+    FChunkSize: Integer;
+    FReconnectPolicy: string;
     FReconnectDelayMs, FMaxReconnectDelayMs: Integer;
     FGracefulTimeoutMs: Integer;
-    FPublishTopic: string; // where read data is published - see PublishTopic property
+    FPublishTopic: string;
 
     FTransportLock: TCriticalSection;
-    FConnected: Boolean; // reader loop's substitute for "process still running" -
-                          // there's no exit code for a dropped socket, just
-                          // "the last Read failed"
+    FConnected: Boolean;
     FReaderThread: TThread;
     FMonitorThread: TThread;
     FStopping: Boolean;
@@ -576,10 +330,6 @@ type
     property Delimiter: string read FDelimiter write FDelimiter;
     property ChunkSize: Integer read FChunkSize write FChunkSize;
     property ReconnectPolicy: string read FReconnectPolicy write FReconnectPolicy;
-    // Where read data is published - "<id>.out" if left blank (SetupSocketClients
-    // in vdrx.lpr applies that fallback; this class has no ID to default against
-    // on its own, since ID is only assigned once Registry.Register runs, after
-    // this property would already need a value).
     property PublishTopic: string read FPublishTopic write FPublishTopic;
     property ReconnectDelayMs: Integer read FReconnectDelayMs write FReconnectDelayMs;
     property MaxReconnectDelayMs: Integer read FMaxReconnectDelayMs write FMaxReconnectDelayMs;
@@ -591,57 +341,17 @@ type
 
 const
   MAX_HEADER_SIZE = 16384;
-  MAX_BODY_SIZE = 10 * 1024 * 1024; // generous for dev/test form posts - not meant for large uploads
+  MAX_BODY_SIZE = 10 * 1024 * 1024;
   WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
-// Opens a client TCP connection to AHost:APort - for reverse-proxying to a
-// locally-managed backend (see vdrx_http.pas's proxy_bridges). Returns nil
-// on failure. IPv4 dotted-quad host only (matches this whole codebase's
-// AF_INET-only assumption elsewhere) and plaintext only - nothing here
-// talks TLS as a CLIENT, which is fine since backends are loopback-only by
-// design (see vdrx_http.pas's ProxyRequest).
 function ConnectTCP(const AHost: string; APort: Word): TVDRX_Transport;
-
-// Same as ConnectTCP, but resolves AHost via DNS (resolve.THostResolver)
-// when it isn't a bare IPv4 literal - for TVDRX_SocketClientExecutive
-// dialing an arbitrary remote host, unlike ConnectTCP's loopback-only
-// backends. Still IPv4/AF_INET only (matches the rest of this codebase).
-// Returns nil on either resolution or connect failure - no exception, same
-// contract as ConnectTCP.
 function ConnectTCPHost(const AHost: string; APort: Word): TVDRX_Transport;
-
-// Reads tls_ssl_dll/tls_crypto_dll (top-level config keys) and, if either
-// is set, assigns them to FPC's openssl unit's DLLSSLName/DLLUtilName
-// globals before anything calls into it - see vdrx.lpr for call site (must
-// run before Registry.InitializeAll, i.e. before any TLS-using executive's
-// Initialize). Windows-only: Linux distros almost always have libssl
-// discoverable via the unversioned name already (see hogircd's
-// libssl-dev-vs-libssl3 note); Windows has no equivalent system-wide
-// location, which is the actual problem this solves (see session notes -
-// bot.lpr's "Could not initialize OpenSSL library" against OpenSSL 4.x).
-// A no-op with nothing configured, so existing Linux-only deployments are
-// unaffected either way.
 procedure ApplyOpenSSLDLLOverrides(AConfig: TVDRX_Config);
 
 implementation
 
-// Forward declaration - TVDRX_WebListenerExecutive.HandleConnection (below)
-// needs to call this before its real definition's textual position later in
-// this file's implementation section (Object Pascal compiles top-to-bottom
-// within a unit; a standalone routine with no interface-section declaration
-// needs a forward decl to be callable from earlier code in the same file).
 function ReadFullRequest(ATransport: TVDRX_Transport): string; forward;
 
-// Parses a plain "a.b.c.d" IPv4 address into the 4 bytes sockaddr_in.sin_addr
-// needs, in the correct (network) byte order - dotted-quad notation is
-// already MSB-first, so filling Bytes[0..3] in left-to-right reading order
-// and copying them straight into sin_addr is correct with no byte-swap step.
-// Deliberately hand-rolled rather than relying on the Sockets unit's own
-// string-to-address helper: an earlier version of this function used
-// StrToHostAddr and was never actually verified against this FPC version -
-// it silently produced the wrong address, which is why every connect()
-// attempt hung for ~21s (Windows' default SYN-retry timeout for a target
-// that never responds) instead of failing or succeeding immediately.
 function ParseIPv4(const AHost: string; out AAddr: Cardinal): Boolean;
 var
   Parts: TStringArray;
@@ -661,25 +371,19 @@ begin
   Result := True;
 end;
 
-// to get around lack of poSearchPath in process.TProcessOptions
 function ProcessFindInPath(const Exe: string): string;
 var
   Paths: TStringList;
   Dir: string;
   Candidate: string;
 begin
-  Result := Exe;  // default return value
-
-  // If Exe already contains a path, don't search PATH
-  if (Pos(PathDelim, Exe) > 0) or (Pos('/', Exe) > 0) then
-    Exit;
-
+  Result := Exe;
+  if (Pos(PathDelim, Exe) > 0) or (Pos('/', Exe) > 0) then Exit;
   Paths := TStringList.Create;
   try
     Paths.Delimiter := PathSeparator;
     Paths.StrictDelimiter := True;
     Paths.DelimitedText := GetEnvironmentVariable('PATH');
-
     for Dir in Paths do
     begin
       Candidate := IncludeTrailingPathDelimiter(Dir) + Exe;
@@ -694,7 +398,6 @@ begin
   end;
 end;
 
-
 function ConnectTCP(const AHost: string; APort: Word): TVDRX_Transport;
 var
   Sock: TSocket;
@@ -702,7 +405,7 @@ var
   IPBytes: Cardinal;
 begin
   Result := nil;
-  if not ParseIPv4(AHost, IPBytes) then Exit; // dotted-quad IPv4 only - matches the loopback-only proxy design, no DNS resolution needed
+  if not ParseIPv4(AHost, IPBytes) then Exit;
   Sock := fpSocket(AF_INET, SOCK_STREAM, 0);
   if Sock < 0 then Exit;
   FillChar(Addr, SizeOf(Addr), 0);
@@ -717,11 +420,6 @@ begin
   Result := TVDRX_PlainTransport.Create(Sock);
 end;
 
-// Shared by ConnectTCPHost (below) and TVDRX_SocketClientExecutive.DoConnect
-// - the TLS path needs the raw connected TSocket (to wrap in
-// TVDRX_TLSTransport itself), not a TVDRX_Transport already wrapping one, so
-// this is the one place the actual resolve+connect happens and both callers
-// build on it instead of duplicating it.
 function ConnectRawSocket(const AHost: string; APort: Word; out ASocket: TSocket): Boolean;
 var
   Addr: TInetSockAddr;
@@ -733,14 +431,10 @@ begin
   ASocket := -1;
   if not ParseIPv4(AHost, IPBytes) then
   begin
-    // Not a bare dotted-quad - resolve it. THostResolver wraps the
-    // platform's own resolver (getaddrinfo/gethostbyname under the hood),
-    // so this works the same on Windows and Unix without any extra
-    // platform-specific code here.
     Resolver := THostResolver.Create(nil);
     try
-      if not Resolver.NameLookup(AHost) then Exit; // resolution failed - no such host, or no network
-      NetAddr := Resolver.NetHostAddress; // already network-byte-order (in_addr) - matches sin_addr directly
+      if not Resolver.NameLookup(AHost) then Exit;
+      NetAddr := Resolver.NetHostAddress;
       Move(NetAddr, IPBytes, SizeOf(IPBytes));
     finally
       Resolver.Free;
@@ -770,12 +464,6 @@ begin
   Result := TVDRX_PlainTransport.Create(Sock);
 end;
 
-// See this function's interface comment for the general shape. Only
-// Windows actually needs the override - Linux almost always finds libssl
-// via the unversioned name once libssl-dev's symlink is present (see the
-// hogircd session notes), so on Unix this is a documented no-op even if
-// tls_ssl_dll/tls_crypto_dll happen to be set in a config shared across
-// platforms.
 procedure ApplyOpenSSLDLLOverrides(AConfig: TVDRX_Config);
 {$IFDEF WINDOWS}
 var
@@ -840,23 +528,20 @@ begin
   FSocket := ASocket;
   FSSL := SslNew(ACtx);
   SslSetFd(FSSL, FSocket);
-  FOK := Assigned(FSSL) and (SslAccept(FSSL) = 1); // blocking - fine, runs on this connection's own thread
+  FOK := Assigned(FSSL) and (SslAccept(FSSL) = 1);
 end;
 
 constructor TVDRX_TLSTransport.Create(ASocket: TSocket; ACtx: PSSL_CTX; const AHostname: string);
 begin
   inherited Create;
   FSocket := ASocket;
-  if not Assigned(ACtx) then Exit; // FOK stays False (default) - see this constructor's interface comment; guards against SslSetFd(nil, ...) below, which segfaults in native OpenSSL with no nil-check of its own
+  if not Assigned(ACtx) then Exit;
   FSSL := SslNew(ACtx);
   if not Assigned(FSSL) then Exit;
   SslSetFd(FSSL, FSocket);
   if AHostname <> '' then
-    // SNI - FPC's openssl unit has no SslSetTlsExtHostName wrapper, so this
-    // goes through the generic SslCtrl the same way the C
-    // SSL_set_tlsext_host_name() macro does.
     SslCtrl(FSSL, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, PChar(AHostname));
-  FOK := (SslConnect(FSSL) = 1); // blocking - runs on this connection's own thread, same as the server-role constructor above
+  FOK := (SslConnect(FSSL) = 1);
 end;
 
 destructor TVDRX_TLSTransport.Destroy;
@@ -890,7 +575,6 @@ procedure TVDRX_TLSTransport.SetReadTimeout(ATimeoutMs: Integer);
 var
   PlainTemp: TVDRX_PlainTransport;
 begin
-  // Delegate socket timeout configuration to underlying socket via temporary plain wrapper or direct options
   PlainTemp := TVDRX_PlainTransport.Create(FSocket);
   try
     PlainTemp.SetReadTimeout(ATimeoutMs);
@@ -904,12 +588,6 @@ end;
 constructor TVDRX_TLSContext.Create(const ACertFile, AKeyFile: string);
 begin
   inherited Create;
-  // SslTLSMethod loads the 'TLS_method' symbol - the modern, version-negotiating
-  // method that works for both accept (server) and connect (client) roles; which
-  // role you get is determined by calling SslAccept vs SslConnect, not by the
-  // method object. (SslMethodV23 / 'SSLv23_method' is NOT used here - that symbol
-  // was dropped from OpenSSL 1.1+/3.x and this unit itself flags it as
-  // "method not supported by lib".)
   FCtx := SslCtxNew(SslTLSMethod);
   FOK := Assigned(FCtx)
     and (SslCtxUseCertificateFile(FCtx, ACertFile, SSL_FILETYPE_PEM) = 1)
@@ -928,7 +606,7 @@ end;
 constructor TVDRX_TLSClientContext.Create(const ACAFile: string; AVerifyPeer: Boolean);
 begin
   inherited Create;
-  FCtx := SslCtxNew(SslTLSMethod); // same version-negotiating method as the server context - see its comment
+  FCtx := SslCtxNew(SslTLSMethod);
   FOK := Assigned(FCtx);
   if not FOK then Exit;
   if AVerifyPeer then
@@ -937,11 +615,6 @@ begin
     if ACAFile <> '' then
       FOK := (SslCtxLoadVerifyLocations(FCtx, ACAFile, '') = 1)
     {$IFDEF UNIX}
-    // No CA file configured - fall back to the common Debian/Ubuntu/RHEL
-    // bundle location most Linux systems already have, rather than silently
-    // failing every handshake. Windows has no equivalent well-known path -
-    // ACAFile is effectively mandatory there (see this class's interface
-    // comment) - so no fallback attempt is made under {$IFDEF WINDOWS}.
     else if FileExists('/etc/ssl/certs/ca-certificates.crt') then
       FOK := (SslCtxLoadVerifyLocations(FCtx, '/etc/ssl/certs/ca-certificates.crt', '') = 1)
     {$ENDIF}
@@ -963,7 +636,7 @@ begin
   inherited Create(True);
   FOwner := AOwner;
   FTransport := ATransport;
-  FreeOnTerminate := False; // Managed manually by the executive for graceful shutdown tracking
+  FreeOnTerminate := False;
 end;
 
 procedure TVDRX_ListenerConnThread.Execute;
@@ -973,7 +646,6 @@ begin
     try
       FOwner.HandleConnection(FTransport);
     except
-      // Isolate connection exceptions
     end;
   finally
     FOwner.UnregisterConnection(Self);
@@ -1045,7 +717,7 @@ begin
     Bus.Publish('log.error', ID + ': fpBind failed on port ' + IntToStr(APort) +
       ' (errno ' + IntToStr(socketerror) + ') - port likely already in use', ID);
     CloseSocket(Result);
-    Exit(-1); // caller must check for -1 rather than trying to accept on a dead/invalid socket
+    Exit(-1);
   end;
   if fpListen(Result, FBacklog) <> 0 then
   begin
@@ -1067,7 +739,7 @@ begin
   if FPlainSocket = -1 then
   begin
     FPlainSocket := 0;
-    Exit; // bind/listen already logged the reason above; nothing to accept on
+    Exit;
   end;
   while not FStopping do
   begin
@@ -1075,10 +747,6 @@ begin
     ClientSock := fpAccept(FPlainSocket, @ClientAddr, @AddrLen);
     if ClientSock = -1 then
     begin
-      // An unexpected accept error (anything other than the socket having
-      // just been closed for shutdown, which the FStopping check above
-      // already handles) used to hit this in a tight loop with no wait,
-      // pegging a CPU core. Give the error a moment to clear.
       if not FStopping then
         Sleep(10);
       Continue;
@@ -1097,9 +765,6 @@ begin
     end;
     ConnThread.Start;
   end;
-  // Shutdown may have already closed FPlainSocket to unblock fpAccept above -
-  // guard against closing an already-closed (and possibly since-reused, on
-  // POSIX) descriptor a second time.
   if FPlainSocket <> 0 then
   begin
     CloseSocket(FPlainSocket);
@@ -1190,10 +855,6 @@ begin
   end;
 end;
 
-// FActiveConnections membership (kept in sync by Register/UnregisterConnection,
-// both called from the connection thread itself) is used as the completion
-// signal instead of AThread.Finished, and nothing here ever calls AThread.Free -
-// see the Shutdown comment below.
 function TVDRX_SocketListenerExecutive.WaitConnGone(AThread: TVDRX_ListenerConnThread; ATimeoutMs: Integer): Boolean;
 var
   Waited: Integer;
@@ -1226,11 +887,6 @@ var
 begin
   FStopping := True;
 
-  // 1. Unblock accept loops. Guard + zero each socket var so the accept
-  // loop's own closing code (AcceptLoopPlain/AcceptLoopTLS) won't also try
-  // to close it again once it wakes up from fpAccept - double-closing a fd
-  // on POSIX is dangerous once the number has been recycled for another
-  // thread's socket.
   if FPlainSocket <> 0 then
   begin
     CloseSocket(FPlainSocket);
@@ -1242,8 +898,6 @@ begin
     FTLSSocket := 0;
   end;
 
-  // 2. Join accept threads (bounded - these should return almost immediately
-  // once their listen socket is closed above).
   if Assigned(FPlainThread) then
   begin
     if WaitThreadOrTimeout(FPlainThread, FGracefulTimeoutMs) then
@@ -1261,7 +915,6 @@ begin
     FTLSThread := nil;
   end;
 
-  // 3. Thread-safe snapshot of active connection threads to close
   FCriticalSection.Acquire;
   try
     CopyList := TList.Create;
@@ -1274,31 +927,11 @@ begin
     for I := 0 to CopyList.Count - 1 do
     begin
       ConnThread := TVDRX_ListenerConnThread(CopyList[I]);
-      // ConnThread.Execute sets FreeOnTerminate := True right before it
-      // returns, so the RTL frees the TThread object itself, on the
-      // connection's own thread, the moment Execute exits - possibly before
-      // this loop even gets here. That means this code must never touch
-      // ConnThread's own fields (.Finished, .Free) once it's had a chance to
-      // exit, since the object may already be gone: doing so risks a
-      // use-after-free, and calling ConnThread.Free here on top of that would
-      // be a double free. WaitConnGone sidesteps this entirely by polling
-      // FActiveConnections membership (a separate, still-live data
-      // structure) instead of the thread object, and this code never calls
-      // ConnThread.Free - FreeOnTerminate already owns that.
-      //
-      // First give it FGracefulTimeoutMs to notice FStopping/EOF and exit on
-      // its own; if it doesn't, force its transport closed - that unblocks a
-      // blocking Read/Write (a connection idling on a client that never
-      // sends/disconnects, the classic hang case) and lets HandleConnection
-      // return. Give it one more short window after that before giving up.
       if not WaitConnGone(ConnThread, FGracefulTimeoutMs) then
       begin
         Bus.Publish('log.warn', ID + ': connection thread did not exit in time - forcing its socket closed', ID);
         try ConnThread.Transport.Close; except end;
         if not WaitConnGone(ConnThread, FGracefulTimeoutMs) then
-          // Genuinely stuck even after a forced close (shouldn't happen) -
-          // abandon it; its transport is already closed so it should
-          // unblock and self-free shortly via FreeOnTerminate regardless.
           Bus.Publish('log.warn', ID + ': connection thread still stuck after forcing its socket closed - abandoning it', ID);
       end;
     end;
@@ -1306,7 +939,6 @@ begin
     CopyList.Free;
   end;
 
-  // 4. Safe to tear down shared resources like context now that all threads are dead
   FTLSContext.Free;
   FTLSContext := nil;
 end;
@@ -1330,14 +962,6 @@ var
   Request: string;
   Conn: TVDRX_HTTPConnection;
 begin
-  // ReadFullRequest, not a fixed-size single read - a WS handshake has no
-  // Content-Length body (so this returns as soon as the header block ends,
-  // no different from before for that case), but a genuine HTTP request
-  // with a body, or just enough headers, could exceed a fixed 2048-byte
-  // buffer and get silently truncated by the old single-read version - a
-  // real gap this listener had that plain TVDRX_HTTPExecutive's connections
-  // never did, purely from the two having drifted - see TVDRX_HTTPConnection's
-  // class comment.
   Request := ReadFullRequest(ATransport);
   if Request = '' then
   begin
@@ -1353,16 +977,15 @@ begin
     Conn := TVDRX_HTTPConnection.Create(Bus, ATransport, FTemplates, FConfig, FStaticDir,
       FProxyRoutes, FCLIRoutes, FWebSocket.Registry, ID);
     try
-      Conn.Run(Request); // already read above - don't read it twice
+      Conn.Run(Request);
     finally
-      Conn.Free; // frees ATransport too - see TVDRX_ConnectionExecutive.Destroy
+      Conn.Free;
     end;
   end;
 end;
 
 procedure TVDRX_WebListenerExecutive.HandlePacket(const AMsg: TVDRX_Message);
 begin
-  // Request/response + hand-off only.
 end;
 
 constructor TCLIWatchdog.Create(AProc: TProcess; ATimeoutMs: Integer);
@@ -1394,11 +1017,27 @@ begin
   end;
 end;
 
-function PlainResponse(const AStatus, AContentType, ABody: string): string;
+function PlainResponse(const AStatus, AContentType, ABody: string; ACustomHeaders: TStringList = nil): string;
+var
+  i: Integer;
+  ExtraHeaders: string;
 begin
+  ExtraHeaders := '';
+  if Assigned(ACustomHeaders) then
+  begin
+    for i := 0 to ACustomHeaders.Count - 1 do
+    begin
+      if ACustomHeaders.Names[i] <> '' then
+        ExtraHeaders := ExtraHeaders + ACustomHeaders.Names[i] + ': ' + ACustomHeaders.ValueFromIndex[i] + #13#10
+      else if Trim(ACustomHeaders[i]) <> '' then
+        ExtraHeaders := ExtraHeaders + Trim(ACustomHeaders[i]) + #13#10;
+    end;
+  end;
+
   Result := 'HTTP/1.1 ' + AStatus + #13#10 +
             'Content-Type: ' + AContentType + #13#10 +
-            'Content-Length: ' + IntToStr(Length(ABody)) + #13#10#13#10 + ABody;
+            'Content-Length: ' + IntToStr(Length(ABody)) + #13#10 +
+            ExtraHeaders + #13#10 + ABody;
 end;
 
 function StatusOf(const AResponse: string): string;
@@ -1460,7 +1099,7 @@ begin
   SL := TStringList.Create;
   try
     SL.Text := AHeaderBlock;
-    for i := 1 to SL.Count - 1 do // line 0 is the request line, not a header
+    for i := 1 to SL.Count - 1 do
     begin
       Colon := Pos(':', SL[i]);
       if (Colon > 0) and SameText(Trim(Copy(SL[i], 1, Colon - 1)), AName) then
@@ -1471,11 +1110,6 @@ begin
   end;
 end;
 
-// Reads a full request off the wire: headers (up to the blank line), then -
-// if a Content-Length header is present - exactly that many more body bytes.
-// Needed for the proxy path (a PHP app expects to see the whole POST body,
-// not the first ~1KB a single Read happened to return) but applies to every
-// request now, board/static included, since it's strictly more correct.
 function ReadFullRequest(ATransport: TVDRX_Transport): string;
 var
   Buf: array[0..4095] of Byte;
@@ -1487,28 +1121,21 @@ begin
   while (HeaderEnd = 0) and (Length(Result) < MAX_HEADER_SIZE) do
   begin
     Received := ATransport.Read(Buf[0], SizeOf(Buf));
-    if Received <= 0 then Exit(Result); // closed before headers finished - hand back whatever we have
+    if Received <= 0 then Exit(Result);
     SetLength(Result, Length(Result) + Received);
     Move(Buf[0], Result[Length(Result) - Received + 1], Received);
     HeaderEnd := Pos(#13#10#13#10, Result);
   end;
-  if HeaderEnd = 0 then Exit; // headers too large or never terminated - drop rather than hang
+  if HeaderEnd = 0 then Exit;
 
   HeaderBlock := Copy(Result, 1, HeaderEnd - 1);
   CLStr := ExtractHeaderValue(HeaderBlock, 'Content-Length');
   ContentLength := 0;
   if CLStr <> '' then
     ContentLength := StrToIntDef(Trim(CLStr), 0);
-  if ContentLength > MAX_BODY_SIZE then ContentLength := MAX_BODY_SIZE; // clamp rather than reject
+  if ContentLength > MAX_BODY_SIZE then ContentLength := MAX_BODY_SIZE;
 
   BodySoFar := Length(Result) - (HeaderEnd + 3);
-  // Grow Result to its final known size in one shot up front, rather than
-  // via SetLength(Result, Length(Result) + Received) on every 4KB chunk
-  // below - each of those was a full realloc-and-copy of everything read so
-  // far, so a multi-megabyte POST body (up to MAX_BODY_SIZE = 10MB) meant
-  // thousands of reallocations copying an ever-growing buffer, quadratic in
-  // the body size. Extending once here makes each chunk below a plain Move
-  // into already-allocated space.
   if ContentLength > BodySoFar then
   begin
     TotalLen := Length(Result) + (ContentLength - BodySoFar);
@@ -1521,10 +1148,6 @@ begin
     Received := ATransport.Read(Buf[0], ToRead);
     if Received <= 0 then
     begin
-      // Client stopped sending early - forward whatever we actually got,
-      // trimming off the space we pre-allocated for bytes that never
-      // arrived (SetLength above assumed the client would send exactly
-      // ContentLength bytes).
       SetLength(Result, HeaderEnd + 3 + BodySoFar);
       Break;
     end;
@@ -1533,31 +1156,27 @@ begin
   end;
 end;
 
-function IsValidBoardName(const AName: string): Boolean;
-var
-  i: Integer;
-begin
-  Result := (Length(AName) > 0) and (Length(AName) <= 64);
-  if not Result then Exit;
-  for i := 1 to Length(AName) do
-    if not (AName[i] in ['a'..'z', 'A'..'Z', '0'..'9', '_', '-']) then
-      Exit(False);
-end;
-
 function GuessContentType(const APath: string): string;
 var
   Ext: string;
 begin
   Ext := LowerCase(ExtractFileExt(APath));
-  if Ext = '.js' then Result := 'application/javascript'
+  if Ext = '.png' then Result := 'image/png'
+  else if (Ext = '.jpg') or (Ext = '.jpeg') then Result := 'image/jpeg'
+  else if Ext = '.webp' then Result := 'image/webp'
+  else if Ext = '.gif' then Result := 'image/gif'
+  else if Ext = '.ico' then Result := 'image/x-icon'
+  else if Ext = '.js' then Result := 'application/javascript'
   else if Ext = '.css' then Result := 'text/css'
   else if Ext = '.html' then Result := 'text/html'
   else if Ext = '.json' then Result := 'application/json'
   else if Ext = '.svg' then Result := 'image/svg+xml'
+  else if Ext = '.wasm' then Result := 'application/wasm'
   else Result := 'application/octet-stream';
 end;
 
-function ServeStaticFile(const APath, AStaticDir: string; ABus: TVDRX_MessageQueue; const ASourceID: string): string;
+function ServeStaticFile(const APath, AStaticDir: string; ABus: TVDRX_MessageQueue;
+  const ASourceID: string; ACustomHeaders: TStringList = nil): string;
 var
   FilePath, Body: string;
   FS: TFileStream;
@@ -1566,13 +1185,13 @@ begin
   if (AStaticDir = '') or (Pos('..', APath) > 0) or (APath = '') or (APath[1] <> '/') then
   begin
     ABus.Publish('log.warn', 'http: rejected static path "' + APath + '"', ASourceID);
-    Exit(PlainResponse('404 Not Found', 'text/plain', 'Not found'));
+    Exit(PlainResponse('404 Not Found', 'text/plain', 'Not found', ACustomHeaders));
   end;
   FilePath := IncludeTrailingPathDelimiter(AStaticDir) + Copy(APath, 2, MaxInt);
   if (not FileExists(FilePath)) or DirectoryExists(FilePath) then
   begin
     ABus.Publish('log.warn', 'http: static file not found: ' + FilePath, ASourceID);
-    Exit(PlainResponse('404 Not Found', 'text/plain', 'Not found'));
+    Exit(PlainResponse('404 Not Found', 'text/plain', 'Not found', ACustomHeaders));
   end;
   FS := TFileStream.Create(FilePath, fmOpenRead or fmShareDenyNone);
   try
@@ -1583,7 +1202,7 @@ begin
     FS.Free;
   end;
   ABus.Publish('log.info', Format('http: served static %s (%d bytes)', [FilePath, Length(Body)]), ASourceID);
-  Result := PlainResponse('200 OK', GuessContentType(APath), Body);
+  Result := PlainResponse('200 OK', GuessContentType(APath), Body, ACustomHeaders);
 end;
 
 function MatchProxyRoute(const APath: string; const ARoutes: TVDRX_ProxyRoutes; out AMatch: TVDRX_ProxyRoute): Boolean;
@@ -1601,20 +1220,13 @@ begin
     end;
 end;
 
-// Strips any existing Connection header and forces 'Connection: close' -
-// without this, a keep-alive-capable backend (php -S included) would hold
-// the socket open waiting for a second request over the same connection,
-// and the "read until the backend closes" loop in ProxyRequest below would
-// then block forever on every single proxied request. Same shape of bug as
-// the WebSocket self-join deadlock from earlier in this project: a blocking
-// read with no other signal for "the response is actually done."
 function ForceConnectionClose(const ARequest: string): string;
 var
   HeaderEnd, i: Integer;
   OutLines: TStringList;
 begin
   HeaderEnd := Pos(#13#10#13#10, ARequest);
-  if HeaderEnd = 0 then Exit(ARequest); // malformed - forward as-is rather than guess
+  if HeaderEnd = 0 then Exit(ARequest);
   OutLines := TStringList.Create;
   try
     OutLines.Text := Copy(ARequest, 1, HeaderEnd - 1);
@@ -1644,12 +1256,6 @@ begin
   begin
     Transport := ConnectTCP(ARoute.Host, ARoute.Port);
     if Assigned(Transport) then Break;
-    // The backend can take a moment to finish starting and bind its port
-    // after Bridge spawns it - a request landing in that window (most
-    // likely right after the daemon itself just started, or right after
-    // 'sys.restart') would otherwise get a spurious 502 on an
-    // otherwise-healthy setup. A few short retries covers that startup
-    // race without masking a genuinely-down backend for long.
     if Attempt < MAX_CONNECT_ATTEMPTS then
       Sleep(RETRY_DELAY_MS);
   end;
@@ -1699,10 +1305,6 @@ begin
     end;
 end;
 
-// Same '..'-rejection posture as ServeStaticFile - a literal-substring check,
-// not full canonicalization. Consistent risk level to what's already
-// accepted for static files in this codebase; fine for the "not secure yet"
-// bar everything else here is at.
 function ResolveScriptPath(const APath, APrefix, AScriptDir: string; out AScriptPath: string): Boolean;
 var
   Rel: string;
@@ -1714,13 +1316,6 @@ begin
   Result := FileExists(AScriptPath);
 end;
 
-// Spawns ARoute.Command ScriptPath fresh, feeds it a handful of CGI-ish env
-// vars (works whether ARoute.Command is plain 'php' - readable via
-// getenv()/$_SERVER - or 'php-cgi', which auto-populates $_GET/$_POST from
-// them like a real CGI SAPI would), and returns its stdout verbatim as the
-// response body. The read loop and TCLIWatchdog run CONCURRENTLY - see the
-// type's comment above for why draining stdout can't wait until after the
-// process exits.
 function RunCLIScript(const ARequest: string; const ARoute: TVDRX_CLIRoute;
   ABus: TVDRX_MessageQueue; const ASourceID: string): string;
 var
@@ -1755,24 +1350,7 @@ begin
     Proc.Environment.Add('REQUEST_URI=' + Path + IfThen(QueryString <> '', '?' + QueryString, ''));
     Proc.Environment.Add('CONTENT_TYPE=' + ExtractHeaderValue(HeaderBlock, 'Content-Type'));
     Proc.Environment.Add('CONTENT_LENGTH=' + ExtractHeaderValue(HeaderBlock, 'Content-Length'));
-    // poSearchPath: without it, ARoute.Command only works as an absolute
-    // path ("/usr/bin/php") - a bare command name like "php" from
-    // vdrx.conf would fail to launch on any system where it's only
-    // resolvable via the shell's PATH.
-    //Proc.Options := [poUsePipes, poStderrToOutPut, poSearchPath]; // poSearchPath not in process.TProcessOptions
     Proc.Options := [poUsePipes, poStderrToOutPut];
-
-    // NOT Proc.CurrentDirectory := ARoute.ScriptDir here - ScriptPath (the
-    // Parameters.Add above) was already built by ResolveScriptPath as
-    // ARoute.ScriptDir + Rel, i.e. relative to the DAEMON's own working
-    // directory. Setting CurrentDirectory to ScriptDir as well doubled that
-    // prefix - the child ended up looking for ScriptDir/ScriptPath (e.g.
-    // "phpcli/phpcli/index.php") from inside ScriptDir, which never
-    // resolved once ScriptDir was a relative path (an absolute ScriptDir
-    // masked this, since PHP would just fail to find ITS half and the
-    // symptom looked identical). Leaving CurrentDirectory unset lets the
-    // child inherit the daemon's own CWD, which is exactly the base
-    // ScriptPath was already computed against.
     Proc.Execute;
 
     Watchdog := TCLIWatchdog.Create(Proc, ARoute.TimeoutMs);
@@ -1791,7 +1369,7 @@ begin
       until Received <= 0;
 
       Watchdog.Cancel;
-      WaitThreadOrTimeout(WatchdogThread, 500); // polls every 50ms internally - should return almost immediately
+      WaitThreadOrTimeout(WatchdogThread, 500);
 
       if Watchdog.Fired then
       begin
@@ -1810,10 +1388,6 @@ begin
   Result := PlainResponse('200 OK', ARoute.ContentType, Output);
 end;
 
-// Common status-code -> reason-phrase text for the handful of codes a bus
-// CLI script is realistically going to return. Falls back to a generic
-// phrase for anything else - the phrase is cosmetic (RFC 7230 says clients
-// MUST ignore it), so an approximate one for an unlisted code is harmless.
 function HTTPStatusText(ACode: Integer): string;
 begin
   case ACode of
@@ -1841,10 +1415,6 @@ begin
   end;
 end;
 
-// Everything after the blank line that ends the headers - '' if the request
-// never got that far (see ReadFullRequest, which is what actually put the
-// body there in the first place; this just re-locates it from the combined
-// string rather than threading a separate parameter through every caller).
 function ExtractBody(const ARequest: string): string;
 var
   HeaderEnd: Integer;
@@ -1854,12 +1424,6 @@ begin
   Result := Copy(ARequest, HeaderEnd + 4, MaxInt);
 end;
 
-// Every "Name: Value" header line (skipping the request line itself) as one
-// flat JSON object. A repeated header name overwrites rather than
-// accumulating into an array - a simplification consistent with
-// ExtractHeaderValue's existing "first/only match wins" contract elsewhere
-// in this unit, fine for the common single-value headers a bus CLI script
-// actually cares about (Host, Content-Type, Cookie, ...).
 function HeadersToJSON(const AHeaderBlock: string): TJSONObject;
 var
   SL: TStringList;
@@ -1870,7 +1434,7 @@ begin
   SL := TStringList.Create;
   try
     SL.Text := AHeaderBlock;
-    for i := 1 to SL.Count - 1 do // line 0 is the request line, not a header
+    for i := 1 to SL.Count - 1 do
     begin
       Colon := Pos(':', SL[i]);
       if Colon > 0 then
@@ -1886,12 +1450,6 @@ begin
   end;
 end;
 
-// Find-with-type-check helper - TJSONObject.Find can return a member of any
-// JSON type (or nil), and a plain "as TJSONObject" cast on a non-nil but
-// wrong-typed result raises EInvalidCast rather than failing gracefully.
-// A bus CLI script sending malformed shapes (e.g. "params": "oops", a
-// string instead of an object) should degrade to "field absent", not crash
-// the HTTP executive's connection thread.
 function FindJSONObject(AObj: TJSONObject; const AName: string): TJSONObject;
 var
   D: TJSONData;
@@ -1903,17 +1461,6 @@ begin
     Result := nil;
 end;
 
-// Converts a bus CLI reply's optional "rows" object - {"loopName": [{...
-// row fields ...}, ...], ...} - into the TVDRX_TemplateNamedRows shape
-// TVDRX_TemplateStore.Fill expects for ##loop:loopName##...##endloop##
-// blocks. Only scalar fields within each row object are kept (same
-// restriction GetObjectArray already applies to config rows in
-// vdrx_config.pas - a template row is a flat Name=Value record, same as
-// there). Non-array values under a loop name, or non-object entries within
-// one, are silently skipped rather than raising - a malformed "rows" value
-// from a buggy script should render that loop as empty, not 500 the whole
-// response. Caller owns and frees the result (it owns its TVDRX_TemplateRows
-// values too, via doOwnsValues).
 { TVDRX_OneShotWaiter }
 
 constructor TVDRX_OneShotWaiter.Create(ABus: TVDRX_MessageQueue);
@@ -1931,10 +1478,6 @@ end;
 
 procedure TVDRX_OneShotWaiter.HandlePacket(const AMsg: TVDRX_Message);
 begin
-  // Only ever expecting exactly one message (this waiter's reply topic is
-  // unique per request - see NextReplyTopic) - a second one showing up
-  // before teardown would just overwrite FReplyPayload harmlessly, since
-  // WaitForReply's caller stops waiting after the first SetEvent anyway.
   FReplyPayload := AMsg.Payload;
   FGotReply := True;
   FEvent.SetEvent;
@@ -1950,14 +1493,6 @@ var
   GReplyTopicCounter: Integer = 0;
   GReplyTopicLock: TCriticalSection;
 
-// Mints a reply topic unique for the lifetime of this daemon process -
-// "<prefix>.N", N from a lock-protected counter (not InterlockedIncrement:
-// this only runs once per request/render-call, nowhere near hot enough for
-// a lock-free path to matter, and a plain critical section is one less
-// platform-specific primitive to get subtly wrong). Same naming shape as
-// TVDRX_WebSocketExecutive.NextConnID's "ws.conn.N" - deliberately, so a
-// glance at vdrx_daemon.log's topic names tells you what KIND of thing
-// minted a given identifier.
 function NextReplyTopic(const APrefix: string): string;
 begin
   GReplyTopicLock.Enter;
@@ -1969,13 +1504,6 @@ begin
   end;
 end;
 
-// The shared "publish a request, block for a correlated reply" primitive
-// behind both RunBusDaemonRoute (§3 of the readme) and BuildBusCLIResponse's
-// "template_topic" routing (§2). AEnvelope is the full JSON payload to
-// publish to AInTopic - this function only adds and manages "reply_to"
-// itself (via NextReplyTopic(AReplyPrefix)) so every caller doesn't have to
-// duplicate the mint/register/publish/wait/unregister sequence, or risk
-// forgetting the Unregister on a timeout path.
 function PublishAndWait(ARegistry: TVDRX_Registry; ABus: TVDRX_MessageQueue;
   const AInTopic, AReplyPrefix: string; AEnvelope: TJSONObject;
   ATimeoutMs: Integer; const ASourceID: string; out AReply: string): Boolean;
@@ -1987,42 +1515,16 @@ begin
   AEnvelope.Add('reply_to', ReplyTopic);
 
   Waiter := TVDRX_OneShotWaiter.Create(ABus);
-  ARegistry.Register(Waiter, ReplyTopic, ReplyTopic); // ID = filter = the reply topic itself - nothing else needs to address this waiter by name
+  ARegistry.Register(Waiter, ReplyTopic, ReplyTopic);
 
   ABus.Publish(AInTopic, AEnvelope.AsJSON, ASourceID);
   Result := Waiter.WaitForReply(ATimeoutMs, AReply);
 
-  ARegistry.Unregister(ReplyTopic); // external teardown (this call runs on the HTTP connection thread, not the waiter's own - it has none) - see TVDRX_OneShotWaiter's comment and vdrx_core.pas's Unregister-vs-UnregisterSelf distinction
+  ARegistry.Unregister(ReplyTopic);
   if not Result then
     ABus.Publish('log.warn', Format('bus wait: no reply on "%s" (published to "%s") within %dms', [ReplyTopic, AInTopic, ATimeoutMs]), ASourceID);
 end;
 
-// Turns a bus CLI script's one-line JSON reply into an actual HTTP response.
-// Two response shapes, chosen by which fields are present:
-//   {"status":200,"content_type":"...","headers":{...},"body":"..."}
-//     - body is used verbatim.
-//   {"status":200,"template":"name","params":{...},"rows":{...}}
-//     - rendered server-side. Two ways this can resolve, chosen by whether
-//       "template_topic" is also present:
-//         - absent (the original, still-supported shape): ATemplates.Fill
-//           runs in-process against whichever HTTP site's own template
-//           store answered THIS connection - simple, zero bus round trip,
-//           but implicit: which store answers depends on which site's port
-//           the request happened to arrive on, which is surprising the
-//           moment more than one site could plausibly serve the same
-//           route (see the readme's §4b note on this).
-//         - present, e.g. {"template_topic":"template.vdrx_admin.render",
-//           "template":"greeting",...} - the render request is instead
-//           PUBLISHED to that explicit topic via PublishAndWait, and
-//           whichever TVDRX_TemplateExecutive is subscribed there (see
-//           vdrx_templates.pas and the "templates" config section)
-//           answers it, regardless of which HTTP site's connection this
-//           is. This is the fix for that ambiguity: the script says
-//           exactly which template store it means, instead of VDRX
-//           guessing from connection topology.
-// "status"/"content_type" fall back to 200/ADefaultContentType if omitted;
-// extra "headers" entries are appended as-is (last-write-wins with the
-// Content-Type/Content-Length lines this function always sets itself).
 function BuildBusCLIResponse(const AReplyLine, ADefaultContentType: string;
   ATemplates: TVDRX_TemplateStore; ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string): string;
 var
@@ -2044,7 +1546,7 @@ begin
   try
     J := GetJSON(AReplyLine);
   except
-    J := nil; // same "nil result AND exception both mean unparseable" handling as EnsureJSONPayload in vdrx_bridge.pas
+    J := nil;
   end;
   if not Assigned(J) or not (J is TJSONObject) then
   begin
@@ -2063,9 +1565,6 @@ begin
 
     if (TemplateName <> '') and (TemplateTopic <> '') then
     begin
-      // Explicit routing - see this function's header comment. Forward
-      // exactly the fields a render request needs (template/params/rows)
-      // as their own envelope; PublishAndWait adds "reply_to" itself.
       RenderEnvelope := TJSONObject.Create;
       try
         RenderEnvelope.Add('template', TemplateName);
@@ -2098,9 +1597,6 @@ begin
     end
     else if TemplateName <> '' then
     begin
-      // Original, still-supported shape - render in-process against
-      // whichever site's own TVDRX_TemplateStore answered this connection.
-      // See this function's header comment for the trade-off vs. above.
       ParamsObj := FindJSONObject(Obj, 'params');
       Params := JSONParamsToStringList(ParamsObj);
       try
@@ -2134,24 +1630,6 @@ begin
   end;
 end;
 
-// The 'bus' counterpart to RunCLIScript above - spawns ARoute.Command fresh
-// per request (same TCLIWatchdog-bounded lifetime), but talks the bus's own
-// JSON-envelope shape instead of CGI env vars + raw body passthrough. Prefix
-// behaves as a URL-rewrite base rather than a filesystem lookup root: the
-// path beyond it (SubPath) and the raw query string are handed to the
-// script as data in the request envelope, exactly like the original design
-// discussion's "base_uri" idea - the script decides what a request for
-// "/irc/channel/%23blah" or "/irc?channel=%23blah" under a "/irc" route
-// means, VDRX doesn't parse it for them.
-//
-// Only the FIRST non-empty line the script writes to stdout is treated as
-// its reply - same "one structured line, nothing else, ever" discipline
-// scripts/irc_soylent.php already documents for vdrx_bridge.pas's
-// persistent-process protocol (see that script's header comment). A script
-// that wants to log its own activity should write to a local file, not
-// stdout/stderr - poStderrToOutPut merges both into the same stream read
-// here, so anything printed before the JSON reply line would otherwise
-// corrupt it.
 function RunBusCLIScript(const ARequest: string; const ARoute: TVDRX_CLIRoute;
   ATemplates: TVDRX_TemplateStore; ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string): string;
 var
@@ -2192,18 +1670,9 @@ begin
 
   Proc := TProcess.Create(nil);
   try
-    {$WARN SYMBOL_DEPRECATED OFF} // CommandLine: same free-form "let TProcess parse the quoting" style as vdrx_bridge.pas's FCommand
+    {$WARN SYMBOL_DEPRECATED OFF}
     Proc.CommandLine := ARoute.Command;
     {$WARN SYMBOL_DEPRECATED ON}
-    // Resolved to absolute up front (ExpandFileName is a no-op on an
-    // already-absolute path) so every log line below - and, more
-    // importantly, whatever error a language-specific interpreter prints
-    // when it can't find its own script - names an unambiguous location
-    // rather than a path that's only meaningful relative to wherever the
-    // daemon happened to be launched from. Worth having explicitly in mind
-    // once several cli_bridges entries (in different languages, possibly
-    // with different script_dir values) are all resolving relative paths
-    // against the same shared daemon CWD - see the readme's §4b gotcha.
     Cwd := ExpandFileName(IfThen(ARoute.ScriptDir <> '', ARoute.ScriptDir, GetCurrentDir));
     Proc.CurrentDirectory := Cwd;
     Proc.Options := [poUsePipes, poStderrToOutPut];
@@ -2218,7 +1687,7 @@ begin
     end;
 
     Proc.Input.Write(ReqLine[1], Length(ReqLine));
-    try Proc.CloseInput; except end; // EOF hint - same as vdrx_bridge.pas's StopProcess
+    try Proc.CloseInput; except end;
 
     Watchdog := TCLIWatchdog.Create(Proc, ARoute.TimeoutMs);
     WatchdogThread := TVDRX_WorkerThread.Create(@Watchdog.Run);
@@ -2251,24 +1720,6 @@ begin
     Proc.Free;
   end;
 
-  // Take the first line that actually LOOKS like our JSON envelope, not
-  // blindly Strings[0] - two things commonly land ahead of it in practice
-  // and shouldn't sink the whole response:
-  //   1. A UTF-8 BOM (EF BB BF) at the very start of Output if the script
-  //      file itself was saved with one (common on Windows editors) - PHP
-  //      happily echoes those 3 bytes before anything else, so line 0
-  //      would start with garbage instead of '{'.
-  //   2. A PHP notice/warning/deprecation line - poStderrToOutPut merges
-  //      stderr into this same stream, and PHP's CLI SAPI writes those
-  //      immediately when triggered, i.e. potentially before the script's
-  //      final fwrite(STDOUT, ...) line even if that write comes later in
-  //      the source.
-  // So: strip a leading BOM if present, then scan lines for the first one
-  // that, trimmed, actually starts with '{' - that's the reply; anything
-  // before it is noise the script printed (or an accidental warning) and
-  // is logged in full below (at WARN, since silently discarding it would
-  // hide the real cause of a "malformed response") rather than treated as
-  // fatal on its own.
   if (Length(Output) >= 3) and (Output[1] = #$EF) and (Output[2] = #$BB) and (Output[3] = #$BF) then
     Delete(Output, 1, 3);
 
@@ -2294,17 +1745,6 @@ begin
   Result := BuildBusCLIResponse(FirstLine, ARoute.ContentType, ATemplates, ABus, ARegistry, ASourceID);
 end;
 
-// The 'bus-daemon' counterpart to RunBusCLIScript above - same request
-// envelope shape (method/path/prefix/sub_path/query/headers/body), same
-// reply shape (BuildBusCLIResponse handles both identically - a persistent
-// subscriber and a spawned script answer in exactly the same JSON), but no
-// process is spawned here at all: the request is published to ARoute.InTopic
-// and this just waits for a reply, via the same PublishAndWait primitive a
-// template_topic lookup uses. Whatever answers InTopic - typically a
-// persistent `processes` entry already subscribed to it, the same kind of
-// thing already running irc_bot - handles as many concurrent requests as
-// arrive, each getting its own uniquely-minted reply topic, without paying
-// spawn cost per request.
 function RunBusDaemonRoute(const ARequest: string; const ARoute: TVDRX_CLIRoute;
   ATemplates: TVDRX_TemplateStore; ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string): string;
 var
@@ -2357,19 +1797,34 @@ begin
   FProxyRoutes := AProxyRoutes;
   FCLIRoutes := ACLIRoutes;
   FRegistry := ARegistry;
+  FCustomHeaders := TStringList.Create;
   Port := 8081;
+end;
+
+destructor TVDRX_HTTPExecutive.Destroy;
+begin
+  FCustomHeaders.Free;
+  inherited Destroy;
 end;
 
 class function TVDRX_HTTPExecutive.BuildResponse(const ARequest: string;
   ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
   const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
-  ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string): string;
+  ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string;
+  ACustomHeaders: TStringList): string;
 var
-  Method, Path, BoardName: string;
+  Method, Path: string;
   Route: TVDRX_ProxyRoute;
   CLIRoute: TVDRX_CLIRoute;
 begin
   ParseRequestLine(ARequest, Method, Path);
+
+  // Fast-path CORS preflight probe
+  if Method = 'OPTIONS' then
+  begin
+    ABus.Publish('log.info', Format('http: %s %s -> 204 No Content (preflight)', [Method, Path]), ASourceID);
+    Exit(PlainResponse('204 No Content', 'text/plain', '', ACustomHeaders));
+  end;
 
   if MatchProxyRoute(Path, AProxyRoutes, Route) then
   begin
@@ -2397,11 +1852,11 @@ begin
   end;
 
   if Method = 'GET' then
-    Result := ServeStaticFile(Path, AStaticDir, ABus, ASourceID)
+    Result := ServeStaticFile(Path, AStaticDir, ABus, ASourceID, ACustomHeaders)
   else
   begin
     ABus.Publish('log.warn', 'http: unhandled method "' + Method + '" for ' + Path, ASourceID);
-    Result := PlainResponse('404 Not Found', 'text/plain', 'Not found');
+    Result := PlainResponse('404 Not Found', 'text/plain', 'Not found', ACustomHeaders);
   end;
 end;
 
@@ -2410,7 +1865,7 @@ end;
 constructor TVDRX_HTTPConnection.Create(ABus: TVDRX_MessageQueue; ATransport: TVDRX_Transport;
   ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
   const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
-  ARegistry: TVDRX_Registry; const ASourceID: string);
+  ARegistry: TVDRX_Registry; const ASourceID: string; ACustomHeaders: TStringList);
 begin
   inherited Create(ABus);
   FTransport := ATransport;
@@ -2421,13 +1876,11 @@ begin
   FCLIRoutes := ACLIRoutes;
   FRegistry := ARegistry;
   FSourceID := ASourceID;
+  FCustomHeaders := ACustomHeaders;
 end;
 
 procedure TVDRX_HTTPConnection.HandlePacket(const AMsg: TVDRX_Message);
 begin
-  // HTTP is request/response, not bus-driven - nothing to do here. Present
-  // only because TVDRX_Executive declares it abstract; this object is never
-  // Registry-registered, so it's never actually called.
 end;
 
 procedure TVDRX_HTTPConnection.Run(const ARequest: string);
@@ -2443,7 +1896,7 @@ begin
   begin
     ParseRequestLine(Request, Method, Path);
     Response := TVDRX_HTTPExecutive.BuildResponse(Request, FTemplates, FConfig, FStaticDir,
-      FProxyRoutes, FCLIRoutes, Bus, FRegistry, FSourceID);
+      FProxyRoutes, FCLIRoutes, Bus, FRegistry, FSourceID, FCustomHeaders);
     Bus.Publish('log.info', Format('http: %s %s -> %s', [Method, Path, StatusOf(Response)]), FSourceID);
     FTransport.Write(Response[1], Length(Response));
   end
@@ -2457,29 +1910,18 @@ var
   Conn: TVDRX_HTTPConnection;
 begin
   Conn := TVDRX_HTTPConnection.Create(Bus, ATransport, FTemplates, FConfig, FStaticDir,
-    FProxyRoutes, FCLIRoutes, FRegistry, ID);
+    FProxyRoutes, FCLIRoutes, FRegistry, ID, FCustomHeaders);
   try
     Conn.Run;
   finally
-    Conn.Free; // frees ATransport too - see TVDRX_ConnectionExecutive.Destroy
+    Conn.Free;
   end;
 end;
 
 procedure TVDRX_HTTPExecutive.HandlePacket(const AMsg: TVDRX_Message);
 begin
-  // HTTP is request/response, not bus-driven - nothing to do here.
 end;
 
-// TVDRX_HTTPExecutive.ApplyConfig ('sys.reload') needs to re-find ITS OWN
-// http_sites row by ID on every reload, not read a flat "executives.http.*"
-// key - that shape predates the multi-site http_sites array and, left as
-// it was, meant every site's ApplyConfig defaulted port/tls_port/tls_cert/
-// tls_key back to the SAME hardcoded fallbacks (8081, none) on every
-// reload, since "executives.http.port" was never actually present in a
-// http_sites-based config - a real port-collision/silent-misconfiguration
-// risk with more than one site, not just a documentation gap. Shared here
-// (rather than duplicated inline in ApplyConfig) since nothing else in this
-// unit needs GetObjectArray's row-matching logic yet.
 function FindConfigRowByID(AConfig: TVDRX_Config; const AArrayKey, AID: string;
   out ARow: TStringList): Boolean;
 var
@@ -2503,9 +1945,11 @@ end;
 
 procedure TVDRX_HTTPExecutive.ApplyConfig;
 var
-  NewPort, NewTLSPort: Integer;
-  CertFile, KeyFile: string;
+  NewPort, NewTLSPort, i: Integer;
+  CertFile, KeyFile, RawHeaders: string;
   SiteRow: TStringList;
+  HeadersJSON: TJSONData;
+  HeadersObj: TJSONObject;
 begin
   if not FindConfigRowByID(FConfig, 'http_sites', ID, SiteRow) then
   begin
@@ -2518,9 +1962,37 @@ begin
     NewTLSPort := StrToIntDef(SiteRow.Values['tls_port'], 0);
     CertFile := SiteRow.Values['tls_cert'];
     KeyFile := SiteRow.Values['tls_key'];
+
+    FCustomHeaders.Clear;
+    if (SiteRow.Values['cors'] = 'True') or (SiteRow.Values['cors'] = 'true') or (SiteRow.Values['cors'] = '1') then
+    begin
+      FCustomHeaders.Values['Access-Control-Allow-Origin'] := '*';
+      FCustomHeaders.Values['Access-Control-Allow-Methods'] := 'GET, POST, OPTIONS';
+      FCustomHeaders.Values['Access-Control-Allow-Headers'] := '*';
+    end;
+
+    RawHeaders := SiteRow.Values['headers'];
+    if RawHeaders <> '' then
+    begin
+      try
+        HeadersJSON := GetJSON(RawHeaders);
+        try
+          if HeadersJSON is TJSONObject then
+          begin
+            HeadersObj := TJSONObject(HeadersJSON);
+            for i := 0 to HeadersObj.Count - 1 do
+              FCustomHeaders.Values[HeadersObj.Names[i]] := HeadersObj.Items[i].AsString;
+          end;
+        finally
+          HeadersJSON.Free;
+        end;
+      except
+      end;
+    end;
   finally
     SiteRow.Free;
   end;
+
   if (NewPort <> Port) or (NewTLSPort <> TLSPort) then
   begin
     Shutdown;
@@ -2528,10 +2000,6 @@ begin
     ConfigureTLS(NewTLSPort, CertFile, KeyFile);
     Initialize;
   end;
-  // NB: FProxyRoutes/FCLIRoutes are NOT rebuilt here yet - cli_bridges and
-  // proxy routes are only read at startup (see vdrx.lpr's SetupCLIBridges).
-  // A 'sys.reload' picks up template/static-dir/port changes live but not
-  // new/changed routes - restart the daemon (or 'sys.restart') for those.
 end;
 
 function ComputeAcceptKey(const AClientKey: string): string;
@@ -2558,14 +2026,6 @@ constructor TWSConnThread.Create(AConn: TVDRX_WSConnection);
 begin
   inherited Create(True);
   FConn := AConn;
-  // Natural (client-initiated) disconnects finish inside RunLoop by calling
-  // UnregisterSelf, which frees the owning TVDRX_WSConnection (and this
-  // thread's FConn along with it) while still running on this very thread.
-  // Nothing outside ever holds a reference to FThread to Free it in that
-  // path (see RunLoop), so this thread must clean up its own TThread object
-  // when it terminates or it leaks. Shutdown's forced-close path still works
-  // fine with this set True: it just stops calling FThread.Free itself
-  // (see TVDRX_WSConnection.Shutdown).
   FreeOnTerminate := True;
 end;
 
@@ -2578,12 +2038,6 @@ end;
 
 destructor TVDRX_ConnectionExecutive.Destroy;
 begin
-  // Nil-guarded: both subclasses normally already own+nil FTransport
-  // themselves before Destroy is ever reached (WS's own Destroy used to
-  // free it unconditionally right here; socket_client's DoDisconnect always
-  // nils it after freeing) - this is a safety net for whatever teardown
-  // path DIDN'T get there first, not the primary way either subclass
-  // expects its transport to go away.
   if Assigned(FTransport) then
     FTransport.Free;
   inherited Destroy;
@@ -2602,19 +2056,13 @@ end;
 destructor TVDRX_WSConnection.Destroy;
 begin
   FStopping := True;
-  // Fallback cleanup: normally RunLoop already stops and frees FPingThread
-  // itself before calling UnregisterSelf (which is what drives us here), so
-  // this is a no-op on that path. But Destroy can also be reached via
-  // Shutdown's FMasterMap.Remove, so guard here too - freeing FTransport/
-  // FSendLock below while FPingThread's PingLoop might still be mid-SendFrame
-  // on another thread is the exact use-after-free this used to hit.
   if Assigned(FPingThread) then
   begin
     WaitThreadOrTimeout(FPingThread, 500);
     FreeAndNil(FPingThread);
   end;
   FSendLock.Free;
-  inherited Destroy; // frees FTransport - see TVDRX_ConnectionExecutive.Destroy
+  inherited Destroy;
 end;
 
 class function TVDRX_WSConnection.IsUpgradeRequest(const ARequest: string): Boolean;
@@ -2660,12 +2108,8 @@ begin
   Result := True;
 end;
 
-// Frames declaring a payload bigger than this are rejected outright rather
-// than trusting the client's stated 64-bit length as-is - without a cap, a
-// single malicious/buggy frame could claim an enormous length and force a
-// huge SetLength allocation before we've even read that much data.
 const
-  WS_MAX_FRAME_LEN = 64 * 1024 * 1024; // 64MB
+  WS_MAX_FRAME_LEN = 64 * 1024 * 1024;
 
 function TVDRX_WSConnection.ReadFrame(out APayload: string; out AOpcode: Byte): Boolean;
 var
@@ -2691,13 +2135,11 @@ begin
   end
   else if LenByte = 127 then
   begin
-    // 64-bit extended length (RFC 6455 5.2) - previously this branch just
-    // aborted and dropped the connection for any frame over 65,535 bytes.
     if FTransport.Read(Ext8[0], 8) <> 8 then Exit;
     Len := 0;
     for i := 0 to 7 do
       Len := (Len shl 8) or Ext8[i];
-    if (Len < 0) or (Len > WS_MAX_FRAME_LEN) then Exit; // oversized/malformed - drop rather than allocate
+    if (Len < 0) or (Len > WS_MAX_FRAME_LEN) then Exit;
   end;
   if (Hdr[1] and $80) <> 0 then
   begin
@@ -2710,7 +2152,7 @@ begin
   while Received < Len do
   begin
     i := FTransport.Read(Data[Received], Integer(Len - Received));
-    if i <= 0 then Exit; // connection closed/errored mid-frame
+    if i <= 0 then Exit;
     Inc(Received, i);
   end;
   for i := 0 to Integer(Len) - 1 do
@@ -2724,7 +2166,7 @@ end;
 
 procedure TVDRX_WSConnection.SendFrame(const APayload: string; AOpcode: Byte);
 var
-  Hdr: array[0..9] of Byte; // 2 base + up to 8 for the 64-bit extended length (RFC 6455 5.2)
+  Hdr: array[0..9] of Byte;
   HdrLen: Integer;
   Buf: string;
   PayloadLen: UInt64;
@@ -2748,10 +2190,6 @@ begin
     end
     else
     begin
-      // 127 = 64-bit extended length follows, big-endian. Without this branch
-      // any payload over 65535 bytes (large history dumps, bulk responses)
-      // wrote a truncated 16-bit length via the Hdr[1]:=126 path above,
-      // producing a malformed frame the client would reject and disconnect on.
       Hdr[1] := 127;
       for i := 0 to 7 do
         Hdr[2 + i] := (PayloadLen shr ((7 - i) * 8)) and $FF;
@@ -2775,13 +2213,6 @@ begin
   FAuthenticated := False;
 end;
 
-// AMsg.Payload is one raw client text frame's worth of JSON - published by
-// TVDRX_WSConnection.RunLoop onto this executive's own "<connID>.rpc.in"
-// subscription (see TVDRX_WebSocketExecutive.AdoptConnection), never parsed
-// by the connectivity object itself. Same method set and behaviour as the
-// original in-connection HandleRPC; only WHERE it runs, and how a reply
-// reaches the browser (FConn.ID + '.rpc.out' instead of a direct SendFrame
-// call - see TVDRX_WSConnection's class comment), has changed.
 procedure TVDRX_WSProtocolExecutive.HandlePacket(const AMsg: TVDRX_Message);
 var
   J: TJSONData;
@@ -2867,8 +2298,6 @@ begin
     Exit;
   end;
 
-  // Only safe to start pinging after the handshake completes - anything sent
-  // before that would corrupt the raw HTTP upgrade exchange.
   FLastPong := Now;
   FPingThread := TVDRX_WorkerThread.Create(@PingLoop);
   FPingThread.Start;
@@ -2877,21 +2306,12 @@ begin
   begin
     if not ReadFrame(Payload, Opcode) then Break;
     case Opcode of
-      // Text frames are pure connectivity's job to MOVE, not interpret -
-      // republished onto the bus for TVDRX_WSProtocolExecutive (see its
-      // class comment) rather than parsed here.
       1: Bus.Publish(ID + '.rpc.in', Payload, ID);
-      9: SendFrame(Payload, 10); // client ping - echo back as pong, per spec
-      10: FLastPong := Now;      // reply to OUR ping - see PingLoop
+      9: SendFrame(Payload, 10);
+      10: FLastPong := Now;
     end;
   end;
 
-  // Stop and free FPingThread BEFORE UnregisterSelf below, which frees Self
-  // (FMasterMap has [doOwnsValues]). FPingThread's PingLoop touches FSendLock
-  // and FTransport on its own thread; freeing those out from under a still-
-  // running PingLoop was a real Access Violation. Setting FStopping here also
-  // makes PingLoop notice and exit on its own between iterations even without
-  // the join below.
   FStopping := True;
   if Assigned(FPingThread) then
   begin
@@ -2901,23 +2321,10 @@ begin
 
   Bus.Publish('log.info', 'ws ' + ID + ': disconnected', ID);
   Bus.Publish('sys.ws.disconnected', Format('{"id":%s}', [JSONString(ID)]), ID);
-  FListener.Registry.Unregister(ID + '.rpc'); // the protocol executive - external teardown (still running on THIS thread, not its own - it has none), must happen before we UnregisterSelf below
-  FListener.Registry.UnregisterSelf(ID); // NOT Unregister - this is our own thread, see vdrx_core.pas's UnregisterSelf comment
-  // Self (and every field on it, including FTransport/FSendLock) is invalid
-  // from this point on - do not touch anything after the call above.
+  FListener.Registry.Unregister(ID + '.rpc');
+  FListener.Registry.UnregisterSelf(ID);
 end;
 
-// Sends a ping every PingIntervalMs and force-closes the transport if no
-// pong (ours or a stray client one - either counts as "link is alive") has
-// been seen within PingIntervalMs + PongTimeoutMs. Closing FTransport here
-// unblocks RunLoop's blocking ReadFrame on another thread - the same
-// close-to-unblock idiom Shutdown already relies on (see
-// TVDRX_ListenerConnThread.Transport's comment) - so the normal disconnect/
-// unregister path in RunLoop runs exactly as it would for a real close,
-// no special-casing needed there.
-// FLastPong is read/written across threads without a lock - a one-cycle
-// stale read just delays detection by ~PingIntervalMs, never causes a false
-// disconnect, so it isn't worth a CriticalSection for a heartbeat check.
 procedure TVDRX_WSConnection.PingLoop;
 var
   Waited: Integer;
@@ -2940,9 +2347,9 @@ begin
     end;
 
     try
-      SendFrame('', 9); // opcode 9 = ping
+      SendFrame('', 9);
     except
-      Break; // transport already gone - natural disconnect raced us here, RunLoop will handle cleanup
+      Break;
     end;
   end;
 end;
@@ -2959,10 +2366,6 @@ begin
   FTransport.Close;
   if Assigned(FThread) then
   begin
-    // FThread now has FreeOnTerminate := True (see TWSConnThread.Create), so
-    // it frees itself when RunLoop returns - we must NOT call FThread.Free
-    // here too, or we'd double-free it. Just wait for it to finish, then
-    // drop our own now-dangling reference.
     WaitThreadOrTimeout(FThread, FListener.GracefulTimeoutMs);
     FThread := nil;
   end;
@@ -2980,12 +2383,6 @@ end;
 
 procedure TVDRX_WSConnection.HandlePacket(const AMsg: TVDRX_Message);
 begin
-  // The protocol executive's own reply channel - already a complete,
-  // fully-formed JSON line (e.g. the "auth.ok" event) - relayed to the
-  // browser verbatim, NOT wrapped in the topic/payload/source/seq envelope
-  // below (which is this connection's own "a browser is a bus participant"
-  // wire format for genuine bus traffic, not an RPC reply) - see this
-  // class's declaration comment and TVDRX_WSProtocolExecutive's.
   if AMsg.Topic = ID + '.rpc.out' then
   begin
     SendFrame(AMsg.Payload);
@@ -3027,12 +2424,6 @@ begin
   NewID := NextConnID;
   Bus.Publish('sys.ws.connected', Format('{"id":%s}', [JSONString(NewID)]), ID);
   Bus.Publish('log.info', 'ws: new connection ' + NewID, ID);
-  // Registered on its own "<id>.rpc.out" from the start (not the old
-  // "sys.none" placeholder) - that's how a TVDRX_WSProtocolExecutive reply
-  // (an auth.ok event, say) reaches this connection at all before the
-  // browser has subscribed to anything of its own yet. Further filters
-  // (whatever the browser 'subscribe's to) are added on top by the
-  // protocol executive below - see its HandlePacket.
   FRegistry.Register(Conn, NewID, NewID + '.rpc.out');
   if FDefaultSubscribe <> '' then
     for Filter in SplitString(FDefaultSubscribe, ',') do
@@ -3049,7 +2440,6 @@ end;
 
 procedure TVDRX_WebSocketExecutive.HandlePacket(const AMsg: TVDRX_Message);
 begin
-  // The listener itself isn't a message recipient - each TVDRX_WSConnection is.
 end;
 
 procedure TVDRX_WebSocketExecutive.ApplyConfig;
@@ -3098,9 +2488,6 @@ begin
   inherited Destroy;
 end;
 
-// Dials out and, on success, starts the reader thread. Does NOT retry on
-// its own - MonitorLoop owns retry/backoff decisions, same division of
-// labour as Bridge's StartProcess/MonitorLoop split.
 procedure TVDRX_SocketClientExecutive.DoConnect;
 var
   Sock: TSocket;
@@ -3157,11 +2544,6 @@ begin
   FReaderThread.Start;
 end;
 
-// Same close-to-unblock idiom used throughout this unit (Shutdown on the
-// listener side, PingLoop on the WS side) - closing FTransport unblocks
-// ReaderLoop's blocking Read on its own thread, so the normal "read
-// returned <=0" cleanup path in ReaderLoop runs exactly as it would for a
-// genuine remote disconnect, no special-casing needed here.
 procedure TVDRX_SocketClientExecutive.DoDisconnect;
 var
   Transport: TVDRX_Transport;
@@ -3191,12 +2573,6 @@ begin
   end;
 end;
 
-// Reads in chunks and frames per FFraming, publishing each complete
-// message to "<ID>.out". Delimiter mode splits on LINE FEED and silently
-// drops any immediately-preceding CR - so both bare \n and \r\n on the wire
-// parse identically, regardless of what FDelimiter (write-side only) is set
-// to. This mirrors TVDRX_BridgeExecutive.ReaderLoop's existing #13/#10
-// handling exactly, not a new behaviour invented for this class.
 procedure TVDRX_SocketClientExecutive.ReaderLoop;
 const
   BufSize = 4096;
@@ -3260,12 +2636,6 @@ begin
   end;
 end;
 
-// Watches FConnected and applies FReconnectPolicy - the direct counterpart
-// to TVDRX_BridgeExecutive.MonitorLoop, same 500ms-doubling-to-30000ms
-// backoff shape, reset to FReconnectDelayMs's starting value after a clean
-// (re)connect. There's no exit-code distinction to make here the way
-// Bridge's 'on-failure' has (a dropped socket doesn't carry one), so this
-// only supports the two policies actually asked for.
 procedure TVDRX_SocketClientExecutive.MonitorLoop;
 var
   StillConnected: Boolean;
@@ -3283,7 +2653,7 @@ begin
 
     if (not StillConnected) and (not FStopping) then
     begin
-      DoDisconnect; // clears FTransport/FReaderThread even if ReaderLoop already exited on its own
+      DoDisconnect;
 
       if FReconnectPolicy = 'none' then
       begin
@@ -3293,11 +2663,11 @@ begin
 
       Sleep(FReconnectDelayMs);
       if FReconnectDelayMs < FMaxReconnectDelayMs then
-        FReconnectDelayMs := FReconnectDelayMs * 2; // exponential backoff on a reconnect loop
+        FReconnectDelayMs := FReconnectDelayMs * 2;
       if not FStopping then
       begin
         DoConnect;
-        FReconnectDelayMs := StartDelayMs; // reset after a clean (re)connect attempt
+        FReconnectDelayMs := StartDelayMs;
       end;
     end;
   end;
@@ -3326,13 +2696,6 @@ begin
   end;
 end;
 
-// Writes AMsg.Payload straight to the socket, framed per FFraming - NOT
-// JSON-wrapped the way Bridge's stdin protocol is, because the payload IS
-// the wire protocol here (an IRC line, an SMTP command, ...), not an
-// envelope around one. Which messages even reach this executive at all is
-// governed entirely by its Registry subscription filter(s), set up
-// alongside every other config-driven executive in vdrx.lpr - this method
-// doesn't re-check the topic itself.
 procedure TVDRX_SocketClientExecutive.HandlePacket(const AMsg: TVDRX_Message);
 var
   Transport: TVDRX_Transport;
@@ -3341,7 +2704,7 @@ begin
   FTransportLock.Enter;
   Transport := FTransport;
   FTransportLock.Leave;
-  if not Assigned(Transport) then Exit; // not currently connected - message is dropped, not queued
+  if not Assigned(Transport) then Exit;
 
   if FFraming = 'chunk' then
     OutStr := AMsg.Payload
@@ -3359,4 +2722,3 @@ finalization
   GReplyTopicLock.Free;
 
 end.
-

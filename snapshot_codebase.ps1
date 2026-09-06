@@ -19,7 +19,7 @@ Get-ChildItem -Recurse -File | Where-Object {
     foreach ($exc in $excludeFolders) {
         if ($file.FullName -like "*\$exc\*") { $isInExcluded = $true }
     }
-    (-not $isInExcluded) -and ($_.Extension -match "\.(pas|lpr)$")
+    (-not $isInExcluded) -and ($_.Extension -match "\.(pas|lpr|conf|md)$")
 } | ForEach-Object {
     $relativeName = $_.FullName.Replace((Get-Location).Path, ".")
     "`n--- FILE: $relativeName ---" | Add-Content -Path $outputFile -Encoding utf8
