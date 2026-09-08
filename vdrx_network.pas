@@ -2071,33 +2071,76 @@ begin
 end;
 
 function TVDRX_WSConnection.DoHandshake: Boolean;
+const
+  ReadChunkSize = 2048;
+  MaxHandshakeBytes = 16384; // generous headroom - real clients send more headers (Origin, Sec-WebSocket-Extensions, User-Agent, cookies) than fit in one packet
+  HandshakeTimeoutMs = 5000;
+  KeyHeaderName = 'Sec-WebSocket-Key:';
 var
-  Buf: array[0..2047] of Byte;
+  Buf: array[0..ReadChunkSize - 1] of Byte;
   Received, i, tailLen: Integer;
-  Request, Key, AcceptKey, Header: string;
+  Request, Chunk, Key, AcceptKey, Header: string;
 begin
   Result := False;
   if FPendingRequest <> '' then
     Request := FPendingRequest
   else
   begin
-    Received := FTransport.Read(Buf[0], SizeOf(Buf));
-    if Received <= 0 then
+    // A real client's handshake request can arrive split across more
+    // than one TCP read - confirmed against Node's native WebSocket
+    // client, which reliably does this even over loopback. The
+    // previous single Read() call here silently dropped any connection
+    // whose Sec-WebSocket-Key hadn't arrived yet in that first read -
+    // no response was ever sent back, so the client just saw a
+    // hung/failed connection with nothing server-side to explain why.
+    // This loops until the blank-line header terminator shows up,
+    // bounded by MaxHandshakeBytes and HandshakeTimeoutMs so a
+    // connection that never completes its handshake can't tie up a
+    // reader thread indefinitely (no read timeout was set here at all
+    // before this fix, despite SetReadTimeout already existing on
+    // TVDRX_Transport - a blocking Read() with no timeout means a
+    // client that connects and never sends anything would have hung
+    // this thread forever).
+    FTransport.SetReadTimeout(HandshakeTimeoutMs);
+    Request := '';
+    while Pos(#13#10#13#10, Request) = 0 do
     begin
-      Bus.Publish('log.warn', 'ws ' + ID + ': no bytes received for handshake', ID);
-      Exit;
+      if Length(Request) >= MaxHandshakeBytes then
+      begin
+        Bus.Publish('log.warn', 'ws ' + ID + ': handshake request exceeded ' + IntToStr(MaxHandshakeBytes) + ' bytes without completing, dropping', ID);
+        Exit;
+      end;
+      Received := FTransport.Read(Buf[0], SizeOf(Buf));
+      if Received <= 0 then
+      begin
+        Bus.Publish('log.warn', 'ws ' + ID + ': handshake read failed or timed out after ' + IntToStr(Length(Request)) + ' bytes', ID);
+        Exit;
+      end;
+      SetString(Chunk, PAnsiChar(@Buf[0]), Received);
+      Request := Request + Chunk;
     end;
-    SetString(Request, PAnsiChar(@Buf[0]), Received);
   end;
-  i := Pos('Sec-WebSocket-Key:', Request);
+  // HTTP header NAMES are case-insensitive per spec - Node's native
+  // WebSocket client sends them fully lowercase ("sec-websocket-key:"),
+  // which is entirely valid HTTP and is what actually broke every
+  // non-browser client against this server (browsers' own WebSocket
+  // implementations happen to send the mixed case this literal
+  // previously required, which is almost certainly why this went
+  // unnoticed - nothing but a browser had ever completed a handshake
+  // here). Matched case-insensitively via UpperCase() on a copy so the
+  // found position i lines up 1:1 with Request (same length/positions
+  // for plain ASCII header text), while Key itself is extracted from
+  // the ORIGINAL Request, not the uppercased copy - the base64 key
+  // value is case-sensitive and must be preserved exactly as sent.
+  i := Pos(UpperCase(KeyHeaderName), UpperCase(Request));
   if i = 0 then
   begin
     Bus.Publish('log.warn', 'ws ' + ID + ': handshake request had no Sec-WebSocket-Key header', ID);
     Exit;
   end;
-  tailLen := Pos(#13, Copy(Request, i, Length(Request))) - 20;
+  tailLen := Pos(#13, Copy(Request, i, Length(Request))) - Length(KeyHeaderName) - 2;
   if tailLen < 1 then Exit;
-  Key := Trim(Copy(Request, i + 19, tailLen));
+  Key := Trim(Copy(Request, i + Length(KeyHeaderName) + 1, tailLen));
   AcceptKey := ComputeAcceptKey(Key);
   Header := 'HTTP/1.1 101 Switching Protocols'#13#10 +
             'Upgrade: websocket'#13#10 +
