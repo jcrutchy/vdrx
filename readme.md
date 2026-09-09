@@ -104,6 +104,23 @@ config - handy for keeping a handful of alternates around (see the
 `socket_clients` example below, which does exactly this for
 soylentnews vs. libera).
 
+**Queue groups - `queue_group`**: give two or more `processes` entries
+(each still needs its own `id`) the same `queue_group` name and a matching
+`subscribe` filter, and each published message goes to exactly one member
+of the group (picked round-robin) instead of every member. This is how a
+handful of identical worker scripts share one queue of jobs:
+
+```json
+[
+  { "id": "worker1", "command": "php worker.php", "subscribe": ["jobs.in"], "queue_group": "workers" },
+  { "id": "worker2", "command": "php worker.php", "subscribe": ["jobs.in"], "queue_group": "workers" },
+  { "id": "worker3", "command": "php worker.php", "subscribe": ["jobs.in"], "queue_group": "workers" }
+]
+```
+
+Omit `queue_group` (the default) for the ordinary fan-out behaviour where
+every subscriber gets every message - existing configs are unaffected.
+
 **Reverse-proxy variant**: add `prefix`/`host`/`port` to a `processes`
 entry and VDRX also registers an HTTP route that reverse-proxies matching
 requests to that address - for an app that already speaks HTTP itself
@@ -422,12 +439,40 @@ it never touches the wire.
   unversioned OpenSSL install FPC can `dlopen` by default.
 - `settings.*` - anything here is available in templates as `$$name$$`.
 
+**Environment variable expansion** - any string value anywhere in
+`vdrx.conf` or an included file can reference `${VAR_NAME}` or
+`${VAR_NAME:-default}`; expansion happens once, on the raw file text,
+before it's parsed as JSON, and before `includes` merging. Handy for
+secrets/hosts that shouldn't be committed, or for one `vdrx.conf` used
+across a couple of machines:
+
+```json
+{ "host": "${IRC_HOST:-irc.libera.chat}", "port": "${IRC_PORT:-6697}" }
+```
+
+An unset variable with no `:-default` expands to an empty string rather
+than being left as literal `${...}` text.
+
 **`buckets`** - append-only JSONL recording of bus traffic, if you want a
 durable log of a set of topics rather than just watching them go by:
 
 ```json
 { "name": "chatlog", "topics": "irc_bot.out,irc_bot.in", "file": "chatlog.jsonl" }
 ```
+
+Add `max_size_mb` to cap a bucket file's size - once appending the next
+entry would push it over that size, the file rotates to `chatlog.jsonl.1`
+(shifting any older `.1`../`.N-1` up by one) and a fresh file starts.
+`max_files` caps how many rotated files are kept (default 5) before the
+oldest is discarded:
+
+```json
+{ "name": "chatlog", "topics": "irc_bot.out,irc_bot.in", "file": "chatlog.jsonl", "max_size_mb": 50, "max_files": 10 }
+```
+
+Omitting `max_size_mb` (the default) keeps a bucket's original unbounded
+append-forever behaviour. `sys.history`/`history <bucket>` only reads the
+live file, not rotated ones.
 
 ---
 
@@ -487,3 +532,18 @@ scripts) resolve against that same working directory - see the gotcha in
   would finish the "everything only talks via the bus" picture, but adds a
   bus round trip to every request including the highest-volume ones
   (images, CSS, JS), so it's a deliberate scope boundary, not an oversight.
+- `TVDRX_Message` has no native `ReplyTo`/`CorrelationID` fields yet -
+  request/reply (§4b/§4d) works today only via `TVDRX_OneShotWaiter`
+  minting a throwaway reply topic per call. Promoting that to fields on
+  the message itself would let a supervised `processes` script implement
+  request/reply against an arbitrary caller without either side needing to
+  invent topic-naming conventions - queued as the next bus-level change,
+  not yet started.
+- No inbound raw-TCP/TLS listener (`socket_clients` is outbound-only) -
+  a `socket_servers` config section mirroring `socket_clients` but
+  accepting connections would slot into the existing
+  `TVDRX_SocketListenerExecutive` base class (already generic over
+  plain/TLS accept loops; `TVDRX_WebListenerExecutive`/`TVDRX_HTTPExecutive`/
+  `TVDRX_WebSocketExecutive` are all descendants of it) the same way
+  `TVDRX_SocketClientExecutive` reuses the transport/framing code - not yet
+  built.

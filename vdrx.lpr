@@ -116,7 +116,7 @@ var
   Row: TStringList;
   Bridge: TVDRX_BridgeExecutive;
   n, BridgeGraceMs, i: Integer;
-  RestartRaw: string;
+  RestartRaw, QueueGroup, GroupSuffix: string;
   Filters: TStringArray;
 begin
   SetLength(ARoutes, 0);
@@ -150,15 +150,26 @@ begin
 
       Bridge.PublishPatterns := Row.Values['publish'];
 
+      // queue_group: '' (the default) keeps the historical fan-out behaviour
+      // - every subscriber matching a topic gets every message. Give two or
+      // more processes entries the same queue_group (they still need their
+      // own distinct "id") and Register's round-robin dispatch means each
+      // published message goes to exactly one member of the group, letting
+      // several instances of an expensive worker script share a queue of
+      // jobs on one topic without any change to the worker script itself.
+      QueueGroup := Row.Values['queue_group'];
+
       if Row.Values['subscribe'] <> '' then
       begin
         Filters := SplitString(Row.Values['subscribe'], ',');
-        ARegistry.Register(Bridge, Row.Values['id'], Trim(Filters[0]));
+        ARegistry.Register(Bridge, Row.Values['id'], Trim(Filters[0]), QueueGroup);
         for i := 1 to High(Filters) do
-          ARegistry.Register(Bridge, Row.Values['id'], Trim(Filters[i]));
+          ARegistry.Register(Bridge, Row.Values['id'], Trim(Filters[i]), QueueGroup);
       end
       else
-        ARegistry.Register(Bridge, Row.Values['id'], Row.Values['id'] + '.in');
+        ARegistry.Register(Bridge, Row.Values['id'], Row.Values['id'] + '.in', QueueGroup);
+
+      GroupSuffix := IfThen(QueueGroup <> '', ', queue_group=' + QueueGroup, '');
 
       if Row.Values['prefix'] <> '' then
       begin
@@ -169,11 +180,11 @@ begin
         ARoutes[n].Port := StrToIntDef(Row.Values['port'], 0);
         WriteLn('  Process "', Row.Values['id'], '" (proxied): ', ARoutes[n].Prefix, ' -> ',
           ARoutes[n].Host, ':', ARoutes[n].Port, ' (', Row.Values['command'],
-          ', restart=', RestartRaw, ', graceful_timeout_ms=', BridgeGraceMs, ')');
+          ', restart=', RestartRaw, ', graceful_timeout_ms=', BridgeGraceMs, GroupSuffix, ')');
       end
       else
         WriteLn('  Process "', Row.Values['id'], '" (', Row.Values['command'],
-          ', restart=', RestartRaw, ', graceful_timeout_ms=', BridgeGraceMs, ')');
+          ', restart=', RestartRaw, ', graceful_timeout_ms=', BridgeGraceMs, GroupSuffix, ')');
     end;
   finally
     Rows.Free;
@@ -364,7 +375,8 @@ var
   Bucket: TVDRX_BucketExecutive;
   Filters: TStringArray;
   FilePath: string;
-  i: Integer;
+  MaxSizeMB, MaxFiles, EffectiveMaxFiles, i: Integer;
+  RotateSuffix: string;
 begin
   Rows := AConfig.GetObjectArray('buckets');
   try
@@ -377,13 +389,27 @@ begin
       end;
       FilePath := IfThen(Row.Values['file'] <> '', Row.Values['file'],
         'bucket_' + Row.Values['name'] + '.jsonl');
-      Bucket := TVDRX_BucketExecutive.Create(Kernel.Queue, FilePath);
+      // max_size_mb=0 (the default when omitted) keeps a bucket's original
+      // unbounded-append behaviour; set it to enable rotation, optionally
+      // paired with max_files (defaults to 5 rotated files) to cap total
+      // disk use.
+      MaxSizeMB := StrToIntDef(Row.Values['max_size_mb'], 0);
+      MaxFiles := StrToIntDef(Row.Values['max_files'], 0);
+      Bucket := TVDRX_BucketExecutive.Create(Kernel.Queue, FilePath, MaxSizeMB, MaxFiles);
       Filters := SplitString(Row.Values['topics'], ',');
       ARegistry.Register(Bucket, Row.Values['name'], Trim(Filters[0]));
       for i := 1 to High(Filters) do
         ARegistry.Register(Bucket, Row.Values['name'], Trim(Filters[i]));
+      if MaxSizeMB > 0 then
+      begin
+        if MaxFiles > 0 then EffectiveMaxFiles := MaxFiles else EffectiveMaxFiles := 5;
+        RotateSuffix := ', rotates at ' + IntToStr(MaxSizeMB) + 'MB (keeping ' +
+          IntToStr(EffectiveMaxFiles) + ' old files)';
+      end
+      else
+        RotateSuffix := '';
       WriteLn('  Bucket "', Row.Values['name'], '": ', Row.Values['topics'],
-        ' -> ', FilePath);
+        ' -> ', FilePath, RotateSuffix);
     end;
   finally
     Rows.Free;

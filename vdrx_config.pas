@@ -120,6 +120,59 @@ begin
   end;
 end;
 
+// Expands ${VAR_NAME} and ${VAR_NAME:-default} references against the
+// process environment, applied to a config file's raw text before it's
+// parsed as JSON - so it works in any string value (ports, hosts, TLS file
+// paths, command lines, ...) with no per-field special-casing needed here
+// or in any of the callers that read those values back out via
+// GetString/GetInteger/GetBoolean. An unset variable with no ":-default"
+// expands to '' rather than being left as literal "${...}" text - a stray
+// unexpanded placeholder surviving into, say, a port number would fail
+// StrToIntDef silently and confusingly far from here, whereas '' at least
+// fails the same way an actually-blank config value would.
+// Deliberately a single linear scan with no regex/allocation-per-match -
+// this runs once per config file per Reload, not per lookup, so simplicity
+// wins over the marginal performance a compiled pattern would buy.
+function ExpandEnvVars(const S: string): string;
+var
+  i, j, k, len, sepPos: Integer;
+  VarName, DefaultVal, EnvVal: string;
+begin
+  Result := '';
+  i := 1;
+  len := Length(S);
+  while i <= len do
+  begin
+    if (S[i] = '$') and (i < len) and (S[i + 1] = '{') then
+    begin
+      j := i + 2;
+      k := j;
+      while (k <= len) and (S[k] <> '}') do Inc(k);
+      if k <= len then
+      begin
+        VarName := Copy(S, j, k - j);
+        DefaultVal := '';
+        sepPos := Pos(':-', VarName);
+        if sepPos > 0 then
+        begin
+          DefaultVal := Copy(VarName, sepPos + 2, Length(VarName) - sepPos - 1);
+          VarName := Copy(VarName, 1, sepPos - 1);
+        end;
+        EnvVal := GetEnvironmentVariable(VarName);
+        if (EnvVal = '') and (sepPos > 0) then
+          EnvVal := DefaultVal;
+        Result := Result + EnvVal;
+        i := k + 1;
+        Continue;
+      end;
+      // no closing '}' found - fall through and copy the '$' literally
+      // rather than silently swallowing an unterminated reference
+    end;
+    Result := Result + S[i];
+    Inc(i);
+  end;
+end;
+
 // Loads AFilePath, recursively resolves and merges any top-level "includes"
 // array it names (paths resolved relative to AFilePath's OWN directory, so
 // an included file's includes work the same way regardless of which
@@ -163,6 +216,10 @@ begin
   JSONText := TStringList.Create;
   try
     JSONText.LoadFromFile(AbsPath);
+    // Expand ${VAR}/${VAR:-default} before parsing - see ExpandEnvVars. Applied
+    // per-file, so an included file's own env references are expanded the same
+    // way as the top-level vdrx.conf's.
+    JSONText.Text := ExpandEnvVars(JSONText.Text);
     try
       Parsed := GetJSON(JSONText.Text);
     except

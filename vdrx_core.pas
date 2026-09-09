@@ -82,15 +82,28 @@ type
   // A single (Executive, Filter) routing entry. Filters now live here rather than on
   // the executive itself, so one executive can be registered under any number of
   // them - e.g. a Logger subscribed to both 'log.>' and 'irc.>'.
+  // Group is '' for ordinary fan-out subscriptions (every matching subscriber
+  // gets every message, the historical behaviour). A non-empty Group turns
+  // this into a queue-group ("competing consumers") subscription: see
+  // TVDRX_Registry.GetSubscribers for how members sharing a Group name split
+  // matching messages via round-robin instead of all receiving each one.
   TVDRX_Subscription = class
   public
     Exec: TVDRX_Executive;
     Filter: string;
-    constructor Create(AExec: TVDRX_Executive; const AFilter: string);
+    Group: string;
+    constructor Create(AExec: TVDRX_Executive; const AFilter: string; const AGroup: string = '');
   end;
 
   TVDRX_SubList = specialize TObjectList<TVDRX_Subscription>; // owns its Subscriptions
   TVDRX_SubListDictionary = specialize TObjectDictionary<string, TVDRX_SubList>;
+  // Per-group round-robin cursor, keyed by group name - next index (mod
+  // however many members currently match a given message) to hand the next
+  // message to. Deliberately a single counter per group name rather than
+  // one per (group, topic) pair: two different topics feeding the same
+  // group still take turns off one shared rotation, same as NATS/MQTT-style
+  // queue groups.
+  TVDRX_GroupCounterMap = specialize TDictionary<string, Integer>;
 
   // MasterMap (owning, ID -> Executive) is still the single source of truth for
   // lifecycle and memory management - exactly one entry per AID, regardless of how
@@ -102,6 +115,7 @@ type
     FMasterMap: TVDRX_ExecMasterMap;
     FLiteralSubs: TVDRX_SubListDictionary;
     FWildcardSubs: TVDRX_SubList;
+    FGroupCounters: TVDRX_GroupCounterMap;
     FLock: TCriticalSection;
     procedure RemoveSubscriptionsUnlocked(AExec: TVDRX_Executive);
   public
@@ -111,7 +125,12 @@ type
     // registered, this also takes ownership of AExec (it'll be freed on
     // Unregister). Safe to call repeatedly with the same AID to add more filters to
     // an already-registered executive.
-    procedure Register(AExec: TVDRX_Executive; const AID, AFilter: string);
+    // AGroup, when non-empty, makes this a queue-group subscription: of every
+    // currently-registered executive sharing AGroup whose filter matches a
+    // given message, only one (picked round-robin) receives it - see
+    // GetSubscribers. Leave AGroup as '' for the historical fan-out-to-everyone
+    // behaviour.
+    procedure Register(AExec: TVDRX_Executive; const AID, AFilter: string; const AGroup: string = '');
     // Drops every filter subscription for AID WITHOUT destroying the executive -
     // use this (then Register again) to replace an executive's subscriptions in
     // place, e.g. a WebSocket connection re-subscribing to a new topic.
@@ -350,11 +369,12 @@ end;
 
 { TVDRX_Subscription }
 
-constructor TVDRX_Subscription.Create(AExec: TVDRX_Executive; const AFilter: string);
+constructor TVDRX_Subscription.Create(AExec: TVDRX_Executive; const AFilter: string; const AGroup: string);
 begin
   inherited Create;
   Exec := AExec;
   Filter := AFilter;
+  Group := AGroup;
 end;
 
 { TVDRX_Registry }
@@ -365,10 +385,12 @@ begin
   FMasterMap := TVDRX_ExecMasterMap.Create([doOwnsValues]);
   FLiteralSubs := TVDRX_SubListDictionary.Create([doOwnsValues]);
   FWildcardSubs := TVDRX_SubList.Create; // owns its Subscriptions
+  FGroupCounters := TVDRX_GroupCounterMap.Create;
 end;
 
 destructor TVDRX_Registry.Destroy;
 begin
+  FGroupCounters.Free;
   FWildcardSubs.Free;
   FLiteralSubs.Free;
   FMasterMap.Free; // owns and frees every registered executive
@@ -382,7 +404,7 @@ end;
 // executive - this is what lets one executive be registered under any number of
 // filters, e.g. Register(Logger, 'logger', 'log.>') then
 // Register(Logger, 'logger', 'irc.>').
-procedure TVDRX_Registry.Register(AExec: TVDRX_Executive; const AID, AFilter: string);
+procedure TVDRX_Registry.Register(AExec: TVDRX_Executive; const AID, AFilter: string; const AGroup: string);
 var
   List: TVDRX_SubList;
   Sub: TVDRX_Subscription;
@@ -394,7 +416,7 @@ begin
       AExec.ID := AID;
       FMasterMap.Add(AID, AExec);
     end;
-    Sub := TVDRX_Subscription.Create(AExec, AFilter);
+    Sub := TVDRX_Subscription.Create(AExec, AFilter, AGroup);
     if (Pos('*', AFilter) > 0) or (Pos('>', AFilter) > 0) then
       FWildcardSubs.Add(Sub)
     else
@@ -516,22 +538,70 @@ end;
 // Same executive can be reachable via more than one matching Subscription (e.g. two
 // overlapping wildcard filters, or a literal + a wildcard both matching ATopic) -
 // dedupe so HandlePacket is never called twice for one message.
+//
+// Group ('' ) subscriptions keep the historical fan-out behaviour and go
+// straight into Result. Subscriptions with a non-empty Group are instead
+// collected per group name into GroupMembers first; once every matching
+// Subscription has been scanned, exactly one member of each group that
+// matched is picked via FGroupCounters' round-robin cursor and added to
+// Result - so N executives registered under the same group split a stream
+// of messages instead of every one of them receiving every message. A
+// group with only one currently-registered, matching member behaves
+// exactly like an ordinary subscription (always that one member).
 function TVDRX_Registry.GetSubscribers(const ATopic: string): TVDRX_ExecList;
 var
   Sub: TVDRX_Subscription;
   List: TVDRX_SubList;
+  GroupMembers: specialize TObjectDictionary<string, TVDRX_ExecList>;
+  Members: TVDRX_ExecList;
+  GroupName: string;
+  Idx: Integer;
+  Chosen: TVDRX_Executive;
+
+  procedure ConsiderSub(ASub: TVDRX_Subscription);
+  begin
+    if ASub.Group = '' then
+    begin
+      if Result.IndexOf(ASub.Exec) < 0 then
+        Result.Add(ASub.Exec);
+      Exit;
+    end;
+    if not GroupMembers.TryGetValue(ASub.Group, Members) then
+    begin
+      Members := TVDRX_ExecList.Create;
+      GroupMembers.Add(ASub.Group, Members);
+    end;
+    if Members.IndexOf(ASub.Exec) < 0 then
+      Members.Add(ASub.Exec);
+  end;
+
 begin
   FLock.Enter;
   try
     Result := TVDRX_ExecList.Create;
-    if FLiteralSubs.TryGetValue(ATopic, List) then
-      for Sub in List do
-        if Result.IndexOf(Sub.Exec) < 0 then
-          Result.Add(Sub.Exec);
-    for Sub in FWildcardSubs do
-      if TopicMatches(Sub.Filter, ATopic) then
-        if Result.IndexOf(Sub.Exec) < 0 then
-          Result.Add(Sub.Exec);
+    GroupMembers := specialize TObjectDictionary<string, TVDRX_ExecList>.Create([doOwnsValues]);
+    try
+      if FLiteralSubs.TryGetValue(ATopic, List) then
+        for Sub in List do
+          ConsiderSub(Sub);
+      for Sub in FWildcardSubs do
+        if TopicMatches(Sub.Filter, ATopic) then
+          ConsiderSub(Sub);
+
+      for GroupName in GroupMembers.Keys do
+      begin
+        Members := GroupMembers[GroupName];
+        if Members.Count = 0 then Continue;
+        if not FGroupCounters.TryGetValue(GroupName, Idx) then
+          Idx := 0;
+        Chosen := Members[Idx mod Members.Count];
+        FGroupCounters.AddOrSetValue(GroupName, Idx + 1);
+        if Result.IndexOf(Chosen) < 0 then
+          Result.Add(Chosen);
+      end;
+    finally
+      GroupMembers.Free;
+    end;
   finally
     FLock.Leave;
   end;
