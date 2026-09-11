@@ -240,12 +240,19 @@ type
   private
     FListener: TVDRX_WebSocketExecutive;
     FThread: TThread;
+    FSendThread: TThread;
     FSendLock: TCriticalSection;
+    FSendEvent: TEvent;
+    FSendQueue: TStringList;
+    FControlQueue: TStringList;
     FPendingRequest: string;
     FPingThread: TThread;
     FStopping: Boolean;
     FLastPong: TDateTime;
     procedure PingLoop;
+    procedure SendLoop;
+    procedure EnqueueFrame(const APayload: string; AOpcode: Byte);
+    function WriteAll(const ABuf: string): Boolean;
     function DoHandshake: Boolean;
     function ReadFrame(out APayload: string; out AOpcode: Byte): Boolean;
   public
@@ -2051,17 +2058,35 @@ begin
   FListener := AListener;
   FTransport := ATransport;
   FSendLock := TCriticalSection.Create;
+  FSendEvent := TEvent.Create(nil, False, False, '');
+  FSendQueue := TStringList.Create;
+  FControlQueue := TStringList.Create;
 end;
 
 destructor TVDRX_WSConnection.Destroy;
 begin
   FStopping := True;
+  if Assigned(FTransport) then
+    FTransport.Close;
+  if Assigned(FSendEvent) then
+    FSendEvent.SetEvent;
   if Assigned(FPingThread) then
   begin
     WaitThreadOrTimeout(FPingThread, 500);
     FreeAndNil(FPingThread);
   end;
+  if Assigned(FSendThread) then
+  begin
+    WaitThreadOrTimeout(FSendThread, 1000);
+    if not FSendThread.Finished then
+      Bus.Publish('log.warn', 'ws ' + ID + ': send thread did not exit in time - abandoning it', ID)
+    else
+      FreeAndNil(FSendThread);
+  end;
+  FSendEvent.Free;
   FSendLock.Free;
+  FSendQueue.Free;
+  FControlQueue.Free;
   inherited Destroy;
 end;
 
@@ -2147,6 +2172,14 @@ begin
             'Connection: Upgrade'#13#10 +
             'Sec-WebSocket-Accept: ' + AcceptKey + #13#10#13#10;
   FTransport.Write(Header[1], Length(Header));
+  // DoHandshake uses a short receive timeout only to prevent an incomplete
+  // HTTP handshake from hanging a connection thread forever. That timeout
+  // applies to the underlying socket, so it MUST be removed after the
+  // handshake succeeds. Otherwise an otherwise-idle WebSocket will hit the
+  // handshake timeout during its normal ReadFrame() loop and disconnect
+  // after ~5 seconds. The ping thread is responsible for liveness after
+  // upgrade and closes the socket itself when the pong deadline expires.
+  FTransport.SetReadTimeout(0);
   Bus.Publish('log.info', 'ws ' + ID + ': handshake OK', ID);
   Result := True;
 end;
@@ -2208,41 +2241,123 @@ begin
 end;
 
 procedure TVDRX_WSConnection.SendFrame(const APayload: string; AOpcode: Byte);
+begin
+  EnqueueFrame(APayload, AOpcode);
+end;
+
+procedure TVDRX_WSConnection.EnqueueFrame(const APayload: string; AOpcode: Byte);
+begin
+  if FStopping then Exit;
+  FSendLock.Enter;
+  try
+    if FStopping then Exit;
+    // Control frames (ping/pong/close) must never sit behind a potentially
+    // large data backlog. Otherwise the ping itself can be delayed until the
+    // browser misses the pong deadline, causing the connection to flap.
+    if AOpcode >= 8 then
+      FControlQueue.Add(Char(AOpcode) + APayload)
+    else
+      FSendQueue.Add(Char(AOpcode) + APayload);
+  finally
+    FSendLock.Leave;
+  end;
+  FSendEvent.SetEvent;
+end;
+
+function TVDRX_WSConnection.WriteAll(const ABuf: string): Boolean;
 var
+  Sent, N: Integer;
+begin
+  Result := False;
+  if FStopping or (Length(ABuf) = 0) then Exit;
+  Sent := 0;
+  while Sent < Length(ABuf) do
+  begin
+    try
+      N := FTransport.Write(ABuf[Sent + 1], Length(ABuf) - Sent);
+    except
+      Exit;
+    end;
+    if N <= 0 then Exit;
+    Inc(Sent, N);
+  end;
+  Result := True;
+end;
+
+procedure TVDRX_WSConnection.SendLoop;
+var
+  Frame: string;
+  Opcode: Byte;
+  Payload: string;
   Hdr: array[0..9] of Byte;
   HdrLen: Integer;
   Buf: string;
   PayloadLen: UInt64;
-  i: Integer;
+  i, Count: Integer;
 begin
-  FSendLock.Enter;
-  try
-    PayloadLen := UInt64(Length(APayload));
-    Hdr[0] := $80 or AOpcode;
-    if PayloadLen < 126 then
+  while not FStopping do
+  begin
+    if FSendEvent.WaitFor(500) <> wrSignaled then
+      Continue;
+
+    while not FStopping do
     begin
-      Hdr[1] := Byte(PayloadLen);
-      HdrLen := 2;
-    end
-    else if PayloadLen <= 65535 then
-    begin
-      Hdr[1] := 126;
-      Hdr[2] := (PayloadLen shr 8) and $FF;
-      Hdr[3] := PayloadLen and $FF;
-      HdrLen := 4;
-    end
-    else
-    begin
-      Hdr[1] := 127;
-      for i := 0 to 7 do
-        Hdr[2 + i] := (PayloadLen shr ((7 - i) * 8)) and $FF;
-      HdrLen := 10;
+      Frame := '';
+      FSendLock.Enter;
+      try
+        if FControlQueue.Count > 0 then
+        begin
+          Frame := FControlQueue[0];
+          FControlQueue.Delete(0);
+        end
+        else if FSendQueue.Count > 0 then
+        begin
+          Frame := FSendQueue[0];
+          FSendQueue.Delete(0);
+        end;
+        Count := FControlQueue.Count + FSendQueue.Count;
+      finally
+        FSendLock.Leave;
+      end;
+
+      if Frame = '' then Break;
+      Opcode := Byte(Frame[1]);
+      Payload := Copy(Frame, 2, MaxInt);
+      PayloadLen := UInt64(Length(Payload));
+      Hdr[0] := $80 or Opcode;
+      if PayloadLen < 126 then
+      begin
+        Hdr[1] := Byte(PayloadLen);
+        HdrLen := 2;
+      end
+      else if PayloadLen <= 65535 then
+      begin
+        Hdr[1] := 126;
+        Hdr[2] := (PayloadLen shr 8) and $FF;
+        Hdr[3] := PayloadLen and $FF;
+        HdrLen := 4;
+      end
+      else
+      begin
+        Hdr[1] := 127;
+        for i := 0 to 7 do
+          Hdr[2 + i] := (PayloadLen shr ((7 - i) * 8)) and $FF;
+        HdrLen := 10;
+      end;
+      SetString(Buf, PAnsiChar(@Hdr[0]), HdrLen);
+      Buf := Buf + Payload;
+      if Length(Buf) > 0 then
+      begin
+        if not WriteAll(Buf) then
+        begin
+          FStopping := True;
+          Break;
+        end;
+      end;
     end;
-    SetString(Buf, PAnsiChar(@Hdr[0]), HdrLen);
-    Buf := Buf + APayload;
-    FTransport.Write(Buf[1], Length(Buf));
-  finally
-    FSendLock.Leave;
+
+    if Count = 0 then
+      Continue;
   end;
 end;
 
@@ -2399,6 +2514,8 @@ end;
 
 procedure TVDRX_WSConnection.Initialize;
 begin
+  FSendThread := TVDRX_WorkerThread.Create(@SendLoop);
+  FSendThread.Start;
   FThread := TWSConnThread.Create(Self);
   FThread.Start;
 end;
@@ -2406,6 +2523,7 @@ end;
 procedure TVDRX_WSConnection.Shutdown;
 begin
   FStopping := True;
+  if Assigned(FSendEvent) then FSendEvent.SetEvent;
   FTransport.Close;
   if Assigned(FThread) then
   begin
@@ -2422,6 +2540,16 @@ begin
     else
       Bus.Publish('log.warn', 'ws ' + ID + ': ping thread did not exit in time - abandoning it', ID);
   end;
+  if Assigned(FSendThread) then
+  begin
+    if WaitThreadOrTimeout(FSendThread, FListener.GracefulTimeoutMs) then
+    begin
+      FSendThread.Free;
+      FSendThread := nil;
+    end
+    else
+      Bus.Publish('log.warn', 'ws ' + ID + ': send thread did not exit in time - abandoning it', ID);
+  end;
 end;
 
 procedure TVDRX_WSConnection.HandlePacket(const AMsg: TVDRX_Message);
@@ -2431,7 +2559,6 @@ begin
     SendFrame(AMsg.Payload);
     Exit;
   end;
-  Bus.Publish('log.info', 'ws ' + ID + ': -> "' + AMsg.Topic + '" ' + AMsg.Payload, ID);
   SendFrame(Format('{"topic":%s,"payload":%s,"source":%s,"seq":%d}',
     [JSONString(AMsg.Topic), AMsg.Payload, JSONString(AMsg.SourceID), AMsg.Seq]));
 end;
