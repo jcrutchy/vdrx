@@ -5,7 +5,7 @@ unit vdrx_bridge;
 interface
 
 uses
-  Classes, SysUtils, SyncObjs, Process, fpjson, jsonparser, vdrx_core, vdrx_procutil;
+  Classes, SysUtils, SyncObjs, Process, fpjson, jsonparser, DateUtils, vdrx_core, vdrx_procutil;
 
 
 type
@@ -29,12 +29,32 @@ type
     FRestartPolicy: string; // 'always' (default) | 'on-failure' | 'never'
     FPublishPatterns: string; // comma-joined topic filters, '' = structured
                                // publish disabled entirely (deny by default)
+
+    // Outbound lines to the child's stdin are queued here and written by
+    // FSendThread (see SendLoop), never directly from HandlePacket. A pipe
+    // has no OS-level send timeout the way a socket does, so a wedged child
+    // (alive, not crashed, just not reading its stdin) can't be caught by a
+    // bounded Write the way TVDRX_SocketClientExecutive now is - instead
+    // MonitorLoop watches how long the oldest queued line has been waiting
+    // (FOldestPendingAt/FOldestPendingSet) and treats "still pending after
+    // FSendStallMs" as a hang, same class of symptom as a crashed process.
+    FSendLock: TCriticalSection;
+    FSendEvent: TEvent;
+    FSendQueue: TStringList;
+    FSendThread: TThread;
+    FOldestPendingAt: TDateTime;
+    FOldestPendingSet: Boolean;
+    FSendStallMs: Integer;
+
     function IsPublishAllowed(const ATopic: string): Boolean;
     function TryParseStructuredLine(const ALine: string; out ATopic, APayload: string): Boolean;
     procedure StartProcess;
     procedure StopProcess;
     procedure ReaderLoop;
     procedure MonitorLoop;
+    procedure SendLoop;
+    procedure EnqueueLine(const ALine: string);
+    function SendQueueStalled: Boolean;
   public
     constructor Create(ABus: TVDRX_MessageQueue); override;
     destructor Destroy; override;
@@ -62,6 +82,12 @@ type
     // on Unix) before force-killing it. Defaults to 5000ms; set from
     // vdrx_daemon.conf's top-level "shutdown_grace_ms" in vdrx_daemon.lpr.
     property GracefulTimeoutMs: Integer read FGracefulTimeoutMs write FGracefulTimeoutMs;
+    // How long a line may sit at the front of the outbound queue,
+    // unconsumed by the child, before MonitorLoop treats the process as
+    // hung and force-restarts it via KillCurrentProcess. Defaults to
+    // 5000ms; set from vdrx.conf's per-process "send_stall_ms" if a
+    // particular child is expected to go quiet longer than that.
+    property SendStallMs: Integer read FSendStallMs write FSendStallMs;
     // Current child PID, or 0 if no process is currently running - used by
     // vdrx_admin.pas's 'sys.kill' to find "which bridge owns this PID".
     function CurrentPID: Integer;
@@ -84,9 +110,14 @@ constructor TVDRX_BridgeExecutive.Create(ABus: TVDRX_MessageQueue);
 begin
   inherited Create(ABus);
   FProcessLock := TCriticalSection.Create;
+  FSendLock := TCriticalSection.Create;
+  FSendEvent := TEvent.Create(nil, False, False, '');
+  FSendQueue := TStringList.Create;
+  FOldestPendingSet := False;
   FRestartDelayMs := 500;
   FMaxRestartDelayMs := 30000;
   FGracefulTimeoutMs := 5000;
+  FSendStallMs := 5000;
   FStopping := False;
   FRestartPolicy := 'always';
   FPublishPatterns := '';
@@ -94,6 +125,9 @@ end;
 
 destructor TVDRX_BridgeExecutive.Destroy;
 begin
+  FSendQueue.Free;
+  FSendEvent.Free;
+  FSendLock.Free;
   FProcessLock.Free;
   inherited Destroy;
 end;
@@ -122,6 +156,9 @@ begin
   FReaderThread := TVDRX_WorkerThread.Create(@ReaderLoop);
   FReaderThread.FreeOnTerminate := False;
   FReaderThread.Start;
+  FSendThread := TVDRX_WorkerThread.Create(@SendLoop);
+  FSendThread.FreeOnTerminate := False;
+  FSendThread.Start;
 end;
 
 // Graceful-then-kill: closes stdin (an EOF hint some children, especially on
@@ -134,7 +171,8 @@ end;
 procedure TVDRX_BridgeExecutive.StopProcess;
 var
   Proc: TProcess;
-  ReaderThread: TThread;
+  ReaderThread, SendThread: TThread;
+  ReaderOK, SendOK: Boolean;
 begin
   FProcessLock.Enter;
   try
@@ -144,6 +182,8 @@ begin
                       // nil and exits below without double-freeing anything
     ReaderThread := FReaderThread;
     FReaderThread := nil;
+    SendThread := FSendThread;
+    FSendThread := nil;
   finally
     FProcessLock.Leave;
   end;
@@ -165,21 +205,44 @@ begin
   except
   end;
 
-  // The reader thread's blocking Read should unblock once the process (and
-  // its pipes) are actually gone. Give it one more short window before
-  // deciding it's genuinely stuck.
-  if WaitThreadOrTimeout(ReaderThread, FGracefulTimeoutMs) then
+  // Both the reader thread's blocking Read and the send thread's blocking
+  // Write should unblock once the process (and its pipes) are actually
+  // gone. Give each one the same short window before deciding it's
+  // genuinely stuck. Proc is only freed once BOTH have confirmed exit -
+  // either one could still be touching Proc.Output/Proc.Input otherwise.
+  ReaderOK := WaitThreadOrTimeout(ReaderThread, FGracefulTimeoutMs);
+  SendOK := WaitThreadOrTimeout(SendThread, FGracefulTimeoutMs);
+
+  if ReaderOK then
   begin
     if Assigned(ReaderThread) then ReaderThread.Free;
-    Proc.Free;
   end
   else
-  begin
-    // Truly stuck (shouldn't happen once the process is confirmed dead) -
-    // abandon both rather than risk freeing objects a live thread might
-    // still be touching. Leaks this one instance; logged loudly so it's
-    // visible rather than silently swallowed.
     Bus.Publish('log.warn', Format('bridge %s: reader thread did not exit - abandoning it to avoid a crash', [ID]), ID);
+
+  if SendOK then
+  begin
+    if Assigned(SendThread) then SendThread.Free;
+  end
+  else
+    Bus.Publish('log.warn', Format('bridge %s: send thread did not exit - abandoning it to avoid a crash', [ID]), ID);
+
+  if ReaderOK and SendOK then
+    Proc.Free;
+  // else: leaks this one Proc instance rather than risk freeing it while a
+  // still-live, abandoned thread might touch it - same trade-off the
+  // reader-thread-only version of this code made, just extended to cover
+  // the send thread too.
+
+  // Anything still queued was addressed to the process that just died - a
+  // restart is a new child, not a continuation, so drop it rather than
+  // replaying stale traffic into whatever comes back.
+  FSendLock.Enter;
+  try
+    FSendQueue.Clear;
+    FOldestPendingSet := False;
+  finally
+    FSendLock.Leave;
   end;
 end;
 
@@ -327,6 +390,19 @@ begin
       ExitCode := 0;
     FProcessLock.Leave;
 
+    // Alive per the OS, but stdin hasn't drained in a while - a hang, not a
+    // crash, so RestartPolicy (which governs how a process CHOSE to exit)
+    // doesn't apply here; always bounce it, same as an operator's sys.kill.
+    if StillRunning and (not FStopping) and SendQueueStalled then
+    begin
+      Bus.Publish('log.warn', Format(
+        'bridge %s: outbound queue to stdin has been stuck for over %dms - process looks hung, restarting it',
+        [ID, FSendStallMs]), ID);
+      KillCurrentProcess; // -> StopProcess: graceful-then-kill, clears FProcess and the stale queue
+      StillRunning := False;
+      ProcAssigned := False; // route through the "always restart, not policy-governed" branch below
+    end;
+
     if (not StillRunning) and (not FStopping) then
     begin
       if ProcAssigned then
@@ -367,6 +443,105 @@ begin
   end;
 end;
 
+// True once the oldest still-unsent line has been waiting longer than
+// FSendStallMs. FOldestPendingAt/FOldestPendingSet are maintained by
+// EnqueueLine (set on the empty->non-empty transition) and SendLoop
+// (cleared once the queue drains back to empty) under FSendLock.
+function TVDRX_BridgeExecutive.SendQueueStalled: Boolean;
+begin
+  FSendLock.Enter;
+  try
+    Result := FOldestPendingSet and
+      (MilliSecondsBetween(Now, FOldestPendingAt) > FSendStallMs);
+  finally
+    FSendLock.Leave;
+  end;
+end;
+
+procedure TVDRX_BridgeExecutive.EnqueueLine(const ALine: string);
+begin
+  if FStopping then Exit;
+  FSendLock.Enter;
+  try
+    if FStopping then Exit;
+    if FSendQueue.Count = 0 then
+    begin
+      FOldestPendingAt := Now;
+      FOldestPendingSet := True;
+    end;
+    FSendQueue.Add(ALine);
+  finally
+    FSendLock.Leave;
+  end;
+  FSendEvent.SetEvent;
+end;
+
+// Drains FSendQueue and performs the actual (blocking) FProcess.Input.Write
+// here, off the dispatch thread - HandlePacket only ever calls EnqueueLine.
+// A pipe write can still block this thread if the child truly never reads,
+// but that no longer touches TVDRX_Kernel.Execute; MonitorLoop's
+// SendQueueStalled check is what catches and restarts a child stuck this way.
+// Bound to one process instance for its whole life, exactly like ReaderLoop
+// - a fresh SendThread/SendLoop is created per StartProcess call and exits
+// once THIS Proc stops running. Deliberately does NOT take FProcessLock
+// around the write: StopProcess needs that lock only briefly to swap
+// FProcess to nil and hand off to ForceKillProcess/SIGKILL, and must never
+// be made to wait behind a write that's stuck because the child isn't
+// reading its stdin - that would turn "kill the hung child" into itself
+// hanging on the very lock guarding the field. Instead, StopProcess kills
+// Proc directly (it has its own captured reference) while this thread may
+// still be blocked inside Proc.Input.Write; that write is expected to
+// unblock (with a broken-pipe error) once the kill actually lands, same as
+// ReaderLoop's blocking Read is expected to unblock on EOF - see StopProcess's
+// comment. MonitorLoop's SendQueueStalled check is what notices the hang and
+// triggers that kill in the first place.
+procedure TVDRX_BridgeExecutive.SendLoop;
+var
+  Line: string;
+  HaveLine: Boolean;
+  Proc: TProcess;
+begin
+  FProcessLock.Enter;
+  Proc := FProcess;
+  FProcessLock.Leave;
+
+  while (not FStopping) and Assigned(Proc) and Proc.Running do
+  begin
+    if FSendEvent.WaitFor(200) <> wrSignaled then
+      Continue;
+
+    while (not FStopping) and Proc.Running do
+    begin
+      HaveLine := False;
+      FSendLock.Enter;
+      try
+        if FSendQueue.Count > 0 then
+        begin
+          Line := FSendQueue[0];
+          FSendQueue.Delete(0);
+          HaveLine := True;
+          if FSendQueue.Count = 0 then
+            FOldestPendingSet := False
+          else
+            FOldestPendingAt := Now; // next line becomes "oldest" as of now
+        end;
+      finally
+        FSendLock.Leave;
+      end;
+      if not HaveLine then Break;
+
+      try
+        Proc.Input.Write(Line[1], Length(Line));
+      except
+        // Broken pipe - the process is already gone or going.
+        // MonitorLoop's Running check catches it within ~1s; nothing more
+        // to do here except stop trying to write to it.
+        Break;
+      end;
+    end;
+  end;
+end;
+
 function TVDRX_BridgeExecutive.CurrentPID: Integer;
 begin
   FProcessLock.Enter;
@@ -392,12 +567,16 @@ begin
   FMonitorThread := TVDRX_WorkerThread.Create(@MonitorLoop);
   FMonitorThread.FreeOnTerminate := False;
   FMonitorThread.Start;
+  FSendThread := TVDRX_WorkerThread.Create(@SendLoop);
+  FSendThread.FreeOnTerminate := False;
+  FSendThread.Start;
 end;
 
 procedure TVDRX_BridgeExecutive.Shutdown;
 begin
   FStopping := True;
-  StopProcess;
+  FSendEvent.SetEvent; // wake SendLoop so it notices FStopping promptly
+  StopProcess; // tears down the process, reader thread, AND send thread together
   if Assigned(FMonitorThread) then
   begin
     if WaitThreadOrTimeout(FMonitorThread, FGracefulTimeoutMs) then
@@ -454,20 +633,10 @@ procedure TVDRX_BridgeExecutive.HandlePacket(const AMsg: TVDRX_Message);
 var
   Line: string;
 begin
-  Bus.Publish('log.info', Format('bridge %s: HandlePacket got "%s" (process running: %s)',
-    [ID, AMsg.Topic, BoolToStr(Assigned(FProcess) and FProcess.Running, True)]), ID);
-  FProcessLock.Enter;
-  try
-    if Assigned(FProcess) and FProcess.Running then
-    begin
-      Line := Format('{"topic":%s,"payload":%s,"source":%s}',
-        [JSONString(AMsg.Topic), EnsureJSONPayload(AMsg.Payload), JSONString(AMsg.SourceID)])
-        + LineEnding;
-      FProcess.Input.Write(Line[1], Length(Line));
-    end;
-  finally
-    FProcessLock.Leave;
-  end;
+  Line := Format('{"topic":%s,"payload":%s,"source":%s}',
+    [JSONString(AMsg.Topic), EnsureJSONPayload(AMsg.Payload), JSONString(AMsg.SourceID)])
+    + LineEnding;
+  EnqueueLine(Line); // SendLoop does the actual (potentially blocking) write - see its comment
 end;
 
 end.

@@ -38,6 +38,14 @@ type
     function Write(const ABuf; ALen: Integer): Integer; virtual; abstract;
     procedure Close; virtual; abstract;
     procedure SetReadTimeout(ATimeoutMs: Integer); virtual; abstract;
+    // Bounds a single underlying send() so a stalled/half-open peer (send
+    // buffer full, no ACKs coming back) fails a Write within ATimeoutMs
+    // instead of blocking for the OS's TCP retransmit ceiling (which can be
+    // 15-30 minutes). Without this, any HandlePacket that writes straight to
+    // a transport - e.g. TVDRX_SocketClientExecutive - can wedge whatever
+    // thread calls it for that entire window. Pass 0 to wait indefinitely
+    // (the old, unbounded default).
+    procedure SetWriteTimeout(ATimeoutMs: Integer); virtual; abstract;
   end;
 
   TVDRX_PlainTransport = class(TVDRX_Transport)
@@ -49,6 +57,7 @@ type
     function Write(const ABuf; ALen: Integer): Integer; override;
     procedure Close; override;
     procedure SetReadTimeout(ATimeoutMs: Integer); override;
+    procedure SetWriteTimeout(ATimeoutMs: Integer); override;
   end;
 
   TVDRX_TLSTransport = class(TVDRX_Transport)
@@ -65,6 +74,7 @@ type
     function Write(const ABuf; ALen: Integer): Integer; override;
     procedure Close; override;
     procedure SetReadTimeout(ATimeoutMs: Integer); override;
+    procedure SetWriteTimeout(ATimeoutMs: Integer); override;
   end;
 
   TVDRX_TLSContext = class
@@ -320,10 +330,24 @@ type
     FMonitorThread: TThread;
     FStopping: Boolean;
 
+    // Outbound writes are queued here and drained by FSendThread instead of
+    // being written straight from HandlePacket - see SendLoop. This is the
+    // same shape as TVDRX_WSConnection's FSendQueue/FSendEvent/SendLoop;
+    // kept as a separate copy rather than a shared base class for now (see
+    // vdrx_core.pas's TVDRX_Executive comment on not extracting a base class
+    // until there are three near-identical examples).
+    FSendLock: TCriticalSection;
+    FSendEvent: TEvent;
+    FSendQueue: TStringList;
+    FSendThread: TThread;
+    FWriteTimeoutMs: Integer;
+
     procedure DoConnect;
     procedure DoDisconnect;
     procedure ReaderLoop;
     procedure MonitorLoop;
+    procedure SendLoop;
+    procedure EnqueueLine(const ALine: string);
   public
     constructor Create(ABus: TVDRX_MessageQueue); override;
     destructor Destroy; override;
@@ -341,6 +365,11 @@ type
     property ReconnectDelayMs: Integer read FReconnectDelayMs write FReconnectDelayMs;
     property MaxReconnectDelayMs: Integer read FMaxReconnectDelayMs write FMaxReconnectDelayMs;
     property GracefulTimeoutMs: Integer read FGracefulTimeoutMs write FGracefulTimeoutMs;
+    // How long a single Write to the remote peer may block before it's
+    // treated as failed (see TVDRX_Transport.SetWriteTimeout). Defaults to
+    // 5000ms - set from vdrx.conf per socket_clients entry if you need a
+    // different bound for a particular slow/flaky peer.
+    property WriteTimeoutMs: Integer read FWriteTimeoutMs write FWriteTimeoutMs;
     procedure Initialize; override;
     procedure Shutdown; override;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
@@ -471,6 +500,26 @@ begin
   Result := TVDRX_PlainTransport.Create(Sock);
 end;
 
+// Turns on TCP keepalive probes so a half-open peer (network dropped, box
+// power-cycled, NAT table entry expired - anything that leaves the other
+// side gone without a clean FIN) gets detected by the OS within a bounded
+// time even if VDRX never tries to write to it. Uses the OS's default probe
+// interval/count (usually ~2 hours idle then a handful of retries a few
+// seconds apart on Linux) - good enough to eventually notice a dead peer
+// without pulling in platform-specific tuning knobs FPC doesn't expose
+// uniformly across Unix/Windows. Best-effort: failure here isn't fatal to
+// the connection, just leaves keepalive off.
+procedure SetSocketKeepAlive(ASocket: TSocket);
+var
+  Enable: LongInt;
+begin
+  Enable := 1;
+  try
+    fpSetsockopt(ASocket, SOL_SOCKET, SO_KEEPALIVE, @Enable, SizeOf(Enable));
+  except
+  end;
+end;
+
 procedure ApplyOpenSSLDLLOverrides(AConfig: TVDRX_Config);
 {$IFDEF WINDOWS}
 var
@@ -524,6 +573,25 @@ var
 begin
   Timeout := ATimeoutMs;
   fpSetsockopt(FSocket, SOL_SOCKET, SO_RCVTIMEO, @Timeout, SizeOf(Timeout));
+end;
+{$ENDIF}
+
+procedure TVDRX_PlainTransport.SetWriteTimeout(ATimeoutMs: Integer);
+{$IFDEF UNIX}
+var
+  TV: TimeVal;
+begin
+  TV.tv_sec := ATimeoutMs div 1000;
+  TV.tv_usec := (ATimeoutMs mod 1000) * 1000;
+  fpSetsockopt(FSocket, SOL_SOCKET, SO_SNDTIMEO, @TV, SizeOf(TV));
+end;
+{$ENDIF}
+{$IFDEF WINDOWS}
+var
+  Timeout: DWORD;
+begin
+  Timeout := ATimeoutMs;
+  fpSetsockopt(FSocket, SOL_SOCKET, SO_SNDTIMEO, @Timeout, SizeOf(Timeout));
 end;
 {$ENDIF}
 
@@ -585,6 +653,24 @@ begin
   PlainTemp := TVDRX_PlainTransport.Create(FSocket);
   try
     PlainTemp.SetReadTimeout(ATimeoutMs);
+  finally
+    PlainTemp.Free;
+  end;
+end;
+
+// SSL_write ultimately calls send() on this same fd, so SO_SNDTIMEO still
+// bounds the underlying syscall even though OpenSSL sits in between. Not
+// airtight - a sufficiently large OpenSSL-side write buffer could in theory
+// absorb small writes without ever calling send() - but for VDRX's line-at-a-
+// time payloads this is a solid practical bound, and vastly better than the
+// previous "never times out" behaviour.
+procedure TVDRX_TLSTransport.SetWriteTimeout(ATimeoutMs: Integer);
+var
+  PlainTemp: TVDRX_PlainTransport;
+begin
+  PlainTemp := TVDRX_PlainTransport.Create(FSocket);
+  try
+    PlainTemp.SetWriteTimeout(ATimeoutMs);
   finally
     PlainTemp.Free;
   end;
@@ -2638,6 +2724,9 @@ constructor TVDRX_SocketClientExecutive.Create(ABus: TVDRX_MessageQueue);
 begin
   inherited Create(ABus);
   FTransportLock := TCriticalSection.Create;
+  FSendLock := TCriticalSection.Create;
+  FSendEvent := TEvent.Create(nil, False, False, '');
+  FSendQueue := TStringList.Create;
   FPort := 0;
   FTLS := False;
   FTLSVerify := True;
@@ -2648,12 +2737,16 @@ begin
   FReconnectDelayMs := 500;
   FMaxReconnectDelayMs := 30000;
   FGracefulTimeoutMs := 5000;
+  FWriteTimeoutMs := 5000;
   FStopping := False;
   FConnected := False;
 end;
 
 destructor TVDRX_SocketClientExecutive.Destroy;
 begin
+  FSendQueue.Free;
+  FSendEvent.Free;
+  FSendLock.Free;
   FTransportLock.Free;
   inherited Destroy;
 end;
@@ -2671,6 +2764,7 @@ begin
     Bus.Publish('log.warn', Format('%s: connect to %s:%d failed', [ID, FHost, FPort]), ID);
     Exit;
   end;
+  SetSocketKeepAlive(Sock); // catches a peer that goes silently half-open later
 
   if FTLS then
   begin
@@ -2699,6 +2793,8 @@ begin
   end
   else
     Transport := TVDRX_PlainTransport.Create(Sock);
+
+  Transport.SetWriteTimeout(FWriteTimeoutMs); // bounds SendLoop's writes below - see unit comment on TVDRX_Transport.SetWriteTimeout
 
   FTransportLock.Enter;
   try
@@ -2740,6 +2836,16 @@ begin
     else
       Bus.Publish('log.warn', ID + ': reader thread did not exit in time - abandoning it', ID);
     Transport.Free;
+  end;
+
+  // Anything still queued was addressed to the connection that just died -
+  // a fresh reconnect is a new peer/session, not a continuation, so drop it
+  // rather than replaying possibly-stale traffic once SendLoop picks back up.
+  FSendLock.Enter;
+  try
+    FSendQueue.Clear;
+  finally
+    FSendLock.Leave;
   end;
 end;
 
@@ -2850,11 +2956,23 @@ begin
   FMonitorThread := TVDRX_WorkerThread.Create(@MonitorLoop);
   FMonitorThread.FreeOnTerminate := False;
   FMonitorThread.Start;
+  FSendThread := TVDRX_WorkerThread.Create(@SendLoop);
+  FSendThread.FreeOnTerminate := False;
+  FSendThread.Start;
 end;
 
 procedure TVDRX_SocketClientExecutive.Shutdown;
 begin
   FStopping := True;
+  FSendEvent.SetEvent; // wake SendLoop so it notices FStopping promptly
+  if Assigned(FSendThread) then
+  begin
+    if WaitThreadOrTimeout(FSendThread, FGracefulTimeoutMs) then
+      FSendThread.Free
+    else
+      Bus.Publish('log.warn', ID + ': send thread did not exit in time - abandoning it', ID);
+    FSendThread := nil;
+  end;
   DoDisconnect;
   if Assigned(FMonitorThread) then
   begin
@@ -2866,23 +2984,89 @@ begin
   end;
 end;
 
+// Formats the outgoing line and queues it - the actual (potentially slow)
+// Transport.Write happens on FSendThread via SendLoop, never here. This is
+// what keeps a stalled/half-open remote peer from blocking
+// TVDRX_Kernel.Execute's single dispatch thread: HandlePacket now always
+// returns immediately regardless of the connection's state.
 procedure TVDRX_SocketClientExecutive.HandlePacket(const AMsg: TVDRX_Message);
 var
-  Transport: TVDRX_Transport;
   OutStr: string;
 begin
-  FTransportLock.Enter;
-  Transport := FTransport;
-  FTransportLock.Leave;
-  if not Assigned(Transport) then Exit;
-
   if FFraming = 'chunk' then
     OutStr := AMsg.Payload
   else
     OutStr := AMsg.Payload + FDelimiter;
 
   if Length(OutStr) > 0 then
-    Transport.Write(OutStr[1], Length(OutStr));
+    EnqueueLine(OutStr);
+end;
+
+procedure TVDRX_SocketClientExecutive.EnqueueLine(const ALine: string);
+begin
+  if FStopping then Exit;
+  FSendLock.Enter;
+  try
+    if FStopping then Exit;
+    FSendQueue.Add(ALine);
+  finally
+    FSendLock.Leave;
+  end;
+  FSendEvent.SetEvent;
+end;
+
+// Drains FSendQueue one line at a time and performs the actual blocking
+// Transport.Write here, off the dispatch thread. Because DoConnect already
+// called SetWriteTimeout, a stalled/half-open peer makes this Write return
+// promptly (error or short write) instead of hanging - at which point this
+// loop marks the connection down and lets MonitorLoop's existing
+// reconnect/backoff machinery take over, exactly as if ReaderLoop had
+// noticed a closed socket.
+procedure TVDRX_SocketClientExecutive.SendLoop;
+var
+  Line: string;
+  HaveLine: Boolean;
+  Transport: TVDRX_Transport;
+  Sent: Integer;
+begin
+  while not FStopping do
+  begin
+    if FSendEvent.WaitFor(500) <> wrSignaled then
+      Continue;
+
+    while not FStopping do
+    begin
+      HaveLine := False;
+      FSendLock.Enter;
+      try
+        if FSendQueue.Count > 0 then
+        begin
+          Line := FSendQueue[0];
+          FSendQueue.Delete(0);
+          HaveLine := True;
+        end;
+      finally
+        FSendLock.Leave;
+      end;
+      if not HaveLine then Break;
+
+      FTransportLock.Enter;
+      Transport := FTransport;
+      FTransportLock.Leave;
+      if not Assigned(Transport) then Continue; // dropped while queued - nothing to send to
+
+      Sent := Transport.Write(Line[1], Length(Line));
+      if Sent <= 0 then
+      begin
+        Bus.Publish('log.warn', Format('%s: write to %s:%d failed or timed out - marking connection down',
+          [ID, FHost, FPort]), ID);
+        FTransportLock.Enter;
+        FConnected := False;
+        FTransportLock.Leave;
+        Break; // stop draining against a dead connection; MonitorLoop reconnects and DoDisconnect clears the rest
+      end;
+    end;
+  end;
 end;
 
 initialization

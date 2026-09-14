@@ -75,6 +75,17 @@ type
     property Bus: TVDRX_MessageQueue read FBus;
     procedure Initialize; virtual;
     procedure Shutdown; virtual;
+    // Called synchronously, once per matching subscriber, from
+    // TVDRX_Kernel.Execute's single dispatch thread (see vdrx_core.pas)
+    // for every message on the bus. MUST NOT BLOCK: any wait here - a
+    // socket write, a pipe write, a lock held by a slow thread - stalls
+    // every other subscriber on the bus until it returns. If a descendant
+    // needs to do I/O that can be slow, queue it and hand it to its own
+    // worker thread instead (see TVDRX_BridgeExecutive/
+    // TVDRX_SocketClientExecutive/TVDRX_WSConnection's EnqueueLine+SendLoop
+    // pairs in vdrx_bridge.pas/vdrx_network.pas for the established shape).
+    // TVDRX_Kernel.Execute times every call and logs a log.warn past
+    // HANDLEPACKET_WARN_MS as a tripwire for a future violation of this.
     procedure HandlePacket(const AMsg: TVDRX_Message); virtual; abstract;
     procedure ApplyConfig; virtual;
   end;
@@ -706,11 +717,24 @@ begin
   inherited;
 end;
 
+const
+  // HandlePacket contracts as "must not block" (see TVDRX_Executive's
+  // comment) - every implementation in this codebase now only ever
+  // enqueues onto its own async send thread instead of doing I/O inline
+  // (see vdrx_bridge.pas's and vdrx_network.pas's SendLoop/EnqueueLine
+  // pairs). This threshold is deliberately generous relative to that - a
+  // compliant HandlePacket should return in well under 1ms - so tripping
+  // it means some executive (present or future) is violating the
+  // contract, not that the bus is merely "a bit busy".
+  HANDLEPACKET_WARN_MS = 250;
+
 procedure TVDRX_Kernel.Execute;
 var
   Msg: TVDRX_Message;
   Subscribers: TVDRX_ExecList;
   Exec: TVDRX_Executive;
+  StartedAt: TDateTime;
+  ElapsedMs: Int64;
 begin
   FRegistry.InitializeAll;
   while not Terminated do
@@ -725,7 +749,16 @@ begin
       Subscribers := FRegistry.GetSubscribers(Msg.Topic);
       try
         for Exec in Subscribers do
+        begin
+          StartedAt := Now;
           Exec.HandlePacket(Msg);
+          ElapsedMs := MilliSecondsBetween(Now, StartedAt);
+          if ElapsedMs > HANDLEPACKET_WARN_MS then
+            FQueue.Publish('log.warn', Format(
+              'kernel: %s.HandlePacket("%s") took %dms - HandlePacket must never block; ' +
+              'this stalls the whole dispatch loop for every other subscriber',
+              [Exec.ID, Msg.Topic, ElapsedMs]), 'kernel');
+        end;
       finally
         Subscribers.Free;
       end;

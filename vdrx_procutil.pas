@@ -169,6 +169,15 @@ begin
   {$IFDEF UNIX}
   FpSignal(SIGINT, signalhandler(@UnixShutdownSignalHandler));
   FpSignal(SIGTERM, signalhandler(@UnixShutdownSignalHandler));
+  // A write() to a pipe/socket whose other end is gone raises SIGPIPE,
+  // which defaults to killing the whole process - before any Pascal
+  // try/except ever runs, since it's a signal, not a language-level
+  // exception. Every "a write can fail, catch it and treat the connection
+  // as dead" pattern in this codebase (TVDRX_BridgeExecutive.SendLoop,
+  // TVDRX_SocketClientExecutive.SendLoop, and anything that came before
+  // them) silently depends on this being masked. Ignoring it here makes a
+  // failed write surface as a normal EPIPE/error return instead.
+  FpSignal(SIGPIPE, signalhandler(SIG_IGN));
   {$ENDIF}
   {$IFDEF WINDOWS}
   SetConsoleCtrlHandler(@WindowsShutdownCtrlHandler, True);
