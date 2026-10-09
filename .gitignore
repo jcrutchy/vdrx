@@ -5,4 +5,3 @@
 *.ppu
 *.o
 backup/
-/daemon/vdrx_daemon

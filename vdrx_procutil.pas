@@ -14,6 +14,28 @@ uses
 // forced close/kill. Returns True if the thread finished within the window.
 function WaitThreadOrTimeout(AThread: TThread; ATimeoutMs: Integer): Boolean;
 
+type
+  TVDRX_RunResult = (rrExited, rrStartFailed, rrTimedOut);
+
+// Runs ACommandLine (program + space-separated args, FPC TProcess quoting
+// rules) to completion: AStdin is written to the program's stdin and closed,
+// stdout and stderr are collected SEPARATELY (both byte-exact - binary safe),
+// and AExitCode is its exit code. AWorkDir '' = the daemon's own directory.
+// Never waits longer than ATimeoutMs (<= 0 = no limit): on expiry the program is
+// force-killed and rrTimedOut returned. rrStartFailed puts the reason in AError.
+// Blocking - call it from a worker/connection thread, never from HandlePacket.
+function RunProgramCapture(const ACommandLine, AWorkDir, AStdin: string;
+  ATimeoutMs: Integer; out AExitCode: Integer;
+  out AStdout, AStderr, AError: string): TVDRX_RunResult;
+
+// Same, but with the program and its arguments already separated - no string
+// splitting or quoting rules involved, so argument values can contain anything
+// (spaces, quotes) and are never re-interpreted. Prefer this whenever any part
+// of the argument list comes from outside the config file.
+function RunProgramCaptureArgs(const AExe: string; AArgs: TStrings;
+  const AWorkDir, AStdin: string; ATimeoutMs: Integer; out AExitCode: Integer;
+  out AStdout, AStderr, AError: string): TVDRX_RunResult;
+
 // Same idea for an external process - polls Running instead of blocking.
 function WaitProcessOrTimeout(AProcess: TProcess; ATimeoutMs: Integer): Boolean;
 
@@ -63,6 +85,129 @@ var
 procedure InstallShutdownSignalHandler;
 
 implementation
+
+function RunProgramCaptureArgs(const AExe: string; AArgs: TStrings;
+  const AWorkDir, AStdin: string; ATimeoutMs: Integer; out AExitCode: Integer;
+  out AStdout, AStderr, AError: string): TVDRX_RunResult;
+var
+  Proc: TProcess;
+  i: Integer;
+  Buf: array[0..8191] of Byte;
+  N, Got: Integer;
+  WasRunning: Boolean;
+  Started: QWord;
+  Found: string;
+begin
+  AExitCode := 0;
+  AStdout := '';
+  AStderr := '';
+  AError := '';
+  Result := rrExited;
+  Proc := TProcess.Create(nil);
+  try
+    Proc.Executable := AExe;
+    if Assigned(AArgs) then
+      for i := 0 to AArgs.Count - 1 do
+        Proc.Parameters.Add(AArgs[i]);
+    if AWorkDir <> '' then Proc.CurrentDirectory := ExpandFileName(AWorkDir);
+    if not FileExists(Proc.Executable) then
+    begin
+      Found := ExeSearch(Proc.Executable, SysUtils.GetEnvironmentVariable('PATH'));
+      if Found <> '' then Proc.Executable := Found;
+    end;
+    Proc.Options := [poUsePipes]; // stdout and stderr stay separate
+    try
+      Proc.Execute;
+    except
+      on E: Exception do
+      begin
+        AError := E.Message;
+        Result := rrStartFailed;
+        Exit;
+      end;
+    end;
+
+    try
+      if AStdin <> '' then Proc.Input.Write(AStdin[1], Length(AStdin));
+    except
+      // program closed stdin early - its exit code / stderr will explain
+    end;
+    try Proc.CloseInput; except end;
+
+    Started := GetTickCount64;
+    repeat
+      // Sample "running" BEFORE draining: if it had already exited and the
+      // drain finds nothing, every byte it wrote has been collected.
+      WasRunning := Proc.Running;
+      Got := 0;
+      while Proc.Output.NumBytesAvailable > 0 do
+      begin
+        N := Proc.Output.Read(Buf[0], SizeOf(Buf));
+        if N <= 0 then Break;
+        SetLength(AStdout, Length(AStdout) + N);
+        Move(Buf[0], AStdout[Length(AStdout) - N + 1], N);
+        Inc(Got, N);
+      end;
+      while Proc.Stderr.NumBytesAvailable > 0 do
+      begin
+        N := Proc.Stderr.Read(Buf[0], SizeOf(Buf));
+        if N <= 0 then Break;
+        SetLength(AStderr, Length(AStderr) + N);
+        Move(Buf[0], AStderr[Length(AStderr) - N + 1], N);
+        Inc(Got, N);
+      end;
+      if (Got = 0) and WasRunning then
+      begin
+        if (ATimeoutMs > 0) and (GetTickCount64 - Started > QWord(ATimeoutMs)) then
+        begin
+          ForceKillProcess(Proc);
+          Result := rrTimedOut;
+          Exit;
+        end;
+        Sleep(2);
+      end;
+    until (not WasRunning) and (Got = 0);
+
+    AExitCode := Proc.ExitStatus;
+    {$IFDEF UNIX}
+    // FPC 3.2 returns the raw wait() status (exit code 1 arrives as 256);
+    // newer versions return the plain code. Handle both.
+    if (AExitCode >= 256) and ((AExitCode and $FF) = 0) then AExitCode := AExitCode shr 8;
+    {$ENDIF}
+  finally
+    Proc.Free;
+  end;
+end;
+
+function RunProgramCapture(const ACommandLine, AWorkDir, AStdin: string;
+  ATimeoutMs: Integer; out AExitCode: Integer;
+  out AStdout, AStderr, AError: string): TVDRX_RunResult;
+var
+  Parts: TStringList;
+  Args: TStringList;
+  i: Integer;
+begin
+  Parts := TStringList.Create;
+  Args := TStringList.Create;
+  try
+    CommandToList(ACommandLine, Parts);
+    if Parts.Count = 0 then
+    begin
+      AExitCode := 0;
+      AStdout := '';
+      AStderr := '';
+      AError := 'empty command line';
+      Exit(rrStartFailed);
+    end;
+    for i := 1 to Parts.Count - 1 do
+      Args.Add(Parts[i]);
+    Result := RunProgramCaptureArgs(Parts[0], Args, AWorkDir, AStdin, ATimeoutMs,
+      AExitCode, AStdout, AStderr, AError);
+  finally
+    Args.Free;
+    Parts.Free;
+  end;
+end;
 
 function WaitThreadOrTimeout(AThread: TThread; ATimeoutMs: Integer): Boolean;
 var

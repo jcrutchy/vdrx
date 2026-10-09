@@ -81,7 +81,7 @@ about VDRX - it just reads and writes JSON lines:
 - **stdout**: every line the process writes is republished onto the bus as
   `<id>.out` by default - or, if the line itself is
   `{"topic":"some.topic","payload":"..."}` and `some.topic` matches the
-  entry's `publish` patterns, it's published to *that* topic instead. This
+  entry's `publish_allow` patterns, it's published to *that* topic instead. This
   is how a script can talk on more than one topic without VDRX needing to
   know anything about its protocol.
 
@@ -91,7 +91,7 @@ about VDRX - it just reads and writes JSON lines:
   "command": "c:/php/php C:/dev/vdrx/scripts/irc_client.php --nick=vdrxbot --channel=#vdrx",
   "restart": "always",
   "subscribe": ["freenode.out"],
-  "publish": ["irc_bot.in"],
+  "publish_allow": ["irc_bot.in"],
   "enabled": true
 }
 ```
@@ -324,7 +324,7 @@ request instead of paying spawn cost per request:
 
 ```json
 { "id": "echo_daemon", "command": "php scripts/echo_daemon.php", "restart": "always",
-  "subscribe": ["echo.daemon.in"], "publish": ["http.reply.*"], "enabled": true }
+  "subscribe": ["echo.daemon.in"], "publish_allow": ["http.reply.*"], "enabled": true }
 ```
 
 See `scripts/echo_daemon.php` for a working pair with the config above.
@@ -369,6 +369,110 @@ section for why you'd choose it over an HTTP site's own implicit
 more than one site's port (routes are global, §4 above), rendering against
 "whichever site happened to answer" stops being well-defined, and this
 makes the choice explicit instead.
+
+### 4e. Exposing an ordinary CLI program - `runners` + `http_routes`
+
+A normal command-line tool doesn't speak the bus, so two small pieces put it
+there - and because both sides are just bus participants, **anything** on the
+bus can use the tool, not only a browser:
+
+```
+browser ──► http_routes entry ──publish──► femsection.in ──► runners entry ──► program
+   ▲                                                                              │
+   └──────── HTTP response ◄──── reply on a per-request topic ◄───── publish ◄────┘
+```
+
+- A **`runners`** entry subscribes to a topic, runs the program once per
+  message, and publishes a reply envelope. It is an ordinary executive:
+  a WebSocket client, a `processes` script or an IRC bridge can publish to its
+  topic exactly as an HTTP route does.
+- An **`http_routes`** entry maps a URL prefix to a topic: it publishes the
+  request there (with a per-request `reply_to`) and returns whatever reply comes
+  back.
+
+```json
+"http_routes": [
+  { "id": "femsection", "prefix": "/fem3d/section", "allow": "POST", "timeout_ms": 12000 }
+],
+"runners": [
+  { "id": "femsection",
+    "command": "{FEM3D_BIN}/femsection{EXE_EXT}",
+    "args": ["-"],
+    "exit_status": { "1": 422, "3": 400 },
+    "timeout_ms": 8000 }
+]
+```
+
+A route and a runner with the same `id` are wired together by default
+(`<id>.in`); set `in_topic` / `subscribe` to wire them differently or to put
+several routes in front of one runner.
+
+**`http_routes`** fields: `id`, `prefix` (required) · `in_topic` (default
+`<id>.in`) · `allow` (methods accepted, default `POST`; others get 405) ·
+`timeout_ms` (default 10000; no reply in time -> 504) · `content_type` (of a
+successful reply, default `text/plain`) · `response`: `"raw"` (default - the
+reply's own `status`, `body` and `content_type`) or `"json"` (the whole reply
+envelope returned as `application/json`, so a page gets `status`, `exit_code`
+and `stderr` as data, not just text).
+
+**`runners`** fields:
+
+| Field | Meaning |
+|---|---|
+| `id`, `command` | Required. `command` is the program plus any fixed leading arguments. |
+| `subscribe` | Topic(s) it listens on; default `<id>.in`. |
+| `publish` | Topic the reply goes to when the message has **no** `reply_to`; default `<id>.out`. |
+| `args` | Further arguments, as a JSON array. `%%name%%` is filled from the message's `params` / `query`; `%%name?%%` is optional (a token containing a missing optional value is dropped - write a flag and its value as one token, `"--units=%%units?%%"`). Only placeholders named here can ever be filled. |
+| `stdin` | `"body"` (default: the message's `body` is the program's stdin) or `"none"`. |
+| `exit_status` | Exit code -> reply status, `{"1": 422}`; other non-zero exits are 500. |
+| `timeout_ms` | Default 10000; the program is force-killed and the reply status is 504. |
+| `workers` / `max_queue` | Programs that may run at once (default 2) / messages allowed to wait (default 64); beyond that the reply status is 503. |
+| `content_type` | Of a successful reply; default `text/plain`. |
+| `script_dir` | Working directory for the program. |
+
+**Message in** - plain text (taken as the `body`), or JSON:
+`{"body": "...", "params": {"units": "mm"}, "query": "units=mm", "reply_to": "some.topic"}`
+(an HTTP route sends `query` and `body` itself; `params` is for bus clients).
+**Reply out** - `{"status": 200, "content_type": "text/plain", "body": "...", "exit_code": 0}`,
+plus `"stderr"` when the program wrote any. The program is started with an
+argument **vector**, never through a shell and never split on spaces, so a
+parameter value can't change the command; values are also limited to 1024
+characters with no control characters, and a token that is *only* a
+placeholder can't start with `-` (so a caller can't inject an option flag).
+
+Notes: output is carried as a JSON string, so it should be text (invalid UTF-8
+is replaced with `?`). For a browser page on another origin, set `"cors": true`
+on the `http_sites` entry; those headers are added to every route response.
+
+---
+
+### 4f. Config conventions - what `id`, `subscribe` and `publish` mean
+
+Every bus-facing config entry follows the same three rules, so a config reads
+the same wherever you look:
+
+- **`id`** names the executive (it is also what `sys.kill` and the logs call it).
+- **`subscribe`** is the topic filter(s) it listens on (a string, or an array).
+  Where it's omitted the default is `<id>.in` - and the startup banner prints the
+  resolved topics for every entry, so nothing is hidden.
+- **`publish`** is the topic it writes its output to (default `<id>.out`) - it
+  always names a *topic*. On `processes`, the list of topic patterns the child
+  may publish to is called **`publish_allow`** instead (the old `publish`
+  spelling there still works, with a warning).
+
+| Section | Subscribes (`subscribe`) | Publishes |
+|---|---|---|
+| `processes` | default `<id>.in` | stdout lines to `<id>.out`, or to any topic in `publish_allow` |
+| `socket_clients` | default `<id>.in` | received data to `publish` (default `<id>.out`) |
+| `runners` | default `<id>.in` | replies to `reply_to`, else `publish` (default `<id>.out`) |
+| `templates` | default `<id>.in` | the render reply, to the request's `reply_to` |
+| `buckets` | required (formerly `topics`) | nothing - records to a file |
+| `http_routes` | - (the HTTP side waits for one reply) | the request to `in_topic` |
+
+`buckets` entries are now `id` + `subscribe` (the old `name` / `topics` still
+work, with a warning). The older `cli_bridges` protocols (`cgi`, `bus`,
+`bus-daemon`) are still supported; new work should use `http_routes` and
+`runners`, which go through the bus the same way everything else does.
 
 ---
 
@@ -453,11 +557,89 @@ across a couple of machines:
 An unset variable with no `:-default` expands to an empty string rather
 than being left as literal `${...}` text.
 
+**Variables** - a top-level `"variables"` object declares your own
+`{NAME}` variables, and VDRX also provides automatic (reserved) ones and
+`{ENV:NAME}` for environment variables. A reference can be used in any
+string **key or value** anywhere in `vdrx.conf` *and* in every file it
+(recursively) includes - including inside `includes` paths, and inside
+other variables' names and values:
+
+```json
+{
+  "includes": ["{KYZU_DIR}/kyzu.vdrx.conf"],
+  "variables": {
+    "KYZU_DIR": "C:/dev/kyzu",
+    "PHP_DIR": "c:/php",
+    "PHP_BIN_FILENAME": "{PHP_DIR}/php{EXE_EXT}",
+    "ADMIN_EMAIL_ADDRESS": "admin@example.com"
+  },
+  "cli_bridges": [
+    { "id": "demo", "prefix": "/demo", "protocol": "bus",
+      "command": "{PHP_BIN_FILENAME} {CONF_DIR}{PATH_SEPARATOR}scripts{PATH_SEPARATOR}hello_bus.php" }
+  ]
+}
+```
+
+| Reserved variable | Value |
+|---|---|
+| `{PLATFORM}` | `windows`, `linux`, `darwin`, `freebsd`, `unix` or `unknown` |
+| `{ARCHITECTURE}` | `x86_64`, `i386`, `aarch64`, `arm`, `ppc64` or `unknown` |
+| `{PATH_SEPARATOR}` / `{PATH_LIST_SEPARATOR}` | directory separator (`\` or `/`) / PATH-list separator (`;` or `:`) |
+| `{EXE_EXT}` | `.exe` on Windows, empty elsewhere |
+| `{VDRX_ROOT_PATH}` | directory containing the running vdrx executable |
+| `{VDRX_BIN_FILENAME}` / `{VDRX_BIN_PATH}` | the executable's file name / full path |
+| `{APP_ROOT_PATH}` / `{APP_BIN_FILENAME}` / `{APP_BIN_PATH}` | the same three under their generic names (what `jsonconf.pas` itself provides) |
+| `{MAIN_CONF_DIR}` | directory of the top-level `vdrx.conf` |
+| `{CONF_DIR}` / `{CONF_FILE}` | directory / name of the file the reference is *written in* - so inside an included `kyzu.vdrx.conf`, `{CONF_DIR}` is the kyzu directory |
+| `{LBRACE}` / `{RBRACE}` | a literal `{` / `}` |
+| `{ENV:NAME}` | environment variable (error if unset or empty) |
+| `{ENV:NAME:-fallback}` | environment variable, or `fallback` if unset/empty |
+
+Rules worth knowing:
+
+- **Recursion and nesting.** Variables may use other variables (in names
+  and values) in any order, and references nest: `{VAR_{WHICH}}`.
+- **Circular references are errors.** `A` → `B` → `A` is reported with the
+  chain (`circular variable reference: A -> B -> A`). At startup the
+  daemon refuses to run and prints the problems; on `reload` the
+  **existing configuration stays in force** and the problems are written
+  to the log as errors. The same applies to a JSON syntax error, an
+  undefined variable, an unset `{ENV:NAME}` without a fallback, or a bad
+  include.
+- **Includes.** An included file can use variables declared by the file
+  that includes it. If two files declare the same variable, the
+  including file wins - so an application's own conf can ship a default
+  and `vdrx.conf` can override it. An `includes` path may use variables
+  declared in the including files above it (not in itself or its
+  siblings).
+- **Strict about typos, relaxed about everything else.** Something shaped
+  like a reference (`{print}`) that names nothing is an error; braces
+  that aren't shaped like one (`{"a":1}`, `{status,body}`, `{ }`) are
+  left alone. Write `{LBRACE}print{RBRACE}` for a literal `{print}`.
+- **Documentation is exempt.** A `description` key, or any key ending in
+  `_description`, is never expanded.
+- **Not just strings.** A variable can only be substituted into a JSON
+  string, so write numbers and booleans as strings (`"port": "{WEB_PORT}"`)
+  - `GetInteger`/`GetBoolean` read those fine.
+- The resolved variables are also readable from code as config values:
+  `Config.GetString('variables.ADMIN_EMAIL_ADDRESS', '')`.
+- `{ENV:NAME}` is applied *after* the file is parsed, so unlike the older
+  `${NAME}` form it's safe for values containing backslashes (Windows
+  paths).
+
+All of this - includes, variables, environment expansion, safe reload - lives
+in **`jsonconf.pas`**, which depends on nothing but FPC's own `fpjson`
+and `jsonparser`, so any other project (fem3d, soma, ...) can copy that one
+file and use it. Subclass `TJsonConf`, override `RegisterReservedVariables`
+and call `SetReservedVariable` to add your own reserved names (see
+`vdrx_config.pas`, which adds the `VDRX_*` ones). `test_jsonconf.lpr` is its
+self-contained test suite.
+
 **`buckets`** - append-only JSONL recording of bus traffic, if you want a
 durable log of a set of topics rather than just watching them go by:
 
 ```json
-{ "name": "chatlog", "topics": "irc_bot.out,irc_bot.in", "file": "chatlog.jsonl" }
+{ "id": "chatlog", "subscribe": ["irc_bot.out", "irc_bot.in"], "file": "chatlog.jsonl" }
 ```
 
 Add `max_size_mb` to cap a bucket file's size - once appending the next
@@ -467,7 +649,7 @@ entry would push it over that size, the file rotates to `chatlog.jsonl.1`
 oldest is discarded:
 
 ```json
-{ "name": "chatlog", "topics": "irc_bot.out,irc_bot.in", "file": "chatlog.jsonl", "max_size_mb": 50, "max_files": 10 }
+{ "id": "chatlog", "subscribe": ["irc_bot.out", "irc_bot.in"], "file": "chatlog.jsonl", "max_size_mb": 50, "max_files": 10 }
 ```
 
 Omitting `max_size_mb` (the default) keeps a bucket's original unbounded
@@ -481,15 +663,17 @@ live file, not rotated ones.
 | Unit | What's in it |
 |---|---|
 | `vdrx_core.pas` | `TVDRX_Kernel`, `TVDRX_MessageQueue`, `TVDRX_Registry`, `TVDRX_Executive` - the bus itself, zero protocol knowledge |
-| `vdrx_config.pas` | JSON config wrapper, hot-reloadable |
+| `jsonconf.pas` | Generic, dependency-free JSON config loader: recursive `includes`, `{VARIABLES}`, environment expansion, safe reload (§6). Reusable by any project |
+| `vdrx_config.pas` | Thin `TVDRX_Config` subclass of `TJsonConf` that adds the `VDRX_*` reserved variables |
 | `vdrx_admin.pas` | `sys.>` admin commands (`sys.reload`/`sys.quit`/`sys.kill`/...) |
 | `vdrx_stdin.pas` | Console command reader, feeds `vdrx_admin` |
-| `vdrx_logger.pas` | `log.>` → colored console + `vdrx_daemon.log` |
+| `vdrx_logger.pas` | Everything on the bus → colored console + `vdrx_daemon.log`, written from its own thread; long payloads are clipped (`log_max_payload_bytes`, default 4096) |
 | `vdrx_procutil.pas` | Cross-platform process wait/terminate/kill helpers |
 | `vdrx_bridge.pas` | `TVDRX_BridgeExecutive` - supervised external processes (§2) |
 | `vdrx_bucket.pas` | Append-only JSONL topic recorder (§6) |
 | `vdrx_templates.pas` | Template engine (`$$setting$$`/`??const??`/`%%var%%`/`##loop##`/`@@child@@`) and `TVDRX_TemplateExecutive`, the bus-reachable wrapper around it (§4d) |
 | `vdrx_network.pas` | Everything socket-facing: TLS/plain transport, the listener base class, `TVDRX_HTTPExecutive` (§4) including `TVDRX_OneShotWaiter`/`PublishAndWait` (the bus-daemon/template-topic reply-correlation primitive), `TVDRX_WebSocketExecutive` + `TVDRX_WSConnection`/`TVDRX_WSProtocolExecutive` (§5), `TVDRX_SocketClientExecutive` (§3) |
+| `vdrx_runner.pas` | `TVDRX_RunnerExecutive`: runs a CLI program per bus message, publishes the output (§4e) |
 | `vdrx.lpr` | Entry point - reads `vdrx.conf`, wires every executive above up from it |
 
 ---

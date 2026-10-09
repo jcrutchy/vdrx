@@ -29,6 +29,9 @@ type
     ContentType: string;
     Protocol: string;
     InTopic: string;
+    // http_routes (bus-daemon shape) options
+    Allow: string;       // comma-separated HTTP methods accepted; '' = any
+    Response: string;    // 'raw' (default): use the reply's status/body/content_type; 'json': return the whole reply envelope as application/json
   end;
   TVDRX_CLIRoutes = array of TVDRX_CLIRoute;
 
@@ -1844,8 +1847,22 @@ var
   Method, Path, SubPath, QueryString, HeaderBlock, Body, ReplyRaw: string;
   HeaderEnd: Integer;
   ReqObj: TJSONObject;
+  AllowHdrs: TStringList;
+  ReplyJ: TJSONData;
+  RStatus: Integer;
 begin
   ParseRequestLine(ARequest, Method, Path);
+  if ARoute.Allow <> '' then
+    if Pos(',' + UpperCase(Method) + ',', ',' + StringReplace(UpperCase(ARoute.Allow), ' ', '', [rfReplaceAll]) + ',') = 0 then
+    begin
+      AllowHdrs := TStringList.Create;
+      try
+        AllowHdrs.Add('Allow=' + ARoute.Allow);
+        Exit(PlainResponse('405 Method Not Allowed', 'text/plain', 'Method not allowed - use ' + ARoute.Allow, AllowHdrs));
+      finally
+        AllowHdrs.Free;
+      end;
+    end;
   QueryString := ExtractQueryString(ARequest);
   HeaderEnd := Pos(#13#10#13#10, ARequest);
   if HeaderEnd > 0 then HeaderBlock := Copy(ARequest, 1, HeaderEnd - 1) else HeaderBlock := ARequest;
@@ -1876,6 +1893,24 @@ begin
   end;
 
   ABus.Publish('log.info', Format('http bus-daemon: %s %s (in_topic=%s) -> %d bytes', [Method, Path, ARoute.InTopic, Length(ReplyRaw)]), ASourceID);
+  if SameText(ARoute.Response, 'json') then
+  begin
+    // hand the browser the whole reply envelope as JSON (status, body,
+    // content_type, exit_code, stderr, ...) instead of unwrapping it
+    RStatus := 200;
+    try
+      ReplyJ := GetJSON(ReplyRaw);
+      try
+        if ReplyJ is TJSONObject then RStatus := TJSONObject(ReplyJ).Get('status', 200);
+      finally
+        ReplyJ.Free;
+      end;
+    except
+      ReplyRaw := '{"status":502,"body":"reply was not valid JSON"}';
+      RStatus := 502;
+    end;
+    Exit(PlainResponse(IntToStr(RStatus) + ' ' + HTTPStatusText(RStatus), 'application/json', ReplyRaw));
+  end;
   Result := BuildBusCLIResponse(ReplyRaw, ARoute.ContentType, ATemplates, ABus, ARegistry, ASourceID);
 end;
 
@@ -1898,6 +1933,35 @@ destructor TVDRX_HTTPExecutive.Destroy;
 begin
   FCustomHeaders.Free;
   inherited Destroy;
+end;
+
+// Adds a site's custom response headers (CORS etc., from "cors"/"headers" in
+// http_sites) to a response some other code already built - used for the
+// cli_bridges routes, whose responses are assembled by RunCLIScript /
+// BuildBusCLIResponse rather than by PlainResponse. Headers the response
+// already carries (matched case-insensitively) are left alone, so a script can
+// still override a site default. Without this a browser would pass the CORS
+// preflight but then refuse to hand the actual response to the calling page.
+function InjectCustomHeaders(const AResponse: string; ACustomHeaders: TStringList): string;
+var
+  p, HdrEnd, i: Integer;
+  Head, Extra, Name: string;
+begin
+  Result := AResponse;
+  if (ACustomHeaders = nil) or (ACustomHeaders.Count = 0) then Exit;
+  p := Pos(#13#10, AResponse);
+  if p = 0 then Exit;
+  HdrEnd := Pos(#13#10#13#10, AResponse);
+  if HdrEnd = 0 then HdrEnd := Length(AResponse);
+  Head := LowerCase(Copy(AResponse, 1, HdrEnd));
+  Extra := '';
+  for i := 0 to ACustomHeaders.Count - 1 do
+  begin
+    Name := ACustomHeaders.Names[i];
+    if (Name <> '') and (Pos(#13#10 + LowerCase(Name) + ':', Head) = 0) then
+      Extra := Extra + Name + ': ' + ACustomHeaders.ValueFromIndex[i] + #13#10;
+  end;
+  Insert(Extra, Result, p + 2);
 end;
 
 class function TVDRX_HTTPExecutive.BuildResponse(const ARequest: string;
@@ -1930,17 +1994,17 @@ begin
     if SameText(CLIRoute.Protocol, 'bus-daemon') then
     begin
       ABus.Publish('log.info', Format('http: %s %s -> bus-daemon %s', [Method, Path, CLIRoute.InTopic]), ASourceID);
-      Exit(RunBusDaemonRoute(ARequest, CLIRoute, ATemplates, ABus, ARegistry, ASourceID));
+      Exit(InjectCustomHeaders(RunBusDaemonRoute(ARequest, CLIRoute, ATemplates, ABus, ARegistry, ASourceID), ACustomHeaders));
     end
     else if SameText(CLIRoute.Protocol, 'bus') then
     begin
       ABus.Publish('log.info', Format('http: %s %s -> bus cli %s', [Method, Path, CLIRoute.Command]), ASourceID);
-      Exit(RunBusCLIScript(ARequest, CLIRoute, ATemplates, ABus, ARegistry, ASourceID));
+      Exit(InjectCustomHeaders(RunBusCLIScript(ARequest, CLIRoute, ATemplates, ABus, ARegistry, ASourceID), ACustomHeaders));
     end
     else
     begin
       ABus.Publish('log.info', Format('http: %s %s -> cli %s', [Method, Path, CLIRoute.Command]), ASourceID);
-      Exit(RunCLIScript(ARequest, CLIRoute, ABus, ASourceID));
+      Exit(InjectCustomHeaders(RunCLIScript(ARequest, CLIRoute, ABus, ASourceID), ACustomHeaders));
     end;
   end;
 

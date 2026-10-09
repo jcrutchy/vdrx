@@ -21,6 +21,7 @@ uses
   vdrx_bucket,
   vdrx_network,
   vdrx_templates,
+  vdrx_runner,
   vdrx_procutil;
 
 type
@@ -148,7 +149,18 @@ begin
       end;
       Bridge.RestartPolicy := RestartRaw;
 
-      Bridge.PublishPatterns := Row.Values['publish'];
+      // "publish_allow": topic patterns the child process may publish to.
+      // (Formerly called "publish" - still accepted, but "publish" is now
+      // reserved for "the topic this thing writes its output to", as it is on
+      // socket_clients and runners.)
+      if Row.Values['publish_allow'] <> '' then
+        Bridge.PublishPatterns := Row.Values['publish_allow']
+      else
+      begin
+        Bridge.PublishPatterns := Row.Values['publish'];
+        if Row.Values['publish'] <> '' then
+          WriteLn('  Process "', Row.Values['id'], '": "publish" is deprecated here - rename it to "publish_allow" (same meaning).');
+      end;
 
       // queue_group: '' (the default) keeps the historical fan-out behaviour
       // - every subscriber matching a topic gets every message. Give two or
@@ -180,11 +192,15 @@ begin
         ARoutes[n].Port := StrToIntDef(Row.Values['port'], 0);
         WriteLn('  Process "', Row.Values['id'], '" (proxied): ', ARoutes[n].Prefix, ' -> ',
           ARoutes[n].Host, ':', ARoutes[n].Port, ' (', Row.Values['command'],
-          ', restart=', RestartRaw, ', graceful_timeout_ms=', BridgeGraceMs, GroupSuffix, ')');
+          ', restart=', RestartRaw, ', graceful_timeout_ms=', BridgeGraceMs, GroupSuffix,
+          ', subscribe=', IfThen(Row.Values['subscribe'] <> '', Row.Values['subscribe'], Row.Values['id'] + '.in'),
+          ', output -> ', Row.Values['id'], '.out)');
       end
       else
         WriteLn('  Process "', Row.Values['id'], '" (', Row.Values['command'],
-          ', restart=', RestartRaw, ', graceful_timeout_ms=', BridgeGraceMs, GroupSuffix, ')');
+          ', restart=', RestartRaw, ', graceful_timeout_ms=', BridgeGraceMs, GroupSuffix,
+          ', subscribe=', IfThen(Row.Values['subscribe'] <> '', Row.Values['subscribe'], Row.Values['id'] + '.in'),
+          ', output -> ', Row.Values['id'], '.out)');
     end;
   finally
     Rows.Free;
@@ -272,6 +288,35 @@ begin
   end;
 end;
 
+// cli_bridges "exit_status": {"1": 422, "3": 400} arrives as JSON text (nested
+// objects are stored that way by GetObjectArray); turn it into "1=422,3=400".
+function ExitStatusToPairs(const AJSON: string): string;
+var
+  D: TJSONData;
+  i: Integer;
+begin
+  Result := '';
+  if Trim(AJSON) = '' then Exit;
+  try
+    D := GetJSON(AJSON);
+  except
+    WriteLn('  cli_bridges: exit_status is not valid JSON - ignored.');
+    Exit;
+  end;
+  try
+    if D is TJSONObject then
+      for i := 0 to TJSONObject(D).Count - 1 do
+      begin
+        if Result <> '' then Result := Result + ',';
+        Result := Result + TJSONObject(D).Names[i] + '=' + TJSONObject(D).Items[i].AsString;
+      end
+    else
+      WriteLn('  cli_bridges: exit_status must be an object like {"1": 422} - ignored.');
+  finally
+    D.Free;
+  end;
+end;
+
 procedure SetupCLIBridges(AConfig: TVDRX_Config; out ARoutes: TVDRX_CLIRoutes);
 var
   Rows: TVDRX_ConfigRows;
@@ -291,6 +336,11 @@ begin
       end;
 
       Protocol := LowerCase(IfThen(Row.Values['protocol'] <> '', Row.Values['protocol'], 'cgi'));
+      if Protocol = 'exec' then
+      begin
+        WriteLn('  Skipping cli_bridges entry "', Row.Values['id'], '": protocol "exec" no longer exists - declare a runners entry plus an http_routes entry instead (see readme 4e).');
+        Continue;
+      end;
       if (Protocol <> 'cgi') and (Protocol <> 'bus') and (Protocol <> 'bus-daemon') then
       begin
         WriteLn('  cli_bridges entry "', Row.Values['id'], '": unrecognized protocol "', Protocol, '" - using "cgi".');
@@ -320,6 +370,8 @@ begin
       ARoutes[n].ScriptDir := Row.Values['script_dir'];
       ARoutes[n].TimeoutMs := StrToIntDef(Row.Values['timeout_ms'], 5000);
       ARoutes[n].ContentType := IfThen(Row.Values['content_type'] <> '', Row.Values['content_type'], 'text/html');
+      ARoutes[n].Allow := Row.Values['allow'];
+      ARoutes[n].Response := Row.Values['response'];
       ARoutes[n].Protocol := Protocol;
       ARoutes[n].InTopic := IfThen(Row.Values['in_topic'] <> '', Row.Values['in_topic'], Row.Values['id'] + '.in');
 
@@ -330,11 +382,153 @@ begin
             '] (timeout_ms=', ARoutes[n].TimeoutMs, ')');
         'bus-daemon':
           WriteLn('  CLI bridge "', Row.Values['id'], '" (bus-daemon): ', ARoutes[n].Prefix, ' -> in_topic="',
-            ARoutes[n].InTopic, '" (timeout_ms=', ARoutes[n].TimeoutMs, ')');
+            ARoutes[n].InTopic, '" (timeout_ms=', ARoutes[n].TimeoutMs, ') - consider moving this to http_routes.');
       else
         WriteLn('  CLI bridge "', Row.Values['id'], '" (cgi): ', ARoutes[n].Prefix, ' -> ',
           ARoutes[n].Command, ' ', ExpandFileName(ARoutes[n].ScriptDir), '/* (timeout_ms=', ARoutes[n].TimeoutMs, ')');
       end;
+    end;
+  finally
+    Rows.Free;
+  end;
+end;
+
+// http_routes: "this URL prefix publishes the request onto the bus topic
+// in_topic and returns whatever reply comes back". It is the bus-daemon shape
+// of a cli_bridges route with the extra fields that matter at the HTTP edge:
+//   id           names the route; also the default in_topic ("<id>.in"), so a
+//                route and a runner that share an id are wired together
+//   prefix       URL prefix (required)
+//   in_topic     bus topic the request envelope is published to
+//   allow        HTTP methods accepted, default "POST" (others get 405)
+//   timeout_ms   how long to wait for the reply, default 10000 (-> 504)
+//   content_type of a successful reply when the reply doesn't say, default text/plain
+//   response     "raw" (default: the reply's own status/body/content_type) or
+//                "json" (the whole reply envelope returned as application/json)
+procedure SetupHTTPRoutes(AConfig: TVDRX_Config; var ARoutes: TVDRX_CLIRoutes);
+var
+  Rows: TVDRX_ConfigRows;
+  Row: TStringList;
+  n: Integer;
+  Resp: string;
+begin
+  Rows := AConfig.GetObjectArray('http_routes');
+  try
+    for Row in Rows do
+    begin
+      if (Row.Values['id'] = '') or (Row.Values['prefix'] = '') then
+      begin
+        WriteLn('  Skipping http_routes entry - needs at least id and prefix.');
+        Continue;
+      end;
+      Resp := LowerCase(IfThen(Row.Values['response'] <> '', Row.Values['response'], 'raw'));
+      if (Resp <> 'raw') and (Resp <> 'json') then
+      begin
+        WriteLn('  http_routes entry "', Row.Values['id'], '": unrecognized response "', Resp, '" - using "raw".');
+        Resp := 'raw';
+      end;
+      n := Length(ARoutes);
+      SetLength(ARoutes, n + 1);
+      ARoutes[n].Protocol := 'bus-daemon';
+      ARoutes[n].Prefix := Row.Values['prefix'];
+      ARoutes[n].InTopic := IfThen(Row.Values['in_topic'] <> '', Row.Values['in_topic'], Row.Values['id'] + '.in');
+      ARoutes[n].Allow := IfThen(Row.Values['allow'] <> '', Row.Values['allow'], 'POST');
+      ARoutes[n].TimeoutMs := StrToIntDef(Row.Values['timeout_ms'], 10000);
+      ARoutes[n].ContentType := IfThen(Row.Values['content_type'] <> '', Row.Values['content_type'], 'text/plain');
+      ARoutes[n].Response := Resp;
+      WriteLn('  HTTP route "', Row.Values['id'], '": ', ARoutes[n].Allow, ' ', ARoutes[n].Prefix,
+        ' -> publish "', ARoutes[n].InTopic, '", await reply (timeout_ms=', ARoutes[n].TimeoutMs,
+        ', response=', Resp, ')');
+    end;
+  finally
+    Rows.Free;
+  end;
+end;
+
+// runners: run an ordinary command-line program once per bus message (see
+// vdrx_runner.pas). Config:
+//   id            required; defaults: subscribe "<id>.in", publish "<id>.out"
+//   command       required; the program (and any fixed leading arguments)
+//   args          optional array of further arguments; "%%name%%" is filled
+//                 from the message's params/query, "%%name?%%" if optional
+//   subscribe     topic(s) it listens on
+//   publish       where results go when the message has no reply_to
+//   stdin         "body" (default) or "none"
+//   exit_status   {"1": 422, "3": 400}: exit code -> reply status (else 500)
+//   timeout_ms    default 10000 (-> reply status 504, program killed)
+//   workers       programs allowed to run at once, default 2
+//   max_queue     waiting messages allowed, default 64 (-> reply status 503)
+//   content_type  of a successful reply, default text/plain
+//   script_dir    working directory for the program
+procedure SetupRunners(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry;
+  AGracefulMs: Integer);
+var
+  Rows: TVDRX_ConfigRows;
+  Row: TStringList;
+  Runner: TVDRX_RunnerExecutive;
+  Args: TStringList;
+  Filters: TStringArray;
+  ArgsJSON: TJSONData;
+  SubDesc, PubDesc: string;
+  i: Integer;
+begin
+  Rows := AConfig.GetObjectArray('runners');
+  try
+    for Row in Rows do
+    begin
+      if (Row.Values['id'] = '') or (Row.Values['command'] = '') then
+      begin
+        WriteLn('  Skipping runners entry - needs at least id and command.');
+        Continue;
+      end;
+      if (Row.Values['enabled'] = 'False') or (Row.Values['enabled'] = 'false') or (Row.Values['enabled'] = '0') then
+      begin
+        WriteLn('  Runner "', Row.Values['id'], '": disabled (enabled=false) - skipping.');
+        Continue;
+      end;
+
+      Runner := TVDRX_RunnerExecutive.Create(Kernel.Queue);
+      Runner.SetCommand(Row.Values['command']);
+      Args := TStringList.Create;
+      try
+        if Row.Values['args#json'] <> '' then
+        begin
+          try
+            ArgsJSON := GetJSON(Row.Values['args#json']);
+            try
+              if ArgsJSON is TJSONArray then
+                for i := 0 to TJSONArray(ArgsJSON).Count - 1 do
+                  Args.Add(TJSONArray(ArgsJSON).Items[i].AsString);
+            finally
+              ArgsJSON.Free;
+            end;
+          except
+            WriteLn('  Runner "', Row.Values['id'], '": "args" is not a valid JSON array - ignored.');
+          end;
+        end;
+        Runner.SetArgs(Args);
+      finally
+        Args.Free;
+      end;
+      Runner.StdinFromBody := LowerCase(IfThen(Row.Values['stdin'] <> '', Row.Values['stdin'], 'body')) <> 'none';
+      Runner.WorkDir := Row.Values['script_dir'];
+      Runner.TimeoutMs := StrToIntDef(Row.Values['timeout_ms'], 10000);
+      Runner.Workers := StrToIntDef(Row.Values['workers'], 2);
+      Runner.MaxQueue := StrToIntDef(Row.Values['max_queue'], 64);
+      Runner.GraceMs := AGracefulMs;
+      Runner.ContentType := IfThen(Row.Values['content_type'] <> '', Row.Values['content_type'], 'text/plain');
+      Runner.PublishTopic := IfThen(Row.Values['publish'] <> '', Row.Values['publish'], Row.Values['id'] + '.out');
+      Runner.SetExitStatus(ExitStatusToPairs(Row.Values['exit_status']));
+
+      SubDesc := IfThen(Row.Values['subscribe'] <> '', Row.Values['subscribe'], Row.Values['id'] + '.in');
+      Filters := SplitString(SubDesc, ',');
+      ARegistry.Register(Runner, Row.Values['id'], Trim(Filters[0]));
+      for i := 1 to High(Filters) do
+        ARegistry.Register(Runner, Row.Values['id'], Trim(Filters[i]));
+      PubDesc := Runner.PublishTopic;
+      WriteLn('  Runner "', Row.Values['id'], '": subscribe=', SubDesc, ', replies to reply_to or ', PubDesc,
+        ' (', Row.Values['command'], ', workers=', Runner.Workers, ', max_queue=', Runner.MaxQueue,
+        ', timeout_ms=', Runner.TimeoutMs, ')');
     end;
   finally
     Rows.Free;
@@ -376,19 +570,27 @@ var
   Filters: TStringArray;
   FilePath: string;
   MaxSizeMB, MaxFiles, EffectiveMaxFiles, i: Integer;
-  RotateSuffix: string;
+  RotateSuffix, BucketID, BucketTopics: string;
 begin
   Rows := AConfig.GetObjectArray('buckets');
   try
     for Row in Rows do
     begin
-      if (Row.Values['name'] = '') or (Row.Values['topics'] = '') then
+      // "id" + "subscribe" match every other executive; the older "name" +
+      // "topics" spellings are still accepted.
+      BucketID := IfThen(Row.Values['id'] <> '', Row.Values['id'], Row.Values['name']);
+      BucketTopics := IfThen(Row.Values['subscribe'] <> '', Row.Values['subscribe'], Row.Values['topics']);
+      if (Row.Values['id'] = '') and (Row.Values['name'] <> '') then
+        WriteLn('  Bucket "', BucketID, '": "name" is deprecated - rename it to "id".');
+      if (Row.Values['subscribe'] = '') and (Row.Values['topics'] <> '') then
+        WriteLn('  Bucket "', BucketID, '": "topics" is deprecated - rename it to "subscribe".');
+      if (BucketID = '') or (BucketTopics = '') then
       begin
-        WriteLn('  Skipping buckets entry - needs at least name and topics.');
+        WriteLn('  Skipping buckets entry - needs at least id and subscribe.');
         Continue;
       end;
       FilePath := IfThen(Row.Values['file'] <> '', Row.Values['file'],
-        'bucket_' + Row.Values['name'] + '.jsonl');
+        'bucket_' + BucketID + '.jsonl');
       // max_size_mb=0 (the default when omitted) keeps a bucket's original
       // unbounded-append behaviour; set it to enable rotation, optionally
       // paired with max_files (defaults to 5 rotated files) to cap total
@@ -396,10 +598,10 @@ begin
       MaxSizeMB := StrToIntDef(Row.Values['max_size_mb'], 0);
       MaxFiles := StrToIntDef(Row.Values['max_files'], 0);
       Bucket := TVDRX_BucketExecutive.Create(Kernel.Queue, FilePath, MaxSizeMB, MaxFiles);
-      Filters := SplitString(Row.Values['topics'], ',');
-      ARegistry.Register(Bucket, Row.Values['name'], Trim(Filters[0]));
+      Filters := SplitString(BucketTopics, ',');
+      ARegistry.Register(Bucket, BucketID, Trim(Filters[0]));
       for i := 1 to High(Filters) do
-        ARegistry.Register(Bucket, Row.Values['name'], Trim(Filters[i]));
+        ARegistry.Register(Bucket, BucketID, Trim(Filters[i]));
       if MaxSizeMB > 0 then
       begin
         if MaxFiles > 0 then EffectiveMaxFiles := MaxFiles else EffectiveMaxFiles := 5;
@@ -408,7 +610,7 @@ begin
       end
       else
         RotateSuffix := '';
-      WriteLn('  Bucket "', Row.Values['name'], '": ', Row.Values['topics'],
+      WriteLn('  Bucket "', BucketID, '": subscribe=', BucketTopics,
         ' -> ', FilePath, RotateSuffix);
     end;
   finally
@@ -497,12 +699,16 @@ begin
     InstallShutdownSignalHandler;
     Kernel := TVDRX_Kernel.Create;
     Config := TVDRX_Config.Create('vdrx.conf');
+    if not Config.Loaded then
+      raise Exception.Create('configuration errors in ' + ExpandFileName(Config.FilePath)
+        + LineEnding + Config.LastErrors);
 
     ApplyOpenSSLDLLOverrides(Config);
 
     ShutdownGraceMs := Config.GetInteger('shutdown_grace_ms', 5000);
 
-    Logger := TVDRX_LoggerExecutive.Create(Kernel.Queue, 'vdrx_daemon.log', lvlINFO);
+    Logger := TVDRX_LoggerExecutive.Create(Kernel.Queue, 'vdrx_daemon.log', lvlINFO,
+      Config.GetInteger('log_max_payload_bytes', 4096));
     Kernel.Registry.Register(Logger, 'logger', '>');
 
     Admin := TVDRX_AdminExecutive.Create(Kernel.Queue, Config, Kernel.Registry, Kernel);
@@ -527,6 +733,8 @@ begin
     SetupProcesses(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes);
     SetupSocketClients(Config, Kernel.Registry, ShutdownGraceMs);
     SetupCLIBridges(Config, CLIRoutes);
+    SetupHTTPRoutes(Config, CLIRoutes);
+    SetupRunners(Config, Kernel.Registry, ShutdownGraceMs);
     SetupTemplateExecutives(Config, Kernel.Registry);
     SetupBuckets(Config, Kernel.Registry);
 

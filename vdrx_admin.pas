@@ -304,12 +304,31 @@ begin
 end;
 
 procedure TVDRX_AdminExecutive.HandlePacket(const AMsg: TVDRX_Message);
+var
+  Errs: TStringList;
+  ErrIdx: Integer;
 begin
   if AMsg.Topic = 'sys.reload' then
   begin
-    FConfig.Reload;
-    FRegistry.ApplyAllConfigs;
-    Bus.Publish('log.info', 'Configuration reloaded successfully.', ID);
+    if FConfig.Reload then
+    begin
+      FRegistry.ApplyAllConfigs;
+      Bus.Publish('log.info', 'Configuration reloaded successfully.', ID);
+    end
+    else
+    begin
+      // Config.Reload leaves the previous (good) config in force when the new
+      // one is rejected, so there is nothing to re-apply.
+      Bus.Publish('log.error', 'admin: reload FAILED - keeping the existing configuration. Problems found:', ID);
+      Errs := TStringList.Create;
+      try
+        Errs.Text := FConfig.LastErrors;
+        for ErrIdx := 0 to Errs.Count - 1 do
+          Bus.Publish('log.error', '  ' + Errs[ErrIdx], ID);
+      finally
+        Errs.Free;
+      end;
+    end;
   end
   else if AMsg.Topic = 'sys.quit' then
   begin

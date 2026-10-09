@@ -8,8 +8,7 @@
       <Unit>
         <Filename Value="vdrx.lpr"/>
         <IsPartOfProject Value="True"/>
-        <IsVisibleTab Value="True"/>
-        <TopLine Value="494"/>
+        <TopLine Value="495"/>
         <CursorPos X="11" Y="511"/>
         <UsageCount Value="35"/>
         <Loaded Value="True"/>
@@ -44,10 +43,20 @@
         <Filename Value="vdrx_config.pas"/>
         <IsPartOfProject Value="True"/>
         <EditorIndex Value="7"/>
-        <TopLine Value="299"/>
-        <CursorPos X="51" Y="312"/>
+        <TopLine Value="41"/>
+        <CursorPos X="51" Y="40"/>
         <UsageCount Value="34"/>
         <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="jsonconf.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UsageCount Value="20"/>
+      </Unit>
+      <Unit>
+        <Filename Value="vdrx_runner.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UsageCount Value="20"/>
       </Unit>
       <Unit>
         <Filename Value="vdrx_admin.pas"/>
@@ -83,7 +92,10 @@
       <Unit>
         <Filename Value="vdrx_procutil.pas"/>
         <IsPartOfProject Value="True"/>
+        <IsVisibleTab Value="True"/>
         <EditorIndex Value="2"/>
+        <TopLine Value="98"/>
+        <CursorPos X="58" Y="106"/>
         <UsageCount Value="34"/>
         <Loaded Value="True"/>
       </Unit>
@@ -102,28 +114,21 @@
         <CursorPos X="54" Y="20"/>
         <UsageCount Value="10"/>
       </Unit>
+      <Unit>
+        <Filename Value="C:\lazarus\fpc\3.2.2\source\rtl\objpas\sysutils\osutilsh.inc"/>
+        <EditorIndex Value="-1"/>
+        <CursorPos X="10" Y="27"/>
+        <UsageCount Value="10"/>
+      </Unit>
+      <Unit>
+        <Filename Value="C:\lazarus\fpc\3.2.2\source\rtl\win\wininc\ascdef.inc"/>
+        <EditorIndex Value="-1"/>
+        <TopLine Value="58"/>
+        <CursorPos X="10" Y="75"/>
+        <UsageCount Value="10"/>
+      </Unit>
     </Units>
     <JumpHistory HistoryIndex="29">
-      <Position>
-        <Filename Value="vdrx.lpr"/>
-        <Caret Line="352" Column="15" TopLine="334"/>
-      </Position>
-      <Position>
-        <Filename Value="vdrx_network.pas"/>
-        <Caret Line="2372" Column="6" TopLine="2355"/>
-      </Position>
-      <Position>
-        <Filename Value="vdrx_network.pas"/>
-        <Caret Line="353" Column="15" TopLine="324"/>
-      </Position>
-      <Position>
-        <Filename Value="vdrx_network.pas"/>
-        <Caret Line="2176" Column="6" TopLine="2163"/>
-      </Position>
-      <Position>
-        <Filename Value="vdrx_network.pas"/>
-        <Caret Line="2372" Column="30" TopLine="2362"/>
-      </Position>
       <Position>
         <Filename Value="vdrx_network.pas"/>
         <Caret Line="2411" Column="46" TopLine="2391"/>
@@ -223,6 +228,26 @@
       <Position>
         <Filename Value="vdrx_core.pas"/>
         <Caret Line="73" Column="39" TopLine="55"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx.lpr"/>
+        <Caret Line="511" Column="11" TopLine="495"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_procutil.pas"/>
+        <Caret Line="115" Column="48" TopLine="99"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_network.pas"/>
+        <Caret Line="1068" Column="61" TopLine="58"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_procutil.pas"/>
+        <Caret Line="117" Column="61" TopLine="98"/>
+      </Position>
+      <Position>
+        <Filename Value="vdrx_network.pas"/>
+        <Caret Line="1068" Column="61" TopLine="58"/>
       </Position>
     </JumpHistory>
     <RunParams>
