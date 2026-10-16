@@ -60,7 +60,8 @@ This is really the whole practical question when you're building something:
 |---|---|---|
 | **Supervised process** (`processes`) | Long-running, restart-on-crash | A daemon that needs to react to bus events continuously - an IRC protocol handler, a game tick loop, a worker |
 | **Reverse-proxy route** (`processes` + `prefix`/`host`/`port`) | Long-running, has its own HTTP server | An existing web app/framework you don't want to rewrite - `php -S`, a Node server, anything that speaks HTTP itself |
-| **CGI-style CLI route** (`cli_bridges`, `protocol: "cgi"`) | Spawned fresh per HTTP request | A classic "one script = one URL" site, PHP/Python/whatever, using ordinary CGI env vars |
+| **CGI executive** (`cgi`) | Spawned fresh per HTTP request | A web-server-style site: `php-cgi`, Python, Perl, compiled `.cgi` programs serving a `doc_root` with static files, index files, rewrites and a front controller. The program is just a consumer of bus messages |
+| *(legacy)* CGI-style CLI route (`cli_bridges`, `protocol: "cgi"`) | Spawned fresh per HTTP request | A classic "one script = one URL" site, PHP/Python/whatever, using ordinary CGI env vars |
 | **Bus CLI route** (`cli_bridges`, `protocol: "bus"`) | Spawned fresh per HTTP request | An HTTP endpoint whose backend logic you want expressed as "read one JSON request, write one JSON reply" - language-agnostic |
 | **Bus-daemon route** (`cli_bridges`, `protocol: "bus-daemon"`) | Long-running, shared across every request | The same request/reply shape as above, but answered by an already-running `processes` subscriber instead of a fresh spawn each time - no per-request process-start cost |
 | **Template executive** (`templates`) | Long-running | Rendering a named template set (`.tpl` files + `%%params%%`/`##rows##`) reachable by topic name from anywhere - a bus-CLI reply, a persistent daemon, anything - rather than tied to one HTTP site's connection |
@@ -184,12 +185,94 @@ with its own static-file root and its own template store:
 }
 ```
 
-Requests are handled in this order: reverse-proxy routes (from `processes`
-entries with `prefix`), then `cli_bridges` routes, then static files under
-`static_dir`. `cli_bridges` is a *global* route table shared across every
-site - only `static_dir`/`template_dir` are per-site.
+Requests are handled in this order:
 
-### 4a. CGI-style routes (`protocol` omitted or `"cgi"`)
+1. **`rewrites`** - regex path rewrites / redirects (§4g).
+2. **Reverse-proxy routes** (from `processes` entries with `prefix`).
+3. **Bus routes** - `cgi` entries (§4a) and `http_routes` entries (§4e); the
+   longest matching prefix wins.
+4. **Static files** under the site's `static_dir`.
+
+The rewrite and route tables are *global*, shared across every site - only
+`static_dir`/`template_dir` are per-site.
+
+**One mechanism underneath.** Every bus route does the same thing: the HTTP
+edge publishes a JSON *request envelope* to the route's topic, waits for a
+reply on a freshly minted `reply_to` topic, and turns the *reply envelope*
+back into an HTTP response. A `cgi` executive, a runner, a supervised daemon
+or a WebSocket client are all just subscribers to that topic. (`cli_bridges`
+below is the old spelling of the same thing and is translated to it at
+startup.)
+
+Request envelope: `method, path, prefix, sub_path, query, request_uri` (the
+client's original URI, pre-rewrite)`, protocol, headers{}, body` (or
+`body_b64` when the body isn't valid UTF-8, e.g. an upload)`, remote_addr,
+remote_port, server_name, server_port, https, reply_to`; `cgi` routes add
+`script_name, script_filename, path_info, doc_root`.
+
+Reply envelope: `status, content_type, headers{}` (a value may be an array -
+several `Set-Cookie`)`, body` or `body_b64`, or `template/params/rows` to have
+a template rendered. `Content-Length`, `Transfer-Encoding` and `Connection`
+can't be set by a reply - the edge owns framing.
+
+### 4a. CGI executive - `cgi`
+
+VDRX as a basic web server. A `cgi` entry is an executive (`vdrx_cgi.pas`)
+*and* the route that feeds it:
+
+```json
+{
+  "id": "php",
+  "prefix": "/",
+  "doc_root": "C:/www/mysite",
+  "command": "{PHP_CGI_BIN_FILENAME}",
+  "args": ["%%script%%"],
+  "extensions": [".php"],
+  "index": ["index.php", "index.html"],
+  "fallback": "/index.php",
+  "env": { "APP_ENV": "dev" },
+  "timeout_ms": 30000,
+  "workers": 4
+}
+```
+
+(`PHP_CGI_BIN_FILENAME` is a variable in `vdrx.conf`: `{PHP_DIR}/php-cgi{EXE_EXT}`.)
+
+How a URL under `prefix` is resolved against `doc_root`, in order:
+an existing script (`/app/index.php/more/path` -> script plus
+`PATH_INFO=/more/path`) -> an existing plain file (served static) -> a
+directory's `index` file (`/sub` without the slash gets a 301 to `/sub/`)
+-> the `fallback` front controller (frameworks, pretty URLs; `REQUEST_URI`
+still holds what the client asked for) -> 404. Paths containing `..`, `:`,
+backslashes, dot-files (`.git`, `.env`; `.well-known` is allowed) or segments
+ending in `.`/space are refused with 403.
+
+The program is started from an argument vector (never a shell):
+`command` + `args`, with `%%script%%` replaced by the absolute script path -
+so the example above runs `php-cgi /www/mysite/index.php`. With `command` ""
+the script file is itself the executable (classic `cgi-bin`). Python is just
+`"command": "python3", "extensions": [".py"]`.
+
+It gets the full RFC 3875 environment - `GATEWAY_INTERFACE, SERVER_SOFTWARE,
+SERVER_PROTOCOL, SERVER_NAME, SERVER_PORT, REQUEST_METHOD, REQUEST_URI,
+SCRIPT_NAME, SCRIPT_FILENAME, DOCUMENT_ROOT, PATH_INFO, PATH_TRANSLATED,
+QUERY_STRING, REMOTE_ADDR, REMOTE_HOST, REMOTE_PORT, CONTENT_TYPE,
+CONTENT_LENGTH, HTTPS` (TLS only), `REDIRECT_STATUS`, `HTTP_*` for each
+request header (never `HTTP_PROXY` - httpoxy), plus `env` from the config -
+the body on stdin, and the script's directory as cwd. Because it is real CGI,
+`php-cgi` populates `$_GET`, `$_POST`, `$_COOKIE`, `$_FILES` and `$_SERVER`
+itself.
+
+Its stdout is parsed as a CGI response: header lines (`Status:`,
+`Content-Type:`, `Location:`, repeated `Set-Cookie:` ...), a blank line, the
+body. A `Location` without `Status` is a 302. No header block at all ->
+502. `"output": "raw"` skips the parsing (stdout is the body, status 200).
+A program over `timeout_ms` is killed -> 504; a full queue (`max_queue`) -> 503.
+
+> The old `cli_bridges` `protocol: "cgi"` is the same thing in its simplest
+> form and is now translated into a `cgi` entry with `output: "raw"`.
+
+### 4a-legacy. The old CGI-style `cli_bridges` route (`protocol` omitted or `"cgi"`)
 
 The classic shape: the URL path beyond `prefix` is resolved to a script
 file under `script_dir`, the interpreter (`command`) is run with that file
@@ -213,7 +296,7 @@ body verbatim.
 example reading the env vars directly with `getenv()` - since `command` is
 plain `php`, not `php-cgi`, `$_GET`/`$_SERVER` are **not** auto-populated).
 
-### 4b. Bus routes (`protocol: "bus"`)
+### 4b. Bus routes (`protocol: "bus"`) - legacy spelling of a runner in envelope mode
 
 The other shape, and the more interesting one: instead of a per-path file
 lookup, `command` is one fixed script/executable that handles *everything*
@@ -306,7 +389,7 @@ script that wants to log its own activity should write to a file, the same
 convention `scripts/irc_client.php` already follows for its bus-subscriber
 side.
 
-### 4c. Bus-daemon routes (`protocol: "bus-daemon"`)
+### 4c. Bus-daemon routes (`protocol: "bus-daemon"`) - legacy spelling of an `http_routes` entry
 
 The persistent-subscriber counterpart to §4b: same request/reply JSON
 shape, but nothing is spawned per request. Instead, the request is
@@ -445,6 +528,22 @@ is replaced with `?`). For a browser page on another origin, set `"cors": true`
 on the `http_sites` entry; those headers are added to every route response.
 
 ---
+
+### 4g. Rewrites - `rewrites`
+
+```json
+"rewrites": [
+  { "match": "^/blog/([0-9]+)/?$", "to": "/post.php?id=$1" },
+  { "match": "^/old-docs/(.*)$",   "to": "/docs/$1", "flag": "permanent" }
+]
+```
+
+`match` is a regular expression against the request path (no query); `to`
+replaces the whole target (`$1`, `$2` are the groups). A `?query` in `to`
+replaces the query string, otherwise the client's is kept. `flag`: `last`
+(default - first matching rule wins), `continue` (keep applying later rules),
+`redirect` (302), `permanent` (301). Rewrites run before every kind of route.
+A bad pattern is reported and skipped at startup.
 
 ### 4f. Config conventions - what `id`, `subscribe` and `publish` mean
 
@@ -673,7 +772,8 @@ live file, not rotated ones.
 | `vdrx_bucket.pas` | Append-only JSONL topic recorder (§6) |
 | `vdrx_templates.pas` | Template engine (`$$setting$$`/`??const??`/`%%var%%`/`##loop##`/`@@child@@`) and `TVDRX_TemplateExecutive`, the bus-reachable wrapper around it (§4d) |
 | `vdrx_network.pas` | Everything socket-facing: TLS/plain transport, the listener base class, `TVDRX_HTTPExecutive` (§4) including `TVDRX_OneShotWaiter`/`PublishAndWait` (the bus-daemon/template-topic reply-correlation primitive), `TVDRX_WebSocketExecutive` + `TVDRX_WSConnection`/`TVDRX_WSProtocolExecutive` (§5), `TVDRX_SocketClientExecutive` (§3) |
-| `vdrx_runner.pas` | `TVDRX_RunnerExecutive`: runs a CLI program per bus message, publishes the output (§4e) |
+| `vdrx_runner.pas` | `TVDRX_RunnerExecutive`: runs a CLI program per bus message, publishes the output (§4e); also the worker-pool base class of the CGI executive, and (envelope mode) the legacy `bus` cli_bridge |
+| `vdrx_cgi.pas` | `TVDRX_CGIExecutive`: RFC 3875 adaptor - request envelope in, CGI program run, reply envelope out (§4a) |
 | `vdrx.lpr` | Entry point - reads `vdrx.conf`, wires every executive above up from it |
 
 ---
@@ -699,6 +799,21 @@ scripts) resolve against that same working directory - see the gotcha in
 ---
 
 ## 9. Known gaps
+
+- HTTP is one request per connection (`Connection: close`): no keep-alive, no
+  chunked *request* bodies, no `Expect: 100-continue`, no Range/ETag/caching
+  headers on static files, no compression. Fine behind a real proxy or for
+  tools; not yet a front-line web server.
+- The route/rewrite tables, `cgi` entries and runners are read at startup;
+  `reload` only re-applies `http_sites` settings.
+- The logger records every bus message at INFO - which now includes whole HTTP
+  request envelopes (POST bodies, cookies). Don't point it at anything
+  sensitive without lowering `log_max_payload_bytes` or filtering `http.reply.*`
+  and `<id>.in` topics.
+- A TLS client that stalls mid-handshake blocks the TLS accept loop (the
+  handshake runs on the accept thread).
+- The reverse proxy adds no `X-Forwarded-*` headers.
+- CGI output is buffered whole (no streaming), and has no size cap.
 
 - No authentication on the `sys.*` admin surface, or on WebSocket
   (`sys.auth` accepts any non-empty token) - fine for a single-operator
@@ -727,7 +842,7 @@ scripts) resolve against that same working directory - see the gotcha in
   a `socket_servers` config section mirroring `socket_clients` but
   accepting connections would slot into the existing
   `TVDRX_SocketListenerExecutive` base class (already generic over
-  plain/TLS accept loops; `TVDRX_WebListenerExecutive`/`TVDRX_HTTPExecutive`/
+  plain/TLS accept loops; `TVDRX_HTTPExecutive`/
   `TVDRX_WebSocketExecutive` are all descendants of it) the same way
   `TVDRX_SocketClientExecutive` reuses the transport/framing code - not yet
   built.

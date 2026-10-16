@@ -1,0 +1,1 @@
+<?php header('Content-Type: text/plain'); echo json_encode($_POST) . "\n"; foreach ($_FILES as $k=>$f) echo "$k: {$f['name']} size={$f['size']} md5=" . md5_file($f['tmp_name']) . " err={$f['error']}\n";

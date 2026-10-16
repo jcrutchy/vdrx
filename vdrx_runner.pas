@@ -17,6 +17,9 @@ unit vdrx_runner;
 //                published to the message's reply_to if it has one, otherwise to
 //                the runner's own "publish" topic (default "<id>.out")
 //
+// (EnvelopeMode is the old spawn-per-request "bus" cli_bridges contract: whole
+// request envelope in as one JSON line, one JSON reply line out.)
+//
 // HandlePacket only queues the message; a small pool of worker threads does the
 // actual spawning, so a slow program never stalls the bus. If the queue is
 // full the message is answered immediately with status 503.
@@ -28,7 +31,7 @@ unit vdrx_runner;
 interface
 
 uses
-  Classes, SysUtils, SyncObjs, Process, fpjson, jsonparser, Generics.Collections,
+  Classes, SysUtils, StrUtils, SyncObjs, Process, fpjson, jsonparser, Generics.Collections,
   vdrx_core, vdrx_procutil;
 
 type
@@ -50,11 +53,17 @@ type
     FJobs: TVDRX_MessageList;
     FThreads: array of TThread;
     FStopping: Boolean;
+    FEnvelopeMode: Boolean;
     procedure WorkerLoop;
-    procedure Process(const AMsg: TVDRX_Message);
+    procedure ProcessEnvelope(const AMsg: TVDRX_Message);
+  protected
+    // One queued message, on a worker thread. CGI (vdrx_cgi.pas) overrides this.
+    procedure Process(const AMsg: TVDRX_Message); virtual;
     procedure Reply(const AReplyTo: string; AStatus: Integer; const AContentType, ABody, AStderr: string; AExitCode: Integer);
     function ExpandArgs(AParams: TStringList; ADest: TStrings; out AError: string): Boolean;
     function ReplyToOf(const APayload: string): string;
+    property CommandParts: TStringList read FCommandParts;
+    property ArgTemplates: TStringList read FArgTemplates;
   public
     constructor Create(ABus: TVDRX_MessageQueue); override;
     destructor Destroy; override;
@@ -65,6 +74,11 @@ type
     procedure SetCommand(const ACommandLine: string);
     procedure SetArgs(AArgs: TStrings);
     property StdinFromBody: Boolean read FStdinFromBody write FStdinFromBody;
+    // True = the legacy cli_bridges "bus" contract: the program gets the whole
+    // request envelope as ONE JSON line on stdin and answers with ONE JSON line
+    // on stdout (the first line starting with "{"), which is published verbatim
+    // as the reply. False (default) = ordinary CLI program (see header).
+    property EnvelopeMode: Boolean read FEnvelopeMode write FEnvelopeMode;
     property WorkDir: string read FWorkDir write FWorkDir;
     property TimeoutMs: Integer read FTimeoutMs write FTimeoutMs;
     property Workers: Integer read FWorkers write FWorkers;
@@ -80,77 +94,6 @@ implementation
 
 const
   MAX_PARAM_LEN = 1024;
-
-// Replace anything that isn't valid UTF-8 with '?' so the JSON reply is
-// always well-formed (program output is carried as a JSON string).
-function CleanUTF8(const S: string): string;
-var
-  i, n, need, j: Integer;
-  c: Byte;
-  ok: Boolean;
-begin
-  Result := '';
-  i := 1;
-  n := Length(S);
-  while i <= n do
-  begin
-    c := Byte(S[i]);
-    if c < $80 then begin Result := Result + S[i]; Inc(i); Continue; end;
-    if (c >= $C2) and (c <= $DF) then need := 1
-    else if (c >= $E0) and (c <= $EF) then need := 2
-    else if (c >= $F0) and (c <= $F4) then need := 3
-    else need := -1;
-    ok := (need > 0) and (i + need <= n);
-    if ok then
-      for j := 1 to need do
-        if (Byte(S[i + j]) and $C0) <> $80 then ok := False;
-    if ok then
-    begin
-      Result := Result + Copy(S, i, need + 1);
-      Inc(i, need + 1);
-    end
-    else
-    begin
-      Result := Result + '?';
-      Inc(i);
-    end;
-  end;
-end;
-
-function HexVal(C: Char): Integer;
-begin
-  case C of
-    '0'..'9': Result := Ord(C) - 48;
-    'a'..'f': Result := Ord(C) - 87;
-    'A'..'F': Result := Ord(C) - 55;
-  else
-    Result := -1;
-  end;
-end;
-
-function URLDecode(const S: string): string;
-var
-  i, H, L: Integer;
-begin
-  Result := '';
-  i := 1;
-  while i <= Length(S) do
-  begin
-    if (S[i] = '%') and (i + 2 <= Length(S)) then
-    begin
-      H := HexVal(S[i + 1]);
-      L := HexVal(S[i + 2]);
-      if (H >= 0) and (L >= 0) then
-      begin
-        Result := Result + Chr(H * 16 + L);
-        Inc(i, 3);
-        Continue;
-      end;
-    end;
-    if S[i] = '+' then Result := Result + ' ' else Result := Result + S[i];
-    Inc(i);
-  end;
-end;
 
 // "a=1&b=two%20words" -> params (later duplicates win)
 procedure ParseQuery(const AQuery: string; AParams: TStringList);
@@ -475,6 +418,11 @@ var
   RR: TVDRX_RunResult;
   Stdin: string;
 begin
+  if FEnvelopeMode then
+  begin
+    ProcessEnvelope(AMsg);
+    Exit;
+  end;
   Body := AMsg.Payload;
   ReplyTo := FPublishTopic;
   Query := '';
@@ -561,6 +509,64 @@ begin
   finally
     Args.Free;
     Params.Free;
+  end;
+end;
+
+procedure TVDRX_RunnerExecutive.ProcessEnvelope(const AMsg: TVDRX_Message);
+var
+  ReplyTo, Exe, SO, SE, ErrText, Line: string;
+  Args, Lines: TStringList;
+  Code, i: Integer;
+  RR: TVDRX_RunResult;
+begin
+  ReplyTo := ReplyToOf(AMsg.Payload);
+  if FCommandParts.Count = 0 then
+  begin
+    Reply(ReplyTo, 500, 'text/plain', 'Runner has no command configured', '', -1);
+    Exit;
+  end;
+  Exe := FCommandParts[0];
+  Args := TStringList.Create;
+  Lines := TStringList.Create;
+  try
+    for i := 1 to FCommandParts.Count - 1 do Args.Add(FCommandParts[i]);
+    RR := RunProgramCaptureArgs(Exe, Args, FWorkDir, AMsg.Payload + LineEnding, FTimeoutMs, Code, SO, SE, ErrText);
+    case RR of
+      rrStartFailed:
+        begin
+          Bus.Publish('log.error', 'runner ' + ID + ': failed to start "' + Exe + '": ' + ErrText, ID);
+          Reply(ReplyTo, 502, 'text/plain', 'Could not start script', '', -1);
+          Exit;
+        end;
+      rrTimedOut:
+        begin
+          Bus.Publish('log.error', 'runner ' + ID + ': "' + Exe + '" exceeded ' + IntToStr(FTimeoutMs) + 'ms, killed it', ID);
+          Reply(ReplyTo, 504, 'text/plain', 'Script timed out', '', -1);
+          Exit;
+        end;
+    end;
+    // a UTF-8 BOM (Windows scripts) and stray notices/warnings ahead of the
+    // reply must not corrupt it: take the first line that looks like JSON
+    if (Length(SO) >= 3) and (SO[1] = #$EF) and (SO[2] = #$BB) and (SO[3] = #$BF) then Delete(SO, 1, 3);
+    Lines.Text := SO;
+    Line := '';
+    for i := 0 to Lines.Count - 1 do
+      if Copy(TrimLeft(Lines[i]), 1, 1) = '{' then
+      begin
+        Line := Trim(Lines[i]);
+        Break;
+      end;
+    if Line = '' then
+    begin
+      Bus.Publish('log.warn', 'runner ' + ID + ': "' + Exe + '" produced no JSON reply line - stdout: ' + Copy(SO, 1, 300) +
+        IfThen(Trim(SE) <> '', ' stderr: ' + Copy(Trim(SE), 1, 300), ''), ID);
+      Reply(ReplyTo, 502, 'text/plain', IfThen(Trim(SO) = '', 'Empty response from script', 'Malformed response from script'), '', -1);
+      Exit;
+    end;
+    Bus.Publish(ReplyTo, Line, ID);
+  finally
+    Lines.Free;
+    Args.Free;
   end;
 end;
 

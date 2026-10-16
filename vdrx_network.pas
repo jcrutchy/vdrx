@@ -7,7 +7,7 @@ interface
 uses
   Classes, SysUtils, StrUtils, Sockets, SyncObjs, Process, vdrx_core,
   vdrx_config, vdrx_templates, vdrx_procutil, Generics.Collections,
-  openssl, resolve, {$IFDEF UNIX}BaseUnix,{$ENDIF} base64, sha1, fpjson, jsonparser, DateUtils;
+  openssl, resolve, {$IFDEF UNIX}BaseUnix,{$ENDIF} base64, sha1, fpjson, jsonparser, DateUtils, RegExpr;
 
 type
 
@@ -21,22 +21,59 @@ type
   end;
   TVDRX_ProxyRoutes = array of TVDRX_ProxyRoute;
 
-  TVDRX_CLIRoute = record
+  // One HTTP route onto the bus: requests under Prefix are published as a JSON
+  // envelope to InTopic and the reply that comes back becomes the HTTP response.
+  // Kind 'bus'  : publish straight away (http_routes; legacy bus-daemon routes).
+  // Kind 'cgi'  : first map the URL onto a script under DocRoot (index files,
+  //               PATH_INFO, front-controller Fallback, static files), then publish
+  //               with script_name/script_filename/path_info filled in (cgi entries).
+  TVDRX_BusRoute = record
+    ID: string;
+    Kind: string;
     Prefix: string;
-    Command: string;
-    ScriptDir: string;
-    TimeoutMs: Integer;
-    ContentType: string;
-    Protocol: string;
     InTopic: string;
-    // http_routes (bus-daemon shape) options
-    Allow: string;       // comma-separated HTTP methods accepted; '' = any
-    Response: string;    // 'raw' (default): use the reply's status/body/content_type; 'json': return the whole reply envelope as application/json
+    Allow: string;        // comma-separated HTTP methods accepted; '' = any
+    TimeoutMs: Integer;
+    ContentType: string;  // default for a reply that doesn't say
+    Response: string;     // 'raw' (default): use the reply's status/headers/body; 'json': hand back the whole envelope as application/json
+    // kind 'cgi' only
+    DocRoot: string;
+    Extensions: string;   // lower-case, wrapped in commas (',.php,.cgi,'); '' = every file is a script
+    IndexFiles: string;   // comma-separated, tried in order for a directory URL
+    Fallback: string;     // URL path (under Prefix) of a front-controller script, '' = none
+    Static: Boolean;      // serve non-script files from DocRoot directly
   end;
-  TVDRX_CLIRoutes = array of TVDRX_CLIRoute;
+  TVDRX_BusRoutes = array of TVDRX_BusRoute;
+
+  // "rewrites": regex on the request path -> new target (may carry ?query).
+  // Flag: 'last' (default, first match wins) | 'continue' | 'redirect' (302) | 'permanent' (301)
+  TVDRX_RewriteRule = record
+    Pattern: string;
+    Target: string;
+    Flag: string;
+  end;
+  TVDRX_RewriteRules = array of TVDRX_RewriteRule;
+
+  // Everything the HTTP edge consults, in the order it consults it.
+  TVDRX_RouteTable = record
+    Rewrites: TVDRX_RewriteRules;
+    Proxy: TVDRX_ProxyRoutes;
+    Bus: TVDRX_BusRoutes;
+  end;
+
+  // Facts about the connection a request arrived on (CGI wants REMOTE_ADDR etc.)
+  TVDRX_ConnInfo = record
+    RemoteAddr: string;
+    RemotePort: Word;
+    ServerPort: Word;
+    Secure: Boolean;
+  end;
 
   TVDRX_Transport = class
   public
+    PeerAddr: string;   // set by the accept loops (dotted IPv4)
+    PeerPort: Word;
+    Secure: Boolean;    // True for a TLS connection
     function Read(var ABuf; ALen: Integer): Integer; virtual; abstract;
     function Write(const ABuf; ALen: Integer): Integer; virtual; abstract;
     procedure Close; virtual; abstract;
@@ -152,37 +189,6 @@ type
     procedure Shutdown; override;
   end;
 
-  TVDRX_WebListenerExecutive = class(TVDRX_SocketListenerExecutive)
-  private
-    FWebSocket: TVDRX_WebSocketExecutive;
-    FTemplates: TVDRX_TemplateStore;
-    FConfig: TVDRX_Config;
-    FStaticDir: string;
-    FProxyRoutes: TVDRX_ProxyRoutes;
-    FCLIRoutes: TVDRX_CLIRoutes;
-  protected
-    procedure HandleConnection(ATransport: TVDRX_Transport); override;
-  public
-    constructor Create(ABus: TVDRX_MessageQueue;
-      AWebSocket: TVDRX_WebSocketExecutive; ATemplates: TVDRX_TemplateStore;
-      AConfig: TVDRX_Config; const AStaticDir: string; const AProxyRoutes: TVDRX_ProxyRoutes;
-      const ACLIRoutes: TVDRX_CLIRoutes); reintroduce;
-    procedure HandlePacket(const AMsg: TVDRX_Message); override;
-  end;
-
-  TCLIWatchdog = class
-  private
-    FProc: TProcess;
-    FTimeoutMs: Integer;
-    FCancelled: Boolean;
-    FFired: Boolean;
-  public
-    constructor Create(AProc: TProcess; ATimeoutMs: Integer);
-    procedure Run;
-    procedure Cancel;
-    property Fired: Boolean read FFired;
-  end;
-
   TVDRX_OneShotWaiter = class(TVDRX_Executive)
   private
     FEvent: TEvent;
@@ -200,8 +206,7 @@ type
     FConfig: TVDRX_Config;
     FTemplates: TVDRX_TemplateStore;
     FStaticDir: string;
-    FProxyRoutes: TVDRX_ProxyRoutes;
-    FCLIRoutes: TVDRX_CLIRoutes;
+    FRoutes: TVDRX_RouteTable;
     FRegistry: TVDRX_Registry;
     FCustomHeaders: TStringList;
   protected
@@ -209,15 +214,15 @@ type
   public
     constructor Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config;
       ATemplates: TVDRX_TemplateStore;
-      const AStaticDir: string; const AProxyRoutes: TVDRX_ProxyRoutes;
-      const ACLIRoutes: TVDRX_CLIRoutes; ARegistry: TVDRX_Registry); reintroduce;
+      const AStaticDir: string; const ARoutes: TVDRX_RouteTable;
+      ARegistry: TVDRX_Registry); reintroduce;
     destructor Destroy; override;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
     procedure ApplyConfig; override;
     property CustomHeaders: TStringList read FCustomHeaders;
     class function BuildResponse(const ARequest: string;
       ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
-      const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
+      const ARoutes: TVDRX_RouteTable; const AConn: TVDRX_ConnInfo;
       ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string;
       ACustomHeaders: TStringList = nil): string;
   end;
@@ -234,15 +239,15 @@ type
     FTemplates: TVDRX_TemplateStore;
     FConfig: TVDRX_Config;
     FStaticDir: string;
-    FProxyRoutes: TVDRX_ProxyRoutes;
-    FCLIRoutes: TVDRX_CLIRoutes;
+    FRoutes: TVDRX_RouteTable;
+    FConn: TVDRX_ConnInfo;
     FRegistry: TVDRX_Registry;
     FSourceID: string;
     FCustomHeaders: TStringList;
   public
     constructor Create(ABus: TVDRX_MessageQueue; ATransport: TVDRX_Transport;
       ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
-      const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
+      const ARoutes: TVDRX_RouteTable; const AConn: TVDRX_ConnInfo;
       ARegistry: TVDRX_Registry; const ASourceID: string;
       ACustomHeaders: TStringList = nil); reintroduce;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
@@ -408,33 +413,6 @@ begin
   end;
   Move(Bytes[0], AAddr, 4);
   Result := True;
-end;
-
-function ProcessFindInPath(const Exe: string): string;
-var
-  Paths: TStringList;
-  Dir: string;
-  Candidate: string;
-begin
-  Result := Exe;
-  if (Pos(PathDelim, Exe) > 0) or (Pos('/', Exe) > 0) then Exit;
-  Paths := TStringList.Create;
-  try
-    Paths.Delimiter := PathSeparator;
-    Paths.StrictDelimiter := True;
-    Paths.DelimitedText := GetEnvironmentVariable('PATH');
-    for Dir in Paths do
-    begin
-      Candidate := IncludeTrailingPathDelimiter(Dir) + Exe;
-      if FileExists(Candidate) then
-      begin
-        Result := Candidate;
-        Exit;
-      end;
-    end;
-  finally
-    Paths.Free;
-  end;
 end;
 
 function ConnectTCP(const AHost: string; APort: Word): TVDRX_Transport;
@@ -830,6 +808,7 @@ var
   AddrLen: TSockLen;
   ClientSock: TSocket;
   ConnThread: TVDRX_ListenerConnThread;
+  PlainT: TVDRX_PlainTransport;
 begin
   FPlainSocket := BindListenSocket(FPort);
   if FPlainSocket = -1 then
@@ -855,7 +834,10 @@ begin
         CloseSocket(ClientSock);
         Break;
       end;
-      ConnThread := TVDRX_ListenerConnThread.Create(Self, TVDRX_PlainTransport.Create(ClientSock));
+      PlainT := TVDRX_PlainTransport.Create(ClientSock);
+      PlainT.PeerAddr := NetAddrToStr(ClientAddr.sin_addr);
+      PlainT.PeerPort := ntohs(ClientAddr.sin_port);
+      ConnThread := TVDRX_ListenerConnThread.Create(Self, PlainT);
     finally
       FCriticalSection.Release;
     end;
@@ -899,6 +881,10 @@ begin
       Transport.Free;
       Continue;
     end;
+
+    Transport.PeerAddr := NetAddrToStr(ClientAddr.sin_addr);
+    Transport.PeerPort := ntohs(ClientAddr.sin_port);
+    Transport.Secure := True;
 
     FCriticalSection.Acquire;
     try
@@ -1037,80 +1023,6 @@ begin
 
   FTLSContext.Free;
   FTLSContext := nil;
-end;
-
-constructor TVDRX_WebListenerExecutive.Create(ABus: TVDRX_MessageQueue; AWebSocket: TVDRX_WebSocketExecutive;
-  ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
-  const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes);
-begin
-  inherited Create(ABus);
-  FWebSocket := AWebSocket;
-  FTemplates := ATemplates;
-  FConfig := AConfig;
-  FStaticDir := AStaticDir;
-  FProxyRoutes := AProxyRoutes;
-  FCLIRoutes := ACLIRoutes;
-  Port := 80;
-end;
-
-procedure TVDRX_WebListenerExecutive.HandleConnection(ATransport: TVDRX_Transport);
-var
-  Request: string;
-  Conn: TVDRX_HTTPConnection;
-begin
-  Request := ReadFullRequest(ATransport);
-  if Request = '' then
-  begin
-    ATransport.Close;
-    ATransport.Free;
-    Exit;
-  end;
-
-  if TVDRX_WSConnection.IsUpgradeRequest(Request) then
-    FWebSocket.AdoptConnection(ATransport, Request)
-  else
-  begin
-    Conn := TVDRX_HTTPConnection.Create(Bus, ATransport, FTemplates, FConfig, FStaticDir,
-      FProxyRoutes, FCLIRoutes, FWebSocket.Registry, ID);
-    try
-      Conn.Run(Request);
-    finally
-      Conn.Free;
-    end;
-  end;
-end;
-
-procedure TVDRX_WebListenerExecutive.HandlePacket(const AMsg: TVDRX_Message);
-begin
-end;
-
-constructor TCLIWatchdog.Create(AProc: TProcess; ATimeoutMs: Integer);
-begin
-  inherited Create;
-  FProc := AProc;
-  FTimeoutMs := ATimeoutMs;
-end;
-
-procedure TCLIWatchdog.Cancel;
-begin
-  FCancelled := True;
-end;
-
-procedure TCLIWatchdog.Run;
-var
-  Waited: Integer;
-begin
-  Waited := 0;
-  while (not FCancelled) and (Waited < FTimeoutMs) do
-  begin
-    Sleep(50);
-    Inc(Waited, 50);
-  end;
-  if (not FCancelled) and FProc.Running then
-  begin
-    FFired := True;
-    ForceKillProcess(FProc);
-  end;
 end;
 
 function PlainResponse(const AStatus, AContentType, ABody: string; ACustomHeaders: TStringList = nil): string;
@@ -1252,6 +1164,36 @@ begin
   end;
 end;
 
+// Maps a URL path (e.g. '/app/index.php') onto a directory, segment by segment.
+// Returns False for anything that could escape or hide something: "..", NUL,
+// backslashes, ':' (NTFS alternate data streams), dot-files (.git, .env ...;
+// ".well-known" is allowed) and segments ending in '.' or ' ' (Windows ignores
+// those, so "x.php." would serve a script's source as plain text).
+function SplitURLPath(const ARawPath: string; ASegs: TStrings): Boolean;
+var
+  Decoded, Seg: string;
+  p, q: Integer;
+begin
+  Result := False;
+  ASegs.Clear;
+  Decoded := URLDecode(ARawPath, False);
+  if (Pos(#0, Decoded) > 0) or (Pos('\', Decoded) > 0) or (Pos(':', Decoded) > 0) then Exit;
+  p := 1;
+  while p <= Length(Decoded) + 1 do
+  begin
+    q := PosEx('/', Decoded, p);
+    if q = 0 then q := Length(Decoded) + 1;
+    Seg := Copy(Decoded, p, q - p);
+    p := q + 1;
+    if (Seg = '') or (Seg = '.') then Continue;
+    if Seg = '..' then Exit;
+    if (Seg[1] = '.') and (Seg <> '.well-known') then Exit;
+    if Seg[Length(Seg)] in ['.', ' '] then Exit;
+    ASegs.Add(Seg);
+  end;
+  Result := True;
+end;
+
 function GuessContentType(const APath: string): string;
 var
   Ext: string;
@@ -1268,6 +1210,14 @@ begin
   else if Ext = '.json' then Result := 'application/json'
   else if Ext = '.svg' then Result := 'image/svg+xml'
   else if Ext = '.wasm' then Result := 'application/wasm'
+  else if (Ext = '.txt') or (Ext = '.log') or (Ext = '.md') then Result := 'text/plain; charset=utf-8'
+  else if Ext = '.xml' then Result := 'application/xml'
+  else if Ext = '.pdf' then Result := 'application/pdf'
+  else if Ext = '.woff2' then Result := 'font/woff2'
+  else if Ext = '.woff' then Result := 'font/woff'
+  else if Ext = '.map' then Result := 'application/json'
+  else if (Ext = '.mp4') or (Ext = '.m4v') then Result := 'video/mp4'
+  else if Ext = '.csv' then Result := 'text/csv'
   else Result := 'application/octet-stream';
 end;
 
@@ -1276,14 +1226,32 @@ function ServeStaticFile(const APath, AStaticDir: string; ABus: TVDRX_MessageQue
 var
   FilePath, Body: string;
   FS: TFileStream;
+  Segs: TStringList;
+  i: Integer;
+  Ok: Boolean;
 begin
   ABus.Publish('log.info', 'http: static path: "' + APath + '"', ASourceID);
-  if (AStaticDir = '') or (Pos('..', APath) > 0) or (APath = '') or (APath[1] <> '/') then
+  Ok := (AStaticDir <> '') and (APath <> '') and (APath[1] = '/');
+  FilePath := '';
+  if Ok then
+  begin
+    Segs := TStringList.Create;
+    try
+      Ok := SplitURLPath(APath, Segs);   // percent-decodes; refuses "..", dot-files, ':' etc.
+      if Ok then
+      begin
+        FilePath := ExcludeTrailingPathDelimiter(ExpandFileName(AStaticDir));
+        for i := 0 to Segs.Count - 1 do FilePath := FilePath + PathDelim + Segs[i];
+      end;
+    finally
+      Segs.Free;
+    end;
+  end;
+  if not Ok then
   begin
     ABus.Publish('log.warn', 'http: rejected static path "' + APath + '"', ASourceID);
     Exit(PlainResponse('404 Not Found', 'text/plain', 'Not found', ACustomHeaders));
   end;
-  FilePath := IncludeTrailingPathDelimiter(AStaticDir) + Copy(APath, 2, MaxInt);
   if (not FileExists(FilePath)) or DirectoryExists(FilePath) then
   begin
     ABus.Publish('log.warn', 'http: static file not found: ' + FilePath, ASourceID);
@@ -1298,7 +1266,7 @@ begin
     FS.Free;
   end;
   ABus.Publish('log.info', Format('http: served static %s (%d bytes)', [FilePath, Length(Body)]), ASourceID);
-  Result := PlainResponse('200 OK', GuessContentType(APath), Body, ACustomHeaders);
+  Result := PlainResponse('200 OK', GuessContentType(FilePath), Body, ACustomHeaders);
 end;
 
 function MatchProxyRoute(const APath: string; const ARoutes: TVDRX_ProxyRoutes; out AMatch: TVDRX_ProxyRoute): Boolean;
@@ -1386,7 +1354,7 @@ begin
   ABus.Publish('log.info', Format('http proxy: %s:%d -> %d bytes', [ARoute.Host, ARoute.Port, Length(Result)]), ASourceID);
 end;
 
-function MatchCLIRoute(const APath: string; const ARoutes: TVDRX_CLIRoutes; out AMatch: TVDRX_CLIRoute): Boolean;
+function MatchBusRoute(const APath: string; const ARoutes: TVDRX_BusRoutes; out AMatch: TVDRX_BusRoute): Boolean;
 var
   i, bestLen: Integer;
 begin
@@ -1401,87 +1369,251 @@ begin
     end;
 end;
 
-function ResolveScriptPath(const APath, APrefix, AScriptDir: string; out AScriptPath: string): Boolean;
+{ ---- request-line helpers + rewrites --------------------------------------- }
+
+// "HTTP/1.1" from "GET /x HTTP/1.1"
+function RequestVersion(const ARequest: string): string;
 var
-  Rel: string;
+  LineEnd, Sp1, Sp2: Integer;
+  Line: string;
 begin
-  Result := False;
-  Rel := Copy(APath, Length(APrefix) + 1, MaxInt);
-  if (Rel = '') or (Pos('..', Rel) > 0) then Exit;
-  AScriptPath := IncludeTrailingPathDelimiter(AScriptDir) + Rel;
-  Result := FileExists(AScriptPath);
+  Result := 'HTTP/1.1';
+  LineEnd := Pos(#13#10, ARequest);
+  if LineEnd = 0 then Exit;
+  Line := Copy(ARequest, 1, LineEnd - 1);
+  Sp1 := Pos(' ', Line);
+  if Sp1 = 0 then Exit;
+  Sp2 := PosEx(' ', Line, Sp1 + 1);
+  if Sp2 > 0 then Result := Trim(Copy(Line, Sp2 + 1, MaxInt));
 end;
 
-function RunCLIScript(const ARequest: string; const ARoute: TVDRX_CLIRoute;
-  ABus: TVDRX_MessageQueue; const ASourceID: string): string;
+// "/path?query" exactly as the client sent it
+function RequestTarget(const ARequest: string): string;
 var
-  Method, Path, ScriptPath, QueryString, HeaderBlock: string;
-  Proc: TProcess;
-  Watchdog: TCLIWatchdog;
-  WatchdogThread: TThread;
-  Buf: array[0..4095] of Byte;
-  Received, HdrEnd: Integer;
-  Output: string;
+  LineEnd, Sp1, Sp2: Integer;
+  Line: string;
 begin
+  Result := '';
+  LineEnd := Pos(#13#10, ARequest);
+  if LineEnd = 0 then LineEnd := Length(ARequest) + 1;
+  Line := Copy(ARequest, 1, LineEnd - 1);
+  Sp1 := Pos(' ', Line);
+  if Sp1 = 0 then Exit;
+  Sp2 := PosEx(' ', Line, Sp1 + 1);
+  if Sp2 = 0 then Sp2 := Length(Line) + 1;
+  Result := Copy(Line, Sp1 + 1, Sp2 - Sp1 - 1);
+end;
+
+function ReplaceRequestTarget(const ARequest, ANewTarget: string): string;
+var
+  LineEnd, Sp1: Integer;
+  Line: string;
+begin
+  LineEnd := Pos(#13#10, ARequest);
+  if LineEnd = 0 then Exit(ARequest);
+  Line := Copy(ARequest, 1, LineEnd - 1);
+  Sp1 := Pos(' ', Line);
+  if Sp1 = 0 then Exit(ARequest);
+  Result := Copy(Line, 1, Sp1) + ANewTarget + ' ' + RequestVersion(ARequest) + Copy(ARequest, LineEnd, MaxInt);
+end;
+
+// Runs the rewrite rules, in order, against the request path. A matching rule
+// replaces the whole target with its "to" (regex groups as $1, $2, ... - see
+// TRegExpr.Substitute); a "?query" in "to" replaces the query string, otherwise
+// the client's own query is kept. Returns True for a redirect rule (ALocation +
+// ARedirectStatus set); otherwise ANewRequest is the request to route (the
+// original one if nothing matched).
+function ApplyRewrites(const ARequest: string; const ARules: TVDRX_RewriteRules;
+  out ANewRequest, ALocation: string; out ARedirectStatus: Integer): Boolean;
+var
+  Method, Path, Query, NewTarget, Flag: string;
+  i, q: Integer;
+  Re: TRegExpr;
+  Matched, Changed: Boolean;
+begin
+  Result := False;
+  ANewRequest := ARequest;
+  ALocation := '';
+  ARedirectStatus := 0;
+  if Length(ARules) = 0 then Exit;
   ParseRequestLine(ARequest, Method, Path);
-  if not ResolveScriptPath(Path, ARoute.Prefix, ARoute.ScriptDir, ScriptPath) then
-  begin
-    ABus.Publish('log.warn', 'http cli: no script found for "' + Path + '" under ' + ARoute.ScriptDir, ASourceID);
-    Exit(PlainResponse('404 Not Found', 'text/plain', 'Not found'));
-  end;
-
-  QueryString := ExtractQueryString(ARequest);
-  HdrEnd := Pos(#13#10#13#10, ARequest);
-  if HdrEnd > 0 then HeaderBlock := Copy(ARequest, 1, HdrEnd - 1) else HeaderBlock := ARequest;
-
-  Proc := TProcess.Create(nil);
+  Query := ExtractQueryString(ARequest);
+  Changed := False;
+  Re := TRegExpr.Create;
   try
-    if FileExists(ARoute.Command) then
-      Proc.Executable := ARoute.Command
-    else
-      Proc.Executable := ProcessFindInPath(ARoute.Command);
-    Proc.Parameters.Add(ScriptPath);
-    Proc.Environment.Add('REQUEST_METHOD=' + Method);
-    Proc.Environment.Add('QUERY_STRING=' + QueryString);
-    Proc.Environment.Add('REQUEST_URI=' + Path + IfThen(QueryString <> '', '?' + QueryString, ''));
-    Proc.Environment.Add('CONTENT_TYPE=' + ExtractHeaderValue(HeaderBlock, 'Content-Type'));
-    Proc.Environment.Add('CONTENT_LENGTH=' + ExtractHeaderValue(HeaderBlock, 'Content-Length'));
-    Proc.Options := [poUsePipes, poStderrToOutPut];
-    Proc.Execute;
-
-    Watchdog := TCLIWatchdog.Create(Proc, ARoute.TimeoutMs);
-    WatchdogThread := TVDRX_WorkerThread.Create(@Watchdog.Run);
-    WatchdogThread.FreeOnTerminate := False;
-    WatchdogThread.Start;
-    try
-      Output := '';
-      repeat
-        Received := Proc.Output.Read(Buf[0], SizeOf(Buf));
-        if Received > 0 then
+    for i := 0 to High(ARules) do
+    begin
+      Matched := False;
+      NewTarget := '';
+      try
+        Re.Expression := ARules[i].Pattern;
+        if Re.Exec(Path) then
         begin
-          SetLength(Output, Length(Output) + Received);
-          Move(Buf[0], Output[Length(Output) - Received + 1], Received);
+          NewTarget := Re.Substitute(ARules[i].Target);
+          Matched := True;
         end;
-      until Received <= 0;
-
-      Watchdog.Cancel;
-      WaitThreadOrTimeout(WatchdogThread, 500);
-
-      if Watchdog.Fired then
-      begin
-        ABus.Publish('log.error', Format('http cli: %s exceeded %dms, killed it', [ScriptPath, ARoute.TimeoutMs]), ASourceID);
-        Exit(PlainResponse('504 Gateway Timeout', 'text/plain', 'Script timed out'));
+      except
+        // a bad pattern is reported once at startup (vdrx.lpr); skip it here
       end;
-    finally
-      WatchdogThread.Free;
-      Watchdog.Free;
+      if not Matched then Continue;
+      Changed := True;
+      q := Pos('?', NewTarget);
+      if q > 0 then
+      begin
+        Path := Copy(NewTarget, 1, q - 1);
+        Query := Copy(NewTarget, q + 1, MaxInt);
+      end
+      else
+        Path := NewTarget;
+      Flag := LowerCase(ARules[i].Flag);
+      if (Flag = 'redirect') or (Flag = 'permanent') then
+      begin
+        ALocation := Path + IfThen(Query <> '', '?' + Query, '');
+        if Flag = 'permanent' then ARedirectStatus := 301 else ARedirectStatus := 302;
+        Exit(True);
+      end;
+      if Flag <> 'continue' then Break;   // 'last' (default): first match wins
     end;
   finally
-    Proc.Free;
+    Re.Free;
+  end;
+  if Changed then
+    ANewRequest := ReplaceRequestTarget(ARequest, Path + IfThen(Query <> '', '?' + Query, ''));
+end;
+
+{ ---- mapping a URL onto a script under doc_root ----------------------------- }
+
+type
+  TCGIResolve = (crNotFound, crScript, crStatic, crRedirectSlash, crForbidden);
+
+function IsScriptExt(const ARoute: TVDRX_BusRoute; const AFileName: string): Boolean;
+begin
+  if ARoute.Extensions = '' then Exit(True);
+  Result := Pos(',' + LowerCase(ExtractFileExt(AFileName)) + ',', ARoute.Extensions) > 0;
+end;
+
+// "cgi" routes: decides what a request path means under the route's doc_root.
+//   crScript         AScriptFile / AScriptName / APathInfo are set (CGI meta-variables)
+//   crStatic         AStaticPath is the path (relative to the prefix) of a plain file
+//   crRedirectSlash  a directory requested without its trailing '/'
+//   crForbidden      the path tried something SplitURLPath refuses
+//   crNotFound
+// Order, like a conventional web server: existing script (anything after it is
+// PATH_INFO) -> existing plain file -> directory index file -> fallback script
+// (front controller, e.g. "/index.php") -> 404.
+function ResolveCGITarget(const APath: string; const ARoute: TVDRX_BusRoute;
+  out AScriptName, AScriptFile, APathInfo, AStaticPath: string): TCGIResolve;
+var
+  Base, Rel, Cur, Next, Cand, Idx: string;
+  Segs, Idxs, FSegs: TStringList;
+  i: Integer;
+  Missing: Boolean;
+
+  function JoinSegs(AFrom, ATo: Integer): string;
+  var
+    k: Integer;
+  begin
+    Result := '';
+    for k := AFrom to ATo do Result := Result + '/' + Segs[k];
   end;
 
-  ABus.Publish('log.info', Format('http cli: %s -> %d bytes', [ScriptPath, Length(Output)]), ASourceID);
-  Result := PlainResponse('200 OK', ARoute.ContentType, Output);
+begin
+  Result := crNotFound;
+  AScriptName := '';
+  AScriptFile := '';
+  APathInfo := '';
+  AStaticPath := '';
+  Base := ARoute.Prefix;
+  while (Base <> '') and (Base[Length(Base)] = '/') do SetLength(Base, Length(Base) - 1);
+  Rel := Copy(APath, Length(Base) + 1, MaxInt);
+  if (Rel <> '') and (Rel[1] <> '/') then Exit;   // prefix "/app" also matched "/apple"
+  if Rel = '' then Rel := '/';
+
+  Segs := TStringList.Create;
+  Idxs := TStringList.Create;
+  FSegs := TStringList.Create;
+  try
+    if not SplitURLPath(Rel, Segs) then Exit(crForbidden);
+    Cur := ExcludeTrailingPathDelimiter(ExpandFileName(ARoute.DocRoot));
+    Missing := False;
+    for i := 0 to Segs.Count - 1 do
+    begin
+      Next := Cur + PathDelim + Segs[i];
+      if DirectoryExists(Next) then
+      begin
+        Cur := Next;
+        Continue;
+      end;
+      if FileExists(Next) then
+      begin
+        if IsScriptExt(ARoute, Next) then
+        begin
+          AScriptFile := Next;
+          AScriptName := Base + JoinSegs(0, i);
+          if i < Segs.Count - 1 then APathInfo := JoinSegs(i + 1, Segs.Count - 1);
+          Exit(crScript);
+        end;
+        if ARoute.Static and (i = Segs.Count - 1) then
+        begin
+          AStaticPath := Rel;
+          Exit(crStatic);
+        end;
+      end;
+      Missing := True;
+      Break;
+    end;
+
+    if not Missing then
+    begin
+      // the whole path is a directory (or the root)
+      if (Rel <> '/') and (Rel[Length(Rel)] <> '/') then Exit(crRedirectSlash);
+      Idxs.CommaText := ARoute.IndexFiles;
+      for i := 0 to Idxs.Count - 1 do
+      begin
+        Idx := Trim(Idxs[i]);
+        if (Idx = '') or (Pos('/', Idx) > 0) or (Pos('\', Idx) > 0) or (Pos('..', Idx) > 0) then Continue;
+        Cand := Cur + PathDelim + Idx;
+        if not FileExists(Cand) then Continue;
+        if IsScriptExt(ARoute, Cand) then
+        begin
+          AScriptFile := Cand;
+          AScriptName := Base + JoinSegs(0, Segs.Count - 1) + '/' + Idx;
+          Exit(crScript);
+        end;
+        if ARoute.Static then
+        begin
+          AStaticPath := Rel + Idx;
+          Exit(crStatic);
+        end;
+      end;
+    end;
+
+    // front controller: everything that matched nothing goes to one script
+    if ARoute.Fallback <> '' then
+    begin
+      Cand := ExcludeTrailingPathDelimiter(ExpandFileName(ARoute.DocRoot));
+      if SplitURLPath(ARoute.Fallback, FSegs) and (FSegs.Count > 0) then
+      begin
+        Next := '';
+        for i := 0 to FSegs.Count - 1 do
+        begin
+          Cand := Cand + PathDelim + FSegs[i];
+          Next := Next + '/' + FSegs[i];
+        end;
+        if FileExists(Cand) then
+        begin
+          AScriptFile := Cand;
+          AScriptName := Base + Next;
+          APathInfo := '';
+          Exit(crScript);
+        end;
+      end;
+    end;
+  finally
+    FSegs.Free;
+    Idxs.Free;
+    Segs.Free;
+  end;
 end;
 
 function HTTPStatusText(ACode: Integer): string;
@@ -1495,13 +1627,22 @@ begin
     303: Result := 'See Other';
     304: Result := 'Not Modified';
     307: Result := 'Temporary Redirect';
+    308: Result := 'Permanent Redirect';
     400: Result := 'Bad Request';
     401: Result := 'Unauthorized';
     403: Result := 'Forbidden';
     404: Result := 'Not Found';
     405: Result := 'Method Not Allowed';
+    409: Result := 'Conflict';
+    410: Result := 'Gone';
+    413: Result := 'Payload Too Large';
+    415: Result := 'Unsupported Media Type';
+    422: Result := 'Unprocessable Content';
+    429: Result := 'Too Many Requests';
     500: Result := 'Internal Server Error';
+    501: Result := 'Not Implemented';
     502: Result := 'Bad Gateway';
+    503: Result := 'Service Unavailable';
     504: Result := 'Gateway Timeout';
   else
     if (ACode >= 200) and (ACode < 300) then Result := 'OK'
@@ -1538,7 +1679,14 @@ begin
         Name := Trim(Copy(SL[i], 1, Colon - 1));
         Value := Trim(Copy(SL[i], Colon + 1, MaxInt));
         if Name <> '' then
-          Result.Strings[Name] := Value;
+        begin
+          // a repeated header is folded into one comma-separated value
+          // (RFC 9110 5.3; Cookie uses "; ")
+          if Assigned(Result.Find(Name)) then
+            Result.Strings[Name] := Result.Strings[Name] + IfThen(SameText(Name, 'Cookie'), '; ', ', ') + CleanUTF8(Value)
+          else
+            Result.Strings[Name] := CleanUTF8(Value);
+        end;
       end;
     end;
   finally
@@ -1621,14 +1769,19 @@ begin
     ABus.Publish('log.warn', Format('bus wait: no reply on "%s" (published to "%s") within %dms', [ReplyTopic, AInTopic, ATimeoutMs]), ASourceID);
 end;
 
-function BuildBusCLIResponse(const AReplyLine, ADefaultContentType: string;
+// Turns a reply envelope into a complete HTTP response:
+//   { "status": 200, "content_type": "...", "body" | "body_b64": "...",
+//     "headers": { "Name": "value" | ["v1", "v2"] } }
+// or, instead of a body, { "template", "params", "rows" [, "template_topic"] }
+// to have the reply rendered by the template engine.
+function BuildReplyResponse(const AReplyLine, ADefaultContentType: string;
   ATemplates: TVDRX_TemplateStore; ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string): string;
 var
   J: TJSONData;
   Obj, ParamsObj, RowsObj, HeadersObj, RenderEnvelope, ReplyObj: TJSONObject;
   ReplyJSON: TJSONData;
-  Status, ContentType, Body, TemplateName, TemplateTopic, ReplyRaw: string;
-  StatusCode, i: Integer;
+  Status, ContentType, Body, TemplateName, TemplateTopic, ReplyRaw, Extra, HName: string;
+  StatusCode, i, k: Integer;
   Params: TStringList;
   NamedRows: TVDRX_TemplateNamedRows;
 begin
@@ -1709,147 +1862,137 @@ begin
       if Body = '' then
         ABus.Publish('log.warn', Format('http bus cli: template "%s" not found or rendered empty - looked for %s', [TemplateName, IncludeTrailingPathDelimiter(ATemplates.Dir) + TemplateName + '.tpl']), ASourceID);
     end
+    else if Obj.Find('body_b64') is TJSONString then
+    begin
+      try
+        Body := DecodeStringBase64(Obj.Get('body_b64', ''));
+      except
+        ABus.Publish('log.warn', 'http reply: body_b64 is not valid base64', ASourceID);
+        Exit(PlainResponse('502 Bad Gateway', 'text/plain', 'Malformed response body'));
+      end;
+    end
     else
       Body := Obj.Get('body', '');
 
-    Result := 'HTTP/1.1 ' + Status + #13#10 + 'Content-Type: ' + ContentType + #13#10;
-
+    // Extra headers. Several lines of one name (Set-Cookie) arrive as an array.
+    // The edge owns framing, so a reply can't set Content-Length, Transfer-Encoding
+    // or Connection; a Content-Type in "headers" overrides "content_type".
+    Extra := '';
     HeadersObj := FindJSONObject(Obj, 'headers');
     if Assigned(HeadersObj) then
       for i := 0 to HeadersObj.Count - 1 do
+      begin
+        HName := HeadersObj.Names[i];
+        if SameText(HName, 'Content-Length') or SameText(HName, 'Transfer-Encoding') or SameText(HName, 'Connection') then Continue;
+        if (HName = '') or (Pos(':', HName) > 0) or (Pos(#13, HName) > 0) or (Pos(#10, HName) > 0) then Continue;
         if HeadersObj.Items[i].JSONType in [jtString, jtNumber, jtBoolean] then
-          Result := Result + HeadersObj.Names[i] + ': ' + HeadersObj.Items[i].AsString + #13#10;
+        begin
+          if SameText(HName, 'Content-Type') then
+            ContentType := HeadersObj.Items[i].AsString
+          else
+            Extra := Extra + HName + ': ' + StringReplace(StringReplace(HeadersObj.Items[i].AsString, #13, ' ', [rfReplaceAll]), #10, ' ', [rfReplaceAll]) + #13#10;
+        end
+        else if HeadersObj.Items[i].JSONType = jtArray then
+          for k := 0 to TJSONArray(HeadersObj.Items[i]).Count - 1 do
+            Extra := Extra + HName + ': ' + StringReplace(StringReplace(TJSONArray(HeadersObj.Items[i]).Items[k].AsString, #13, ' ', [rfReplaceAll]), #10, ' ', [rfReplaceAll]) + #13#10;
+      end;
 
-    Result := Result + 'Content-Length: ' + IntToStr(Length(Body)) + #13#10#13#10 + Body;
+    Result := 'HTTP/1.1 ' + Status + #13#10 + 'Content-Type: ' + ContentType + #13#10 + Extra +
+      'Content-Length: ' + IntToStr(Length(Body)) + #13#10#13#10 + Body;
   finally
     Obj.Free;
   end;
 end;
 
-function RunBusCLIScript(const ARequest: string; const ARoute: TVDRX_CLIRoute;
-  ATemplates: TVDRX_TemplateStore; ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string): string;
+function RedirectResponse(ACode: Integer; const ALocation: string; ACustomHeaders: TStringList): string;
 var
-  Method, Path, SubPath, QueryString, HeaderBlock, Body, ReqLine, Output, FirstLine: string;
-  HeaderEnd: Integer;
-  ReqObj: TJSONObject;
-  Proc: TProcess;
-  Watchdog: TCLIWatchdog;
-  WatchdogThread: TThread;
-  Buf: array[0..4095] of Byte;
-  Received, i: Integer;
-  Cwd: string;
+  H: TStringList;
+begin
+  H := TStringList.Create;
+  try
+    H.Add('Location=' + ALocation);
+    if Assigned(ACustomHeaders) then H.AddStrings(ACustomHeaders);
+    Result := PlainResponse(IntToStr(ACode) + ' ' + HTTPStatusText(ACode), 'text/plain', 'Redirecting to ' + ALocation, H);
+  finally
+    H.Free;
+  end;
+end;
+
+// The request envelope every bus route publishes (documented in readme "HTTP").
+function BuildEnvelope(const ARequest, AOrigTarget: string; const ARoute: TVDRX_BusRoute;
+  const AConn: TVDRX_ConnInfo; const AScriptName, AScriptFile, APathInfo: string): TJSONObject;
+var
+  Method, Path, HeaderBlock, Body, Host, SubPath: string;
+  HeaderEnd, p: Integer;
+  HeadersObj: TJSONObject;
 begin
   ParseRequestLine(ARequest, Method, Path);
-  QueryString := ExtractQueryString(ARequest);
   HeaderEnd := Pos(#13#10#13#10, ARequest);
   if HeaderEnd > 0 then HeaderBlock := Copy(ARequest, 1, HeaderEnd - 1) else HeaderBlock := ARequest;
   Body := ExtractBody(ARequest);
-
   if Length(Path) >= Length(ARoute.Prefix) then
     SubPath := Copy(Path, Length(ARoute.Prefix) + 1, MaxInt)
   else
     SubPath := '';
 
-  ReqObj := TJSONObject.Create;
-  try
-    ReqObj.Add('method', Method);
-    ReqObj.Add('path', Path);
-    ReqObj.Add('prefix', ARoute.Prefix);
-    ReqObj.Add('sub_path', SubPath);
-    ReqObj.Add('query', QueryString);
-    ReqObj.Add('headers', HeadersToJSON(HeaderBlock));
-    ReqObj.Add('body', Body);
-    ReqLine := ReqObj.AsJSON + LineEnding;
-  finally
-    ReqObj.Free;
+  // Host header without its port ("[::1]:8080" -> "[::1]", "a.com:80" -> "a.com")
+  Host := ExtractHeaderValue(HeaderBlock, 'Host');
+  if (Host <> '') and (Host[1] = '[') then
+  begin
+    p := Pos(']', Host);
+    if p > 0 then Host := Copy(Host, 1, p);
+  end
+  else
+  begin
+    p := Pos(':', Host);
+    if p > 0 then Host := Copy(Host, 1, p - 1);
   end;
+  if Host = '' then Host := 'localhost';
 
-  Proc := TProcess.Create(nil);
-  try
-    {$WARN SYMBOL_DEPRECATED OFF}
-    Proc.CommandLine := ARoute.Command;
-    {$WARN SYMBOL_DEPRECATED ON}
-    Cwd := ExpandFileName(IfThen(ARoute.ScriptDir <> '', ARoute.ScriptDir, GetCurrentDir));
-    Proc.CurrentDirectory := Cwd;
-    Proc.Options := [poUsePipes, poStderrToOutPut];
-    try
-      Proc.Execute;
-    except
-      on E: Exception do
-      begin
-        ABus.Publish('log.error', Format('http bus cli: failed to start "%s" (cwd=%s) - %s', [ARoute.Command, Cwd, E.Message]), ASourceID);
-        Exit(PlainResponse('502 Bad Gateway', 'text/plain', 'Could not start script'));
-      end;
-    end;
-
-    Proc.Input.Write(ReqLine[1], Length(ReqLine));
-    try Proc.CloseInput; except end;
-
-    Watchdog := TCLIWatchdog.Create(Proc, ARoute.TimeoutMs);
-    WatchdogThread := TVDRX_WorkerThread.Create(@Watchdog.Run);
-    WatchdogThread.FreeOnTerminate := False;
-    WatchdogThread.Start;
-    try
-      Output := '';
-      repeat
-        Received := Proc.Output.Read(Buf[0], SizeOf(Buf));
-        if Received > 0 then
-        begin
-          SetLength(Output, Length(Output) + Received);
-          Move(Buf[0], Output[Length(Output) - Received + 1], Received);
-        end;
-      until Received <= 0;
-
-      Watchdog.Cancel;
-      WaitThreadOrTimeout(WatchdogThread, 500);
-
-      if Watchdog.Fired then
-      begin
-        ABus.Publish('log.error', Format('http bus cli: %s (cwd=%s) exceeded %dms, killed it', [ARoute.Command, Cwd, ARoute.TimeoutMs]), ASourceID);
-        Exit(PlainResponse('504 Gateway Timeout', 'text/plain', 'Script timed out'));
-      end;
-    finally
-      WatchdogThread.Free;
-      Watchdog.Free;
-    end;
-  finally
-    Proc.Free;
+  Result := TJSONObject.Create;
+  Result.Add('method', Method);
+  Result.Add('path', CleanUTF8(Path));
+  Result.Add('prefix', ARoute.Prefix);
+  Result.Add('sub_path', CleanUTF8(SubPath));
+  Result.Add('query', CleanUTF8(ExtractQueryString(ARequest)));
+  Result.Add('request_uri', CleanUTF8(AOrigTarget));
+  Result.Add('protocol', RequestVersion(ARequest));
+  HeadersObj := HeadersToJSON(HeaderBlock);
+  Result.Add('headers', HeadersObj);
+  // JSON strings must be UTF-8; a binary body (file upload ...) travels as base64
+  if IsValidUTF8(Body) then
+    Result.Add('body', Body)
+  else
+    Result.Add('body_b64', EncodeStringBase64(Body));
+  Result.Add('remote_addr', AConn.RemoteAddr);
+  Result.Add('remote_port', Integer(AConn.RemotePort));
+  Result.Add('server_name', Host);
+  Result.Add('server_port', Integer(AConn.ServerPort));
+  Result.Add('https', AConn.Secure);
+  if SameText(ARoute.Kind, 'cgi') then
+  begin
+    Result.Add('script_name', CleanUTF8(AScriptName));
+    Result.Add('script_filename', AScriptFile);
+    Result.Add('path_info', CleanUTF8(APathInfo));
+    Result.Add('doc_root', ExcludeTrailingPathDelimiter(ExpandFileName(ARoute.DocRoot)));
   end;
-
-  if (Length(Output) >= 3) and (Output[1] = #$EF) and (Output[2] = #$BB) and (Output[3] = #$BF) then
-    Delete(Output, 1, 3);
-
-  FirstLine := '';
-  with TStringList.Create do
-  try
-    Text := Output;
-    for i := 0 to Count - 1 do
-    begin
-      if Copy(TrimLeft(Strings[i]), 1, 1) = '{' then
-      begin
-        FirstLine := Trim(Strings[i]);
-        Break;
-      end;
-    end;
-    if (FirstLine = '') and (Count > 0) then
-      ABus.Publish('log.warn', Format('http bus cli: %s (cwd=%s) produced no line starting with "{" - raw output: %s', [ARoute.Command, Cwd, Output]), ASourceID);
-  finally
-    Free;
-  end;
-
-  ABus.Publish('log.info', Format('http bus cli: %s %s (sub_path="%s", cwd=%s) -> %d bytes', [ARoute.Command, Path, SubPath, Cwd, Length(Output)]), ASourceID);
-  Result := BuildBusCLIResponse(FirstLine, ARoute.ContentType, ATemplates, ABus, ARegistry, ASourceID);
 end;
 
-function RunBusDaemonRoute(const ARequest: string; const ARoute: TVDRX_CLIRoute;
-  ATemplates: TVDRX_TemplateStore; ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string): string;
+// The ONE way an HTTP request reaches code behind the bus: publish the request
+// envelope to the route's in_topic, wait for a reply on a freshly minted
+// reply_to topic, turn the reply back into an HTTP response. Whatever
+// subscribes - a runner, a cgi executive, a supervised daemon, a WebSocket
+// client - is just a consumer.
+function RunBusRoute(const ARequest, AOrigTarget: string; const ARoute: TVDRX_BusRoute;
+  const AConn: TVDRX_ConnInfo; const AScriptName, AScriptFile, APathInfo: string;
+  ATemplates: TVDRX_TemplateStore; ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry;
+  const ASourceID: string): string;
 var
-  Method, Path, SubPath, QueryString, HeaderBlock, Body, ReplyRaw: string;
-  HeaderEnd: Integer;
-  ReqObj: TJSONObject;
+  Method, Path, ReplyRaw: string;
+  Env: TJSONObject;
   AllowHdrs: TStringList;
   ReplyJ: TJSONData;
-  RStatus: Integer;
+  RStatus, WaitMs: Integer;
 begin
   ParseRequestLine(ARequest, Method, Path);
   if ARoute.Allow <> '' then
@@ -1863,36 +2006,23 @@ begin
         AllowHdrs.Free;
       end;
     end;
-  QueryString := ExtractQueryString(ARequest);
-  HeaderEnd := Pos(#13#10#13#10, ARequest);
-  if HeaderEnd > 0 then HeaderBlock := Copy(ARequest, 1, HeaderEnd - 1) else HeaderBlock := ARequest;
-  Body := ExtractBody(ARequest);
 
-  if Length(Path) >= Length(ARoute.Prefix) then
-    SubPath := Copy(Path, Length(ARoute.Prefix) + 1, MaxInt)
-  else
-    SubPath := '';
-
-  ReqObj := TJSONObject.Create;
+  Env := BuildEnvelope(ARequest, AOrigTarget, ARoute, AConn, AScriptName, AScriptFile, APathInfo);
   try
-    ReqObj.Add('method', Method);
-    ReqObj.Add('path', Path);
-    ReqObj.Add('prefix', ARoute.Prefix);
-    ReqObj.Add('sub_path', SubPath);
-    ReqObj.Add('query', QueryString);
-    ReqObj.Add('headers', HeadersToJSON(HeaderBlock));
-    ReqObj.Add('body', Body);
-
-    if not PublishAndWait(ARegistry, ABus, ARoute.InTopic, 'http.reply', ReqObj, ARoute.TimeoutMs, ASourceID, ReplyRaw) then
+    WaitMs := ARoute.TimeoutMs;
+    // the cgi executive kills a runaway program at timeout_ms and answers 504
+    // itself; give that reply time to arrive before the edge gives up
+    if SameText(ARoute.Kind, 'cgi') then Inc(WaitMs, 5000);
+    if not PublishAndWait(ARegistry, ABus, ARoute.InTopic, 'http.reply', Env, WaitMs, ASourceID, ReplyRaw) then
     begin
-      ABus.Publish('log.error', Format('http bus-daemon: no subscriber on "%s" answered %s within %dms', [ARoute.InTopic, Path, ARoute.TimeoutMs]), ASourceID);
-      Exit(PlainResponse('504 Gateway Timeout', 'text/plain', 'No daemon answered in time'));
+      ABus.Publish('log.error', Format('http route "%s": no subscriber on "%s" answered %s within %dms', [ARoute.ID, ARoute.InTopic, Path, WaitMs]), ASourceID);
+      Exit(PlainResponse('504 Gateway Timeout', 'text/plain', 'No handler answered in time'));
     end;
   finally
-    ReqObj.Free;
+    Env.Free;
   end;
 
-  ABus.Publish('log.info', Format('http bus-daemon: %s %s (in_topic=%s) -> %d bytes', [Method, Path, ARoute.InTopic, Length(ReplyRaw)]), ASourceID);
+  ABus.Publish('log.info', Format('http route "%s": %s %s (in_topic=%s) -> %d bytes', [ARoute.ID, Method, Path, ARoute.InTopic, Length(ReplyRaw)]), ASourceID);
   if SameText(ARoute.Response, 'json') then
   begin
     // hand the browser the whole reply envelope as JSON (status, body,
@@ -1911,19 +2041,18 @@ begin
     end;
     Exit(PlainResponse(IntToStr(RStatus) + ' ' + HTTPStatusText(RStatus), 'application/json', ReplyRaw));
   end;
-  Result := BuildBusCLIResponse(ReplyRaw, ARoute.ContentType, ATemplates, ABus, ARegistry, ASourceID);
+  Result := BuildReplyResponse(ReplyRaw, ARoute.ContentType, ATemplates, ABus, ARegistry, ASourceID);
 end;
 
 constructor TVDRX_HTTPExecutive.Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config; ATemplates: TVDRX_TemplateStore;
-  const AStaticDir: string; const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
+  const AStaticDir: string; const ARoutes: TVDRX_RouteTable;
   ARegistry: TVDRX_Registry);
 begin
   inherited Create(ABus);
   FConfig := AConfig;
   FTemplates := ATemplates;
   FStaticDir := AStaticDir;
-  FProxyRoutes := AProxyRoutes;
-  FCLIRoutes := ACLIRoutes;
+  FRoutes := ARoutes;
   FRegistry := ARegistry;
   FCustomHeaders := TStringList.Create;
   Port := 8081;
@@ -1937,8 +2066,8 @@ end;
 
 // Adds a site's custom response headers (CORS etc., from "cors"/"headers" in
 // http_sites) to a response some other code already built - used for the
-// cli_bridges routes, whose responses are assembled by RunCLIScript /
-// BuildBusCLIResponse rather than by PlainResponse. Headers the response
+// bus/cgi routes, whose responses are assembled by BuildReplyResponse
+// rather than by PlainResponse. Headers the response
 // already carries (matched case-insensitively) are left alone, so a script can
 // still override a site default. Without this a browser would pass the CORS
 // preflight but then refuse to hand the actual response to the calling page.
@@ -1966,14 +2095,18 @@ end;
 
 class function TVDRX_HTTPExecutive.BuildResponse(const ARequest: string;
   ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
-  const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
+  const ARoutes: TVDRX_RouteTable; const AConn: TVDRX_ConnInfo;
   ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string;
   ACustomHeaders: TStringList): string;
 var
-  Method, Path: string;
+  Method, Path, OrigTarget, Request, Location: string;
+  ScriptName, ScriptFile, PathInfo, StaticPath: string;
+  Query: string;
+  RedirectStatus: Integer;
   Route: TVDRX_ProxyRoute;
-  CLIRoute: TVDRX_CLIRoute;
+  BusRoute: TVDRX_BusRoute;
 begin
+  OrigTarget := RequestTarget(ARequest);
   ParseRequestLine(ARequest, Method, Path);
 
   // Fast-path CORS preflight probe
@@ -1983,32 +2116,68 @@ begin
     Exit(PlainResponse('204 No Content', 'text/plain', '', ACustomHeaders));
   end;
 
-  if MatchProxyRoute(Path, AProxyRoutes, Route) then
+  // 1. rewrites - from here on the (possibly rewritten) request is what gets routed;
+  //    the envelope still carries the client's original URI as request_uri.
+  Request := ARequest;
+  if Length(ARoutes.Rewrites) > 0 then
   begin
-    ABus.Publish('log.info', Format('http: %s %s -> proxy %s:%d', [Method, Path, Route.Host, Route.Port]), ASourceID);
-    Exit(ProxyRequest(ARequest, Route, ABus, ASourceID));
-  end;
-
-  if MatchCLIRoute(Path, ACLIRoutes, CLIRoute) then
-  begin
-    if SameText(CLIRoute.Protocol, 'bus-daemon') then
+    if ApplyRewrites(ARequest, ARoutes.Rewrites, Request, Location, RedirectStatus) then
     begin
-      ABus.Publish('log.info', Format('http: %s %s -> bus-daemon %s', [Method, Path, CLIRoute.InTopic]), ASourceID);
-      Exit(InjectCustomHeaders(RunBusDaemonRoute(ARequest, CLIRoute, ATemplates, ABus, ARegistry, ASourceID), ACustomHeaders));
-    end
-    else if SameText(CLIRoute.Protocol, 'bus') then
+      ABus.Publish('log.info', Format('http: %s %s -> %d redirect to %s', [Method, Path, RedirectStatus, Location]), ASourceID);
+      Exit(RedirectResponse(RedirectStatus, Location, ACustomHeaders));
+    end;
+    if Request <> ARequest then
     begin
-      ABus.Publish('log.info', Format('http: %s %s -> bus cli %s', [Method, Path, CLIRoute.Command]), ASourceID);
-      Exit(InjectCustomHeaders(RunBusCLIScript(ARequest, CLIRoute, ATemplates, ABus, ARegistry, ASourceID), ACustomHeaders));
-    end
-    else
-    begin
-      ABus.Publish('log.info', Format('http: %s %s -> cli %s', [Method, Path, CLIRoute.Command]), ASourceID);
-      Exit(InjectCustomHeaders(RunCLIScript(ARequest, CLIRoute, ABus, ASourceID), ACustomHeaders));
+      ParseRequestLine(Request, Method, Path);
+      ABus.Publish('log.info', Format('http: rewrote %s -> %s', [OrigTarget, RequestTarget(Request)]), ASourceID);
     end;
   end;
 
-  if Method = 'GET' then
+  // 2. reverse-proxy routes (processes with a prefix)
+  if MatchProxyRoute(Path, ARoutes.Proxy, Route) then
+  begin
+    ABus.Publish('log.info', Format('http: %s %s -> proxy %s:%d', [Method, Path, Route.Host, Route.Port]), ASourceID);
+    Exit(ProxyRequest(Request, Route, ABus, ASourceID));
+  end;
+
+  // 3. bus routes: http_routes and cgi entries
+  if MatchBusRoute(Path, ARoutes.Bus, BusRoute) then
+  begin
+    ScriptName := '';
+    ScriptFile := '';
+    PathInfo := '';
+    if SameText(BusRoute.Kind, 'cgi') then
+    begin
+      case ResolveCGITarget(Path, BusRoute, ScriptName, ScriptFile, PathInfo, StaticPath) of
+        crScript: ;   // fall through to RunBusRoute below
+        crStatic:
+          begin
+            if (Method <> 'GET') and (Method <> 'HEAD') then
+              Exit(PlainResponse('405 Method Not Allowed', 'text/plain', 'Method not allowed', ACustomHeaders));
+            Exit(ServeStaticFile(StaticPath, BusRoute.DocRoot, ABus, ASourceID, ACustomHeaders));
+          end;
+        crRedirectSlash:
+          begin
+            Query := ExtractQueryString(Request);
+            Exit(RedirectResponse(301, Path + '/' + IfThen(Query <> '', '?' + Query, ''), ACustomHeaders));
+          end;
+        crForbidden:
+          begin
+            ABus.Publish('log.warn', Format('http: %s %s -> 403 (path refused under %s)', [Method, Path, BusRoute.DocRoot]), ASourceID);
+            Exit(PlainResponse('403 Forbidden', 'text/plain', 'Forbidden', ACustomHeaders));
+          end;
+      else
+        ABus.Publish('log.warn', Format('http: %s %s -> 404 (nothing under %s)', [Method, Path, BusRoute.DocRoot]), ASourceID);
+        Exit(PlainResponse('404 Not Found', 'text/plain', 'Not found', ACustomHeaders));
+      end;
+    end;
+    ABus.Publish('log.info', Format('http: %s %s -> route "%s" (%s) -> %s', [Method, Path, BusRoute.ID, BusRoute.Kind, BusRoute.InTopic]), ASourceID);
+    Exit(InjectCustomHeaders(RunBusRoute(Request, OrigTarget, BusRoute, AConn, ScriptName, ScriptFile, PathInfo,
+      ATemplates, ABus, ARegistry, ASourceID), ACustomHeaders));
+  end;
+
+  // 4. the site's own static_dir
+  if (Method = 'GET') or (Method = 'HEAD') then
     Result := ServeStaticFile(Path, AStaticDir, ABus, ASourceID, ACustomHeaders)
   else
   begin
@@ -2021,7 +2190,7 @@ end;
 
 constructor TVDRX_HTTPConnection.Create(ABus: TVDRX_MessageQueue; ATransport: TVDRX_Transport;
   ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
-  const AProxyRoutes: TVDRX_ProxyRoutes; const ACLIRoutes: TVDRX_CLIRoutes;
+  const ARoutes: TVDRX_RouteTable; const AConn: TVDRX_ConnInfo;
   ARegistry: TVDRX_Registry; const ASourceID: string; ACustomHeaders: TStringList);
 begin
   inherited Create(ABus);
@@ -2029,8 +2198,8 @@ begin
   FTemplates := ATemplates;
   FConfig := AConfig;
   FStaticDir := AStaticDir;
-  FProxyRoutes := AProxyRoutes;
-  FCLIRoutes := ACLIRoutes;
+  FRoutes := ARoutes;
+  FConn := AConn;
   FRegistry := ARegistry;
   FSourceID := ASourceID;
   FCustomHeaders := ACustomHeaders;
@@ -2043,6 +2212,7 @@ end;
 procedure TVDRX_HTTPConnection.Run(const ARequest: string);
 var
   Request, Response, Method, Path: string;
+  HeadEnd, Sent, N: Integer;
 begin
   if ARequest <> '' then
     Request := ARequest
@@ -2053,9 +2223,26 @@ begin
   begin
     ParseRequestLine(Request, Method, Path);
     Response := TVDRX_HTTPExecutive.BuildResponse(Request, FTemplates, FConfig, FStaticDir,
-      FProxyRoutes, FCLIRoutes, Bus, FRegistry, FSourceID, FCustomHeaders);
+      FRoutes, FConn, Bus, FRegistry, FSourceID, FCustomHeaders);
     Bus.Publish('log.info', Format('http: %s %s -> %s', [Method, Path, StatusOf(Response)]), FSourceID);
-    FTransport.Write(Response[1], Length(Response));
+    if Method = 'HEAD' then
+    begin
+      // headers only (Content-Length still describes the body a GET would return)
+      HeadEnd := Pos(#13#10#13#10, Response);
+      if HeadEnd > 0 then SetLength(Response, HeadEnd + 3);
+    end;
+    // send() may accept fewer bytes than offered (big bodies, send timeout)
+    Sent := 0;
+    while Sent < Length(Response) do
+    begin
+      N := FTransport.Write(Response[Sent + 1], Length(Response) - Sent);
+      if N <= 0 then
+      begin
+        Bus.Publish('log.warn', Format('http: %s %s - client went away after %d of %d bytes', [Method, Path, Sent, Length(Response)]), FSourceID);
+        Break;
+      end;
+      Inc(Sent, N);
+    end;
   end
   else
     Bus.Publish('log.warn', 'http: connection closed before a request arrived', FSourceID);
@@ -2065,9 +2252,14 @@ end;
 procedure TVDRX_HTTPExecutive.HandleConnection(ATransport: TVDRX_Transport);
 var
   Conn: TVDRX_HTTPConnection;
+  Info: TVDRX_ConnInfo;
 begin
+  Info.RemoteAddr := ATransport.PeerAddr;
+  Info.RemotePort := ATransport.PeerPort;
+  Info.Secure := ATransport.Secure;
+  if Info.Secure then Info.ServerPort := TLSPort else Info.ServerPort := Port;
   Conn := TVDRX_HTTPConnection.Create(Bus, ATransport, FTemplates, FConfig, FStaticDir,
-    FProxyRoutes, FCLIRoutes, FRegistry, ID, FCustomHeaders);
+    FRoutes, Info, FRegistry, ID, FCustomHeaders);
   try
     Conn.Run;
   finally

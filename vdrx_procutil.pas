@@ -32,9 +32,25 @@ function RunProgramCapture(const ACommandLine, AWorkDir, AStdin: string;
 // splitting or quoting rules involved, so argument values can contain anything
 // (spaces, quotes) and are never re-interpreted. Prefer this whenever any part
 // of the argument list comes from outside the config file.
+//
+// AEnv (optional): extra "NAME=value" lines for the child's environment. The
+// child still inherits the daemon's own environment (Windows programs need
+// SystemRoot, PATH etc. to start at all); an AEnv entry with the same name
+// replaces the inherited one. Used by the CGI executive (vdrx_cgi.pas).
 function RunProgramCaptureArgs(const AExe: string; AArgs: TStrings;
   const AWorkDir, AStdin: string; ATimeoutMs: Integer; out AExitCode: Integer;
-  out AStdout, AStderr, AError: string): TVDRX_RunResult;
+  out AStdout, AStderr, AError: string; AEnv: TStrings = nil): TVDRX_RunResult;
+
+// Text helpers shared by anything that carries program/HTTP bytes inside JSON
+// (JSON strings must be valid UTF-8; arbitrary bytes are not).
+// IsValidUTF8: True if S is well-formed UTF-8 (so it can ride in a JSON string
+// as-is). CleanUTF8: S with every invalid byte replaced by '?'. Binary data
+// that has to survive intact is carried base64-encoded (\"body_b64\") instead.
+function IsValidUTF8(const S: string): Boolean;
+function CleanUTF8(const S: string): string;
+// Percent-decoding ("%41" -> "A"). APlusIsSpace: True for query strings/forms,
+// False for URL paths (where "+" is a literal plus).
+function URLDecode(const S: string; APlusIsSpace: Boolean = True): string;
 
 // Same idea for an external process - polls Running instead of blocking.
 function WaitProcessOrTimeout(AProcess: TProcess; ATimeoutMs: Integer): Boolean;
@@ -88,10 +104,10 @@ implementation
 
 function RunProgramCaptureArgs(const AExe: string; AArgs: TStrings;
   const AWorkDir, AStdin: string; ATimeoutMs: Integer; out AExitCode: Integer;
-  out AStdout, AStderr, AError: string): TVDRX_RunResult;
+  out AStdout, AStderr, AError: string; AEnv: TStrings = nil): TVDRX_RunResult;
 var
   Proc: TProcess;
-  i: Integer;
+  i, p: Integer;
   Buf: array[0..8191] of Byte;
   N, Got: Integer;
   WasRunning: Boolean;
@@ -116,6 +132,19 @@ begin
       if Found <> '' then Proc.Executable := Found;
     end;
     Proc.Options := [poUsePipes]; // stdout and stderr stay separate
+    if Assigned(AEnv) and (AEnv.Count > 0) then
+    begin
+      // inherit the daemon's environment, then let AEnv override by name
+      for i := 1 to GetEnvironmentVariableCount do
+        Proc.Environment.Add(GetEnvironmentString(i));
+      for i := 0 to AEnv.Count - 1 do
+      begin
+        if Pos('=', AEnv[i]) < 2 then Continue;
+        p := Proc.Environment.IndexOfName(Copy(AEnv[i], 1, Pos('=', AEnv[i]) - 1));
+        if p >= 0 then Proc.Environment.Delete(p);
+        Proc.Environment.Add(AEnv[i]);
+      end;
+    end;
     try
       Proc.Execute;
     except
@@ -209,6 +238,98 @@ begin
   end;
 end;
 
+// Length of the well-formed UTF-8 sequence starting at S[I], or 0 if invalid.
+function UTF8SeqLen(const S: string; I: Integer): Integer;
+var
+  c: Byte;
+  need, j: Integer;
+begin
+  Result := 0;
+  c := Byte(S[I]);
+  if c < $80 then Exit(1);
+  if (c >= $C2) and (c <= $DF) then need := 1
+  else if (c >= $E0) and (c <= $EF) then need := 2
+  else if (c >= $F0) and (c <= $F4) then need := 3
+  else Exit(0);
+  if I + need > Length(S) then Exit(0);
+  for j := 1 to need do
+    if (Byte(S[I + j]) and $C0) <> $80 then Exit(0);
+  Result := need + 1;
+end;
+
+function IsValidUTF8(const S: string): Boolean;
+var
+  i, n: Integer;
+begin
+  Result := True;
+  i := 1;
+  while i <= Length(S) do
+  begin
+    n := UTF8SeqLen(S, i);
+    if n = 0 then Exit(False);
+    Inc(i, n);
+  end;
+end;
+
+function CleanUTF8(const S: string): string;
+var
+  i, n: Integer;
+begin
+  if IsValidUTF8(S) then Exit(S);
+  Result := '';
+  i := 1;
+  while i <= Length(S) do
+  begin
+    n := UTF8SeqLen(S, i);
+    if n = 0 then
+    begin
+      Result := Result + '?';
+      Inc(i);
+    end
+    else
+    begin
+      Result := Result + Copy(S, i, n);
+      Inc(i, n);
+    end;
+  end;
+end;
+
+function HexVal(C: Char): Integer;
+begin
+  case C of
+    '0'..'9': Result := Ord(C) - 48;
+    'a'..'f': Result := Ord(C) - 87;
+    'A'..'F': Result := Ord(C) - 55;
+  else
+    Result := -1;
+  end;
+end;
+
+function URLDecode(const S: string; APlusIsSpace: Boolean = True): string;
+var
+  i, H, L: Integer;
+begin
+  Result := '';
+  i := 1;
+  while i <= Length(S) do
+  begin
+    if (S[i] = '%') and (i + 2 <= Length(S)) then
+    begin
+      H := HexVal(S[i + 1]);
+      L := HexVal(S[i + 2]);
+      if (H >= 0) and (L >= 0) then
+      begin
+        Result := Result + Chr(H * 16 + L);
+        Inc(i, 3);
+        Continue;
+      end;
+    end;
+    if APlusIsSpace and (S[i] = '+') then Result := Result + ' ' else Result := Result + S[i];
+    Inc(i);
+  end;
+end;
+
+// "a=1&b=two%20words" -> params (later duplicates win)
 function WaitThreadOrTimeout(AThread: TThread; ATimeoutMs: Integer): Boolean;
 var
   Waited: Integer;

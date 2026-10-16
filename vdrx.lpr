@@ -12,6 +12,7 @@ uses
   Process,
   fpjson,
   jsonparser,
+  RegExpr,
   vdrx_core,
   vdrx_config,
   vdrx_admin,
@@ -22,6 +23,7 @@ uses
   vdrx_network,
   vdrx_templates,
   vdrx_runner,
+  vdrx_cgi,
   vdrx_procutil;
 
 type
@@ -55,8 +57,7 @@ var
   Logger: TVDRX_LoggerExecutive;
   Stdin: TVDRX_StdinExecutive;
   WS: TVDRX_WebSocketExecutive;
-  ProxyRoutes: TVDRX_ProxyRoutes;
-  CLIRoutes: TVDRX_CLIRoutes;
+  Routes: TVDRX_RouteTable;
   ShutdownGraceMs: Integer;
   DoRestart: Boolean;
   NewProc: TProcess;
@@ -208,8 +209,7 @@ begin
 end;
 
 function SetupHTTPSites(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry;
-  AGracefulMs: Integer; const AProxyRoutes: TVDRX_ProxyRoutes;
-  const ACLIRoutes: TVDRX_CLIRoutes): TVDRX_HTTPSites;
+  AGracefulMs: Integer; const ARoutes: TVDRX_RouteTable): TVDRX_HTTPSites;
 var
   Rows: TVDRX_ConfigRows;
   Row: TStringList;
@@ -235,7 +235,7 @@ begin
         IfThen(Row.Values['template_dir'] <> '', Row.Values['template_dir'], 'templates'));
       Site.HTTP := TVDRX_HTTPExecutive.Create(Kernel.Queue, AConfig, Site.Templates,
         IfThen(Row.Values['static_dir'] <> '', Row.Values['static_dir'], 'static'),
-        AProxyRoutes, ACLIRoutes, ARegistry);
+        ARoutes, ARegistry);
       Site.HTTP.Port := StrToIntDef(Row.Values['port'], 8081);
       Site.HTTP.GracefulTimeoutMs := AGracefulMs;
 
@@ -317,85 +317,9 @@ begin
   end;
 end;
 
-procedure SetupCLIBridges(AConfig: TVDRX_Config; out ARoutes: TVDRX_CLIRoutes);
-var
-  Rows: TVDRX_ConfigRows;
-  Row: TStringList;
-  n: Integer;
-  Protocol: string;
-begin
-  SetLength(ARoutes, 0);
-  Rows := AConfig.GetObjectArray('cli_bridges');
-  try
-    for Row in Rows do
-    begin
-      if (Row.Values['id'] = '') or (Row.Values['prefix'] = '') then
-      begin
-        WriteLn('  Skipping cli_bridges entry - needs at least id and prefix.');
-        Continue;
-      end;
-
-      Protocol := LowerCase(IfThen(Row.Values['protocol'] <> '', Row.Values['protocol'], 'cgi'));
-      if Protocol = 'exec' then
-      begin
-        WriteLn('  Skipping cli_bridges entry "', Row.Values['id'], '": protocol "exec" no longer exists - declare a runners entry plus an http_routes entry instead (see readme 4e).');
-        Continue;
-      end;
-      if (Protocol <> 'cgi') and (Protocol <> 'bus') and (Protocol <> 'bus-daemon') then
-      begin
-        WriteLn('  cli_bridges entry "', Row.Values['id'], '": unrecognized protocol "', Protocol, '" - using "cgi".');
-        Protocol := 'cgi';
-      end;
-
-      if (Protocol = 'bus-daemon') and (Row.Values['in_topic'] = '') and (Row.Values['id'] = '') then
-      begin
-        WriteLn('  Skipping cli_bridges entry - protocol "bus-daemon" needs id (to default in_topic) or an explicit in_topic.');
-        Continue;
-      end;
-      if (Protocol <> 'bus-daemon') and (Row.Values['command'] = '') then
-      begin
-        WriteLn('  Skipping cli_bridges entry "', Row.Values['id'], '" - protocol "', Protocol, '" also needs command.');
-        Continue;
-      end;
-      if (Protocol = 'cgi') and (Row.Values['script_dir'] = '') then
-      begin
-        WriteLn('  Skipping cli_bridges entry "', Row.Values['id'], '" - protocol "cgi" also needs script_dir.');
-        Continue;
-      end;
-
-      n := Length(ARoutes);
-      SetLength(ARoutes, n + 1);
-      ARoutes[n].Prefix := Row.Values['prefix'];
-      ARoutes[n].Command := Row.Values['command'];
-      ARoutes[n].ScriptDir := Row.Values['script_dir'];
-      ARoutes[n].TimeoutMs := StrToIntDef(Row.Values['timeout_ms'], 5000);
-      ARoutes[n].ContentType := IfThen(Row.Values['content_type'] <> '', Row.Values['content_type'], 'text/html');
-      ARoutes[n].Allow := Row.Values['allow'];
-      ARoutes[n].Response := Row.Values['response'];
-      ARoutes[n].Protocol := Protocol;
-      ARoutes[n].InTopic := IfThen(Row.Values['in_topic'] <> '', Row.Values['in_topic'], Row.Values['id'] + '.in');
-
-      case Protocol of
-        'bus':
-          WriteLn('  CLI bridge "', Row.Values['id'], '" (bus): ', ARoutes[n].Prefix, ' -> ',
-            ARoutes[n].Command, ' [cwd=', ExpandFileName(IfThen(ARoutes[n].ScriptDir <> '', ARoutes[n].ScriptDir, GetCurrentDir)),
-            '] (timeout_ms=', ARoutes[n].TimeoutMs, ')');
-        'bus-daemon':
-          WriteLn('  CLI bridge "', Row.Values['id'], '" (bus-daemon): ', ARoutes[n].Prefix, ' -> in_topic="',
-            ARoutes[n].InTopic, '" (timeout_ms=', ARoutes[n].TimeoutMs, ') - consider moving this to http_routes.');
-      else
-        WriteLn('  CLI bridge "', Row.Values['id'], '" (cgi): ', ARoutes[n].Prefix, ' -> ',
-          ARoutes[n].Command, ' ', ExpandFileName(ARoutes[n].ScriptDir), '/* (timeout_ms=', ARoutes[n].TimeoutMs, ')');
-      end;
-    end;
-  finally
-    Rows.Free;
-  end;
-end;
-
 // http_routes: "this URL prefix publishes the request onto the bus topic
-// in_topic and returns whatever reply comes back". It is the bus-daemon shape
-// of a cli_bridges route with the extra fields that matter at the HTTP edge:
+// in_topic and returns whatever reply comes back" - the generic way for ANY
+// executive (runner, supervised daemon, WebSocket client ...) to serve HTTP.
 //   id           names the route; also the default in_topic ("<id>.in"), so a
 //                route and a runner that share an id are wired together
 //   prefix       URL prefix (required)
@@ -403,9 +327,9 @@ end;
 //   allow        HTTP methods accepted, default "POST" (others get 405)
 //   timeout_ms   how long to wait for the reply, default 10000 (-> 504)
 //   content_type of a successful reply when the reply doesn't say, default text/plain
-//   response     "raw" (default: the reply's own status/body/content_type) or
+//   response     "raw" (default: the reply's own status/headers/body) or
 //                "json" (the whole reply envelope returned as application/json)
-procedure SetupHTTPRoutes(AConfig: TVDRX_Config; var ARoutes: TVDRX_CLIRoutes);
+procedure SetupHTTPRoutes(AConfig: TVDRX_Config; var ARoutes: TVDRX_BusRoutes);
 var
   Rows: TVDRX_ConfigRows;
   Row: TStringList;
@@ -429,7 +353,8 @@ begin
       end;
       n := Length(ARoutes);
       SetLength(ARoutes, n + 1);
-      ARoutes[n].Protocol := 'bus-daemon';
+      ARoutes[n].ID := Row.Values['id'];
+      ARoutes[n].Kind := 'bus';
       ARoutes[n].Prefix := Row.Values['prefix'];
       ARoutes[n].InTopic := IfThen(Row.Values['in_topic'] <> '', Row.Values['in_topic'], Row.Values['id'] + '.in');
       ARoutes[n].Allow := IfThen(Row.Values['allow'] <> '', Row.Values['allow'], 'POST');
@@ -439,6 +364,331 @@ begin
       WriteLn('  HTTP route "', Row.Values['id'], '": ', ARoutes[n].Allow, ' ', ARoutes[n].Prefix,
         ' -> publish "', ARoutes[n].InTopic, '", await reply (timeout_ms=', ARoutes[n].TimeoutMs,
         ', response=', Resp, ')');
+    end;
+  finally
+    Rows.Free;
+  end;
+end;
+
+// JSON array text -> TStringList of its elements ('' / invalid -> empty)
+procedure JSONArrayToList(const AJSON: string; AList: TStrings);
+var
+  D: TJSONData;
+  i: Integer;
+begin
+  AList.Clear;
+  if Trim(AJSON) = '' then Exit;
+  try
+    D := GetJSON(AJSON);
+  except
+    Exit;
+  end;
+  try
+    if D is TJSONArray then
+      for i := 0 to TJSONArray(D).Count - 1 do
+        AList.Add(TJSONArray(D).Items[i].AsString);
+  finally
+    D.Free;
+  end;
+end;
+
+function ConfBool(const AValue: string; ADefault: Boolean): Boolean;
+begin
+  if AValue = '' then Exit(ADefault);
+  Result := not ((AValue = 'False') or (AValue = 'false') or (AValue = '0'));
+end;
+
+// cgi: a CGI adaptor (vdrx_cgi.pas) AND the HTTP route that feeds it. A web
+// server's "run this through php-cgi" in one entry; the program is just a
+// consumer of bus messages.
+//   id            required; default in_topic "<id>.in"
+//   prefix        required; URL prefix this entry serves ("/" = the whole site)
+//   doc_root      required; directory the URL (minus prefix) maps onto
+//   command       program to run, e.g. "{PHP_CGI_BIN_FILENAME}"; "" = the script
+//                 file itself is the executable (classic cgi-bin: .cgi/.exe/#!)
+//   args          array of arguments; "%%script%%" = absolute script filename.
+//                 Default ["%%script%%"]  ->  php-cgi /www/index.php
+//   extensions    array of script extensions, default [".php"] (or [".cgi"] when
+//                 command is ""); any other existing file under doc_root is static
+//   index         array of directory index files, default ["index.php", "index.html"]
+//   fallback      URL path of a front-controller script ("/index.php") that gets
+//                 every request that matched no file - pretty URLs / frameworks
+//   static        serve non-script files from doc_root (default true)
+//   allow         accepted HTTP methods, default any
+//   env           object of extra environment variables for the program
+//   work_dir      working directory; default = the script's own directory
+//   output        "cgi" (default: program prints headers, blank line, body) or
+//                 "raw" (stdout is the body verbatim, status 200)
+//   timeout_ms (30000), workers (4), max_queue (64), content_type (text/html),
+//   in_topic, enabled
+procedure SetupCGI(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry;
+  AGracefulMs: Integer; var ARoutes: TVDRX_BusRoutes);
+var
+  Rows: TVDRX_ConfigRows;
+  Row: TStringList;
+  Exec: TVDRX_CGIExecutive;
+  Args, Exts, Idx, Env: TStringList;
+  EnvJSON: TJSONData;
+  n, i: Integer;
+  Id, InTopic, Ext: string;
+begin
+  Rows := AConfig.GetObjectArray('cgi');
+  try
+    for Row in Rows do
+    begin
+      Id := Row.Values['id'];
+      if (Id = '') or (Row.Values['prefix'] = '') or (Row.Values['doc_root'] = '') then
+      begin
+        WriteLn('  Skipping cgi entry - needs at least id, prefix and doc_root.');
+        Continue;
+      end;
+      if not ConfBool(Row.Values['enabled'], True) then
+      begin
+        WriteLn('  CGI "', Id, '": disabled (enabled=false) - skipping.');
+        Continue;
+      end;
+      InTopic := IfThen(Row.Values['in_topic'] <> '', Row.Values['in_topic'], Id + '.in');
+
+      Exec := TVDRX_CGIExecutive.Create(Kernel.Queue);
+      Exec.SetCommand(Row.Values['command']);
+      Args := TStringList.Create;
+      Exts := TStringList.Create;
+      Idx := TStringList.Create;
+      Env := TStringList.Create;
+      try
+        JSONArrayToList(Row.Values['args#json'], Args);
+        Exec.SetArgs(Args);   // empty = just the script
+        Exec.WorkDir := Row.Values['work_dir'];
+        Exec.TimeoutMs := StrToIntDef(Row.Values['timeout_ms'], 30000);
+        Exec.Workers := StrToIntDef(Row.Values['workers'], 4);
+        Exec.MaxQueue := StrToIntDef(Row.Values['max_queue'], 64);
+        Exec.GraceMs := AGracefulMs;
+        Exec.ContentType := IfThen(Row.Values['content_type'] <> '', Row.Values['content_type'], 'text/html');
+        Exec.PublishTopic := Id + '.out';
+        Exec.RawOutput := LowerCase(Row.Values['output']) = 'raw';
+        if Row.Values['env'] <> '' then
+        begin
+          try
+            EnvJSON := GetJSON(Row.Values['env']);
+            try
+              if EnvJSON is TJSONObject then
+                for i := 0 to TJSONObject(EnvJSON).Count - 1 do
+                  Env.Add(TJSONObject(EnvJSON).Names[i] + '=' + TJSONObject(EnvJSON).Items[i].AsString);
+            finally
+              EnvJSON.Free;
+            end;
+          except
+            WriteLn('  CGI "', Id, '": "env" is not a valid JSON object - ignored.');
+          end;
+        end;
+        Exec.SetExtraEnv(Env);
+        ARegistry.Register(Exec, Id, InTopic);
+
+        JSONArrayToList(Row.Values['extensions#json'], Exts);
+        if Exts.Count = 0 then Exts.Add(IfThen(Row.Values['command'] <> '', '.php', '.cgi'));
+        JSONArrayToList(Row.Values['index#json'], Idx);
+        if Idx.Count = 0 then
+        begin
+          Idx.Add('index.php');
+          Idx.Add('index.html');
+        end;
+
+        n := Length(ARoutes);
+        SetLength(ARoutes, n + 1);
+        ARoutes[n].ID := Id;
+        ARoutes[n].Kind := 'cgi';
+        ARoutes[n].Prefix := Row.Values['prefix'];
+        ARoutes[n].InTopic := InTopic;
+        ARoutes[n].Allow := Row.Values['allow'];
+        ARoutes[n].TimeoutMs := Exec.TimeoutMs;
+        ARoutes[n].ContentType := Exec.ContentType;
+        ARoutes[n].Response := 'raw';
+        ARoutes[n].DocRoot := ExpandFileName(Row.Values['doc_root']);
+        ARoutes[n].Extensions := ',';
+        for i := 0 to Exts.Count - 1 do
+        begin
+          Ext := LowerCase(Trim(Exts[i]));
+          if Ext = '' then Continue;
+          if Ext[1] <> '.' then Ext := '.' + Ext;
+          ARoutes[n].Extensions := ARoutes[n].Extensions + Ext + ',';
+        end;
+        ARoutes[n].IndexFiles := Idx.CommaText;
+        ARoutes[n].Fallback := Row.Values['fallback'];
+        ARoutes[n].Static := ConfBool(Row.Values['static'], True);
+        WriteLn('  CGI "', Id, '": ', ARoutes[n].Prefix, ' -> ', IfThen(Row.Values['command'] <> '', Row.Values['command'], '(script itself)'),
+          ' [doc_root=', ARoutes[n].DocRoot, ', ext=', Copy(ARoutes[n].Extensions, 2, Length(ARoutes[n].Extensions) - 2),
+          IfThen(ARoutes[n].Fallback <> '', ', fallback=' + ARoutes[n].Fallback, ''),
+          ', workers=', Exec.Workers, ', timeout_ms=', Exec.TimeoutMs, ']');
+      finally
+        Env.Free;
+        Idx.Free;
+        Exts.Free;
+        Args.Free;
+      end;
+    end;
+  finally
+    Rows.Free;
+  end;
+end;
+
+// rewrites: regex on the request path -> new target, applied before any routing.
+//   match   regular expression (required), tested against the path (no query)
+//   to      replacement target (required); $1, $2 ... are the regex groups; a
+//           "?x=$1" part REPLACES the query string, without one the client's is kept
+//   flag    "last" (default - the first matching rule wins) | "continue" (keep
+//           applying later rules to the result) | "redirect" (302) | "permanent" (301)
+procedure SetupRewrites(AConfig: TVDRX_Config; out ARules: TVDRX_RewriteRules);
+var
+  Rows: TVDRX_ConfigRows;
+  Row: TStringList;
+  Re: TRegExpr;
+  n: Integer;
+  Flag: string;
+begin
+  SetLength(ARules, 0);
+  Rows := AConfig.GetObjectArray('rewrites');
+  try
+    for Row in Rows do
+    begin
+      if (Row.Values['match'] = '') or (Row.Values['to'] = '') then
+      begin
+        WriteLn('  Skipping rewrites entry - needs match and to.');
+        Continue;
+      end;
+      Flag := LowerCase(IfThen(Row.Values['flag'] <> '', Row.Values['flag'], 'last'));
+      if (Flag <> 'last') and (Flag <> 'continue') and (Flag <> 'redirect') and (Flag <> 'permanent') then
+      begin
+        WriteLn('  rewrites entry "', Row.Values['match'], '": unrecognized flag "', Flag, '" - using "last".');
+        Flag := 'last';
+      end;
+      Re := TRegExpr.Create;
+      try
+        try
+          Re.Expression := Row.Values['match'];
+          Re.Compile;   // surface a bad pattern now, not on the first request
+        except
+          on E: Exception do
+          begin
+            WriteLn('  Skipping rewrites entry "', Row.Values['match'], '": bad regular expression - ', E.Message);
+            Continue;
+          end;
+        end;
+      finally
+        Re.Free;
+      end;
+      n := Length(ARules);
+      SetLength(ARules, n + 1);
+      ARules[n].Pattern := Row.Values['match'];
+      ARules[n].Target := Row.Values['to'];
+      ARules[n].Flag := Flag;
+      WriteLn('  Rewrite: ', ARules[n].Pattern, ' -> ', ARules[n].Target, ' [', Flag, ']');
+    end;
+  finally
+    Rows.Free;
+  end;
+end;
+
+// cli_bridges is the OLD way of reaching a program over HTTP, kept working by
+// translating each entry into the current machinery (so it gets the same
+// fixes) and logging a nudge:
+//   protocol "cgi" (default)  -> a cgi entry (doc_root = script_dir, any file is a
+//                                script, output "raw": stdout is the body)
+//   protocol "bus"            -> a runner in envelope mode + an http route
+//   protocol "bus-daemon"     -> an http route
+// New configs should use cgi / runners + http_routes directly (readme section 4).
+procedure SetupLegacyCLIBridges(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry;
+  AGracefulMs: Integer; var ARoutes: TVDRX_BusRoutes);
+var
+  Rows: TVDRX_ConfigRows;
+  Row: TStringList;
+  n: Integer;
+  Protocol, Id, InTopic: string;
+  Cgi: TVDRX_CGIExecutive;
+  Run: TVDRX_RunnerExecutive;
+  TimeoutMs: Integer;
+begin
+  Rows := AConfig.GetObjectArray('cli_bridges');
+  try
+    for Row in Rows do
+    begin
+      Id := Row.Values['id'];
+      if (Id = '') or (Row.Values['prefix'] = '') then
+      begin
+        WriteLn('  Skipping cli_bridges entry - needs at least id and prefix.');
+        Continue;
+      end;
+      Protocol := LowerCase(IfThen(Row.Values['protocol'] <> '', Row.Values['protocol'], 'cgi'));
+      if Protocol = 'exec' then
+      begin
+        WriteLn('  Skipping cli_bridges entry "', Id, '": protocol "exec" no longer exists - declare a runners entry plus an http_routes entry instead (see readme 4e).');
+        Continue;
+      end;
+      if (Protocol <> 'cgi') and (Protocol <> 'bus') and (Protocol <> 'bus-daemon') then
+      begin
+        WriteLn('  cli_bridges entry "', Id, '": unrecognized protocol "', Protocol, '" - using "cgi".');
+        Protocol := 'cgi';
+      end;
+      if (Protocol <> 'bus-daemon') and (Row.Values['command'] = '') then
+      begin
+        WriteLn('  Skipping cli_bridges entry "', Id, '" - protocol "', Protocol, '" also needs command.');
+        Continue;
+      end;
+      if (Protocol = 'cgi') and (Row.Values['script_dir'] = '') then
+      begin
+        WriteLn('  Skipping cli_bridges entry "', Id, '" - protocol "cgi" also needs script_dir.');
+        Continue;
+      end;
+
+      TimeoutMs := StrToIntDef(Row.Values['timeout_ms'], 5000);
+      InTopic := IfThen(Row.Values['in_topic'] <> '', Row.Values['in_topic'], Id + '.in');
+      n := Length(ARoutes);
+      SetLength(ARoutes, n + 1);
+      ARoutes[n].ID := Id;
+      ARoutes[n].Prefix := Row.Values['prefix'];
+      ARoutes[n].InTopic := InTopic;
+      ARoutes[n].Allow := Row.Values['allow'];
+      ARoutes[n].TimeoutMs := TimeoutMs;
+      ARoutes[n].ContentType := IfThen(Row.Values['content_type'] <> '', Row.Values['content_type'], 'text/html');
+      ARoutes[n].Response := Row.Values['response'];
+      ARoutes[n].Kind := 'bus';
+
+      if Protocol = 'bus-daemon' then
+        WriteLn('  cli_bridges "', Id, '" (bus-daemon): deprecated - same as an http_routes entry; ', ARoutes[n].Prefix, ' -> "', InTopic, '"')
+      else if Protocol = 'bus' then
+      begin
+        Run := TVDRX_RunnerExecutive.Create(Kernel.Queue);
+        Run.SetCommand(Row.Values['command']);
+        Run.EnvelopeMode := True;
+        Run.WorkDir := Row.Values['script_dir'];
+        Run.TimeoutMs := TimeoutMs;
+        Run.Workers := 4;
+        Run.GraceMs := AGracefulMs;
+        Run.PublishTopic := Id + '.out';
+        ARegistry.Register(Run, Id, InTopic);
+        ARoutes[n].TimeoutMs := TimeoutMs + 2000;   // let the runner's own 504 arrive first
+        WriteLn('  cli_bridges "', Id, '" (bus): deprecated - now a runner (envelope mode) + http route: ',
+          ARoutes[n].Prefix, ' -> ', Row.Values['command']);
+      end
+      else
+      begin
+        Cgi := TVDRX_CGIExecutive.Create(Kernel.Queue);
+        Cgi.SetCommand(Row.Values['command']);
+        Cgi.TimeoutMs := TimeoutMs;
+        Cgi.Workers := 2;
+        Cgi.GraceMs := AGracefulMs;
+        Cgi.ContentType := ARoutes[n].ContentType;
+        Cgi.PublishTopic := Id + '.out';
+        Cgi.RawOutput := True;
+        ARegistry.Register(Cgi, Id, InTopic);
+        ARoutes[n].Kind := 'cgi';
+        ARoutes[n].DocRoot := ExpandFileName(Row.Values['script_dir']);
+        ARoutes[n].Extensions := '';        // any file under script_dir is a script, as before
+        ARoutes[n].IndexFiles := '';
+        ARoutes[n].Fallback := '';
+        ARoutes[n].Static := False;
+        WriteLn('  cli_bridges "', Id, '" (cgi): deprecated - now a cgi entry (output "raw"): ',
+          ARoutes[n].Prefix, ' -> ', Row.Values['command'], ' ', ARoutes[n].DocRoot, '/*');
+      end;
     end;
   finally
     Rows.Free;
@@ -730,15 +980,17 @@ begin
       Kernel.Registry.Register(WS, 'ws', 'sys.none');
     end;
 
-    SetupProcesses(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes);
+    SetupProcesses(Config, Kernel.Registry, ShutdownGraceMs, Routes.Proxy);
     SetupSocketClients(Config, Kernel.Registry, ShutdownGraceMs);
-    SetupCLIBridges(Config, CLIRoutes);
-    SetupHTTPRoutes(Config, CLIRoutes);
+    SetupRewrites(Config, Routes.Rewrites);
+    SetupLegacyCLIBridges(Config, Kernel.Registry, ShutdownGraceMs, Routes.Bus);
+    SetupHTTPRoutes(Config, Routes.Bus);
+    SetupCGI(Config, Kernel.Registry, ShutdownGraceMs, Routes.Bus);
     SetupRunners(Config, Kernel.Registry, ShutdownGraceMs);
     SetupTemplateExecutives(Config, Kernel.Registry);
     SetupBuckets(Config, Kernel.Registry);
 
-    HTTPSites := SetupHTTPSites(Config, Kernel.Registry, ShutdownGraceMs, ProxyRoutes, CLIRoutes);
+    HTTPSites := SetupHTTPSites(Config, Kernel.Registry, ShutdownGraceMs, Routes);
 
     Kernel.Start;
 
