@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vdrx conf viewer</title>
+<style>
+:root{--bg:#13161b;--pn:#1a1e25;--ln:#2b323c;--fg:#d6dce4;--dim:#8592a1;--err:#ff7070;--warn:#e8b548;--note:#74a9e0;color-scheme:dark}
+@media(prefers-color-scheme:light){:root{--bg:#f4f5f7;--pn:#fff;--ln:#d3d9e0;--fg:#1c2330;--dim:#5b6a7a;--err:#c0262d;--warn:#946200;--note:#1b66d6;color-scheme:light}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif;display:flex;flex-direction:column;height:100vh}
+header{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--ln)}
+h1{font-size:15px;margin:0 8px 0 0;font-weight:600}
+button,label.b{font:inherit;color:var(--fg);background:var(--pn);border:1px solid var(--ln);border-radius:4px;padding:3px 10px;cursor:pointer}
+button:hover,label.b:hover{border-color:var(--dim)}
+.chk{color:var(--dim);margin-left:auto;display:flex;gap:5px;align-items:center}
+main{flex:1;display:grid;grid-template-columns:1fr 340px;min-height:0}
+#view{overflow:auto;padding:8px}#view svg{min-width:900px;width:100%;height:auto;display:block}
+aside{border-left:1px solid var(--ln);overflow:auto;padding:10px 12px;background:var(--pn)}
+aside h2{font-size:13px;margin:14px 0 6px;font-weight:600}aside h2:first-child{margin-top:0}
+.is{border-left:3px solid;padding:3px 8px;margin:4px 0;cursor:pointer;font-size:13px}.is:hover{background:var(--bg)}
+.err{border-color:var(--err)}.warn{border-color:var(--warn)}.note{border-color:var(--note)}
+pre,.m{font:12px/1.4 ui-monospace,Consolas,monospace}pre{white-space:pre-wrap;word-break:break-all;margin:4px 0}
+.dim{color:var(--dim)}
+svg text{font:12px ui-monospace,Consolas,monospace;fill:var(--fg)}svg .d{fill:var(--dim)}svg .b{font-weight:700}
+.nb{fill:var(--pn);stroke:var(--ln)}.nd{cursor:pointer}.nd.off{opacity:.45}
+.e{fill:none;stroke-width:1.6;opacity:.8}.e.x{stroke-dasharray:4 4;opacity:.45}.ln{stroke-width:5;stroke-linecap:round}
+.dm .nd,.dm .e,.dm .la{opacity:.12}.dm .hl{opacity:1!important}.dm .e.hl{stroke-width:2.6}
+input{font:12px ui-monospace,Consolas,monospace;color:var(--fg);background:var(--bg);border:1px solid var(--ln);border-radius:4px;padding:3px 6px}
+.lv{display:flex;gap:4px;align-items:center;margin-left:8px}
+.la .ln{transition:stroke-width .25s}.la.pulse .ln{stroke-width:10}.e.pulse{opacity:1;stroke-width:3}
+#feed div{border-top:1px solid var(--ln);padding:2px 0;word-break:break-all}
+dialog{background:var(--pn);color:var(--fg);border:1px solid var(--ln);border-radius:6px;width:min(640px,92vw)}
+textarea{width:100%;height:260px;background:var(--bg);color:var(--fg);border:1px solid var(--ln);font:12px ui-monospace,monospace}
+@media(max-width:800px){main{grid-template-columns:1fr;grid-template-rows:60vh auto}aside{border-left:0;border-top:1px solid var(--ln)}}
+</style></head><body>
+<header><h1>vdrx conf viewer</h1>
+<label class="b">Open…<input id="f" type="file" multiple hidden></label>
+<label class="b">Add file…<input id="fa" type="file" multiple hidden></label>
+<button id="pb">Paste…</button><button id="db">Demo</button>
+<span class="lv"><input id="wu" value="ws://127.0.0.1:8082" size="21" title="vdrx WebSocket"><input id="wp" value="viewer" size="7" title="ws_profiles id"><input id="wt" type="password" placeholder="token" size="8"><button id="wc">Go live</button></span><span id="ws" class="m dim"></span>
+<span id="fn" class="dim m"></span>
+<label class="chk"><input type="checkbox" id="un"> show unused default lanes</label></header>
+<main><div id="view"></div><aside id="side"><div id="sd"></div><h2>Live messages</h2><div id="feed" class="m dim">not connected</div></aside></main>
+<dialog id="dlg"><form method="dialog"><textarea id="ta" placeholder="Paste vdrx.conf JSON"></textarea><p><button value="ok">Show</button> <button value="x">Cancel</button></p></form></dialog>
+<script>
+//#model
+const REPLY='http.reply.*';
+const L=v=>v==null||v===''?[]:Array.isArray(v)?v.map(s=>String(s).trim()):String(v).split(',').map(s=>s.trim()).filter(Boolean);
+const O=x=>x&&typeof x==='object'?x:{};
+// vdrx topic matching: '*' = one segment, '>' = the rest
+const tm=(f,t)=>{const a=f.split('.'),b=t.split('.');for(let i=0;i<a.length;i++){if(a[i]==='>')return b.length>i;if(i>=b.length)return false;if(a[i]!=='*'&&a[i]!==b[i])return false}return a.length===b.length};
+const ov=(p,q)=>{const x=p.split('.'),y=q.split('.');for(let i=0;;i++){if(x[i]==='>')return y.length>i;if(y[i]==='>')return x.length>i;if(i>=x.length||i>=y.length)return x.length===y.length;if(x[i]!=='*'&&y[i]!=='*'&&x[i]!==y[i])return false}};
+function merge(files){const m={};for(const f of files)for(const k in f.obj){const v=f.obj[k];if(Array.isArray(v))m[k]=(m[k]||[]).concat(v);else if(!(k in m))m[k]=v}return m}
+function build(c){
+ const N=[],I=[],A=k=>(Array.isArray(c[k])?c[k]:[]).map(O);
+ const off=e=>e.enabled===false||e.enabled==='false';
+ const n=(kind,e,id,sub,pub,label,x)=>N.push({kind,id,cfg:e,sub,pub,label,off:off(e),...x})-1;
+ const route=(e,id,pfx,allow)=>n('route',e,id,[REPLY],[e.in_topic||id+'.in'],(allow||'any')+' '+(pfx||'?'),{prefix:pfx,exec:false});
+ const cmd=e=>String(e.command||'').replace(/\{[A-Z_]+\}\/?/g,'').trim()||'(script itself)';
+ const ex={exec:true};
+ A('http_routes').forEach(e=>route(e,e.id||'?',e.prefix,e.allow||'POST'));
+ A('cgi').forEach(e=>{const id=e.id||'?';n('cgi',e,id,[e.in_topic||id+'.in'],[id+'.out',REPLY],cmd(e),{...ex,dflt:[id+'.out']});route(e,id,e.prefix,e.allow)});
+ A('cli_bridges').forEach(e=>{const id=e.id||'?',p=e.protocol||'cgi';
+  if(p!=='bus-daemon')n(p==='bus'?'runner':'cgi',e,id,[e.in_topic||id+'.in'],[id+'.out',REPLY],cmd(e),{...ex,dflt:[id+'.out'],legacy:1});
+  route(e,id,e.prefix,e.allow);I.push({sev:'note',msg:`cli_bridges "${id}" (${p}) is the legacy spelling - use cgi / runners + http_routes.`,nodes:[id]})});
+ A('runners').forEach(e=>{const id=e.id||'?';n('runner',e,id,e.subscribe!=null?L(e.subscribe):[id+'.in'],[e.publish||id+'.out',REPLY],cmd(e),{...ex,dflt:[id+'.out']})});
+ A('processes').forEach(e=>{const id=e.id||'?',pa=e.publish_allow!=null?e.publish_allow:e.publish;
+  n('process',e,id,e.subscribe!=null?L(e.subscribe):[id+'.in'],[id+'.out',...L(pa)],cmd(e)+(e.queue_group?'  [q:'+e.queue_group+']':''),{...ex,dflt:[id+'.out']});
+  if(e.publish!=null&&e.publish_allow==null)I.push({sev:'note',msg:`process "${id}": "publish" is deprecated, rename to "publish_allow".`,nodes:[id]})});
+ A('templates').forEach(e=>{const id=e.id||'?';n('template',e,id,e.subscribe!=null?L(e.subscribe):[id+'.in'],[REPLY],e.dir||'',ex)});
+ A('buckets').forEach(e=>{const id=e.id||e.name||'?';n('bucket',e,id,L(e.subscribe||e.topics),[],e.file||'bucket_'+id+'.jsonl',ex)});
+ A('socket_clients').forEach(e=>{const id=e.id||'?';n('socket',e,id,e.subscribe!=null?L(e.subscribe):[id+'.in'],[e.publish||id+'.out'],(e.host||'?')+':'+(e.port||'?'),{...ex,dflt:[id+'.out']})});
+ // lanes + links
+ const lanes=[],li={},lane=t=>li[t]??(li[t]=lanes.push({t,h:Math.round(lanes.length*137.5+20)%360,pubs:[],subs:[],ext:0})-1);
+ N.forEach(x=>{x.pub.forEach(lane);x.sub.forEach(lane)});
+ const links=[];
+ N.forEach((x,i)=>{for(const d of['pub','sub'])for(const s of x[d])lanes.forEach((l,j)=>{if(l.t===s||ov(s,l.t)){links.push({n:i,l:j,d,x:l.t===s});(d==='pub'?l.pubs:l.subs).push(i)}})});
+ // checks
+ const id2=t=>N.findIndex(x=>x.id===t||x.id+' '===t);
+ const seen={};N.filter(x=>x.exec).forEach(x=>{if(seen[x.id])I.push({sev:'err',msg:`Duplicate id "${x.id}" - executive ids must be unique.`,nodes:[x.id]});seen[x.id]=1});
+ const sites=A('http_sites'),routes=N.filter(x=>x.kind==='route'&&!x.off);
+ if(routes.length&&!sites.length)I.push({sev:'warn',msg:'HTTP routes are defined but there is no http_sites entry to serve them.',nodes:[]});
+ routes.forEach(r=>{const T=r.pub[0],cons=N.filter(x=>x.exec&&!x.off&&x.sub.some(s=>ov(s,T)));
+  if(!cons.length){const dis=N.filter(x=>x.exec&&x.off&&x.sub.some(s=>ov(s,T)));I.push({sev:'err',msg:`Route ${r.label} publishes to "${T}" but nothing subscribes${dis.length?' ('+dis.map(x=>x.id).join(', ')+' would, but is disabled)':''} - requests will time out (504).`,nodes:[r.id],topics:[T]})}
+  cons.filter(x=>x.kind==='process'&&!L(x.cfg.publish_allow!=null?x.cfg.publish_allow:x.cfg.publish).some(p=>tm(p,'http.reply.1'))).forEach(x=>
+   I.push({sev:'warn',msg:`Process "${x.id}" serves route ${r.label} but its publish_allow doesn't cover ${REPLY}, so it can't reply.`,nodes:[x.id],topics:[T]}));
+  if(!r.prefix)I.push({sev:'err',msg:`Route "${r.id}" has no prefix.`,nodes:[r.id]});
+  });
+ A('cgi').forEach(e=>{if(!e.doc_root&&!off(e))I.push({sev:'err',msg:`cgi "${e.id}" needs doc_root.`,nodes:[e.id]})});
+ const byP={};routes.forEach(r=>{if(!r.prefix)return;(byP[r.prefix]=byP[r.prefix]||[]).push(r)});
+ for(const p in byP)if(byP[p].length>1)I.push({sev:'err',msg:`${byP[p].length} routes share the prefix "${p}": ${byP[p].map(r=>r.id).join(', ')}.`,nodes:byP[p].map(r=>r.id)});
+ const proxies=A('processes').filter(e=>e.prefix&&!off(e));
+ proxies.forEach(e=>{if(byP[e.prefix])I.push({sev:'warn',msg:`Proxy prefix "${e.prefix}" (process ${e.id}) is also a route prefix; the proxy wins.`,nodes:[e.id]})});
+ A('cgi').filter(e=>e.prefix==='/'&&e.static!==false&&!off(e)).forEach(e=>{if(sites.some(s=>s.static_dir))I.push({sev:'note',msg:`cgi "${e.id}" serves prefix "/" with static files, so a site's static_dir is never reached.`,nodes:[e.id]})});
+ const rw=A('rewrites');rw.forEach(e=>{try{new RegExp(e.match)}catch(x){I.push({sev:'err',msg:`Rewrite "${e.match}": invalid regular expression.`,nodes:[]})}if(!e.to)I.push({sev:'err',msg:`Rewrite "${e.match}" has no "to".`,nodes:[]})});
+ N.forEach((x,i)=>{if(x.off)return;x.sub.forEach(s=>{if(s===x.id+'.in'||s==='>'||s.startsWith('sys.'))return;
+   if(!N.some(y=>y!==x&&!y.off&&y.pub.some(p=>ov(p,s))))I.push({sev:'note',msg:`"${x.id}" subscribes to "${s}" but nothing in this conf publishes it (fine if fed externally).`,nodes:[x.id],topics:[s]})});
+  x.pub.forEach(p=>{if(p===REPLY||(x.dflt||[]).includes(p))return;if(!N.some(y=>y!==x&&!y.off&&y.sub.some(s=>ov(s,p))))I.push({sev:'note',msg:`"${x.id}" may publish "${p}" but nothing subscribes to it.`,nodes:[x.id],topics:[p]})})});
+ if(c.includes&&c.includes.length)I.push({sev:'note',msg:'This conf has "includes" - they are not followed. Use "Add file…" for each included file to see the whole system.',nodes:[]});
+ const rank={err:0,warn:1,note:2};I.sort((a,b)=>rank[a.sev]-rank[b.sev]);
+ const edge={sites:sites.map(s=>`${s.id||'?'}  :${s.port||'?'}${s.tls_port?' / tls '+s.tls_port:''}${s.static_dir?'  static='+s.static_dir:''}`),
+  proxies:proxies.map(e=>`${e.prefix} → ${e.host||'127.0.0.1'}:${e.port||'?'}  (${e.id})`),rewrites:rw.map(e=>`${e.match} → ${e.to}${e.flag?' ['+e.flag+']':''}`)};
+ return{N,lanes,links,I,edge}}
+//#view
+const $=s=>document.querySelector(s),NS='http://www.w3.org/2000/svg';
+let files=[],M=null,live={};
+const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const cut=(s,k)=>s.length>k?s.slice(0,k-1)+'…':s;
+function draw(){
+ const show=$('#un').checked,{N,lanes,links,I,edge}=M;
+ const vis=lanes.map((l,j)=>{const ex=links.filter(k=>k.l===j&&k.x);return show||ex.some(k=>k.d==='sub')||ex.some(k=>k.d==='pub'&&!(N[k.n].dflt||[]).includes(l.t))});
+ const lo=[];lanes.forEach((l,j)=>vis[j]&&lo.push(j));
+ const ly={};lo.forEach((j,i)=>ly[j]=30+i*34);
+ const bary=(i,d)=>{const q=links.filter(k=>k.n===i&&k.d===d&&k.x&&vis[k.l]).map(k=>ly[k.l]);return q.length?q.reduce((a,b)=>a+b)/q.length:null};
+ const col=d=>N.map((x,i)=>i).filter(i=>bary(i,d)!==null).sort((a,b)=>bary(a,d)-bary(b,d));
+ const cl={pub:col('pub'),sub:col('sub')},ny={pub:{},sub:{}};
+ for(const d in cl)cl[d].forEach((i,r)=>ny[d][i]=30+r*54);
+ const H=Math.max(lo.length*34,cl.pub.length*54,cl.sub.length*54)+40;
+ let s=`<svg viewBox="0 0 1100 ${H}" id="sv"><text x="20" y="14" class="d">publishes</text><text x="850" y="14" class="d">subscribes</text>`;
+ const tag=(a,b,d)=>`data-n="${a}" data-l="${b}" data-d="${d}"`;
+ links.forEach(k=>{if(!vis[k.l])return;const y=ny[k.d][k.n];if(y===undefined)return;const Y=ly[k.l],h=lanes[k.l].h,c=`hsl(${h} 65% 58%)`,m=y+19;
+  s+=k.d==='pub'?`<path class="e${k.x?'':' x'}" ${tag(k.n,k.l,k.d)} stroke="${c}" d="M250,${m} C305,${m} 295,${Y} 340,${Y}"/>`
+   :`<path class="e${k.x?'':' x'}" ${tag(k.n,k.l,k.d)} stroke="${c}" d="M760,${Y} C805,${Y} 805,${m} 850,${m}"/>`});
+ lo.forEach(j=>{const l=lanes[j],y=ly[j],c=`hsl(${l.h} 65% 58%)`,np=links.some(k=>k.l===j&&k.x&&k.d==='pub'),ns=links.some(k=>k.l===j&&k.x&&k.d==='sub');
+  s+=`<g class="la" data-l="${j}" data-n="" style="cursor:pointer"><line class="ln" x1="340" x2="760" y1="${y}" y2="${y}" stroke="${c}"/><text x="348" y="${y-8}">${esc(cut(l.t,46))}</text><text class="d cnt" data-c="${j}" x="756" y="${y-8}" text-anchor="end"></text>`;
+  if(!np)s+=`<line x1="296" x2="340" y1="${y}" y2="${y}" stroke="${c}" stroke-dasharray="3 3"/><text class="d" x="270" y="${y+4}">ext?</text>`;
+  if(!ns)s+=`<line x1="760" x2="804" y1="${y}" y2="${y}" stroke="${c}" stroke-dasharray="3 3"/><text class="d" x="808" y="${y+4}">none</text>`;
+  s+='</g>'});
+ for(const d in cl)cl[d].forEach(i=>{const x=N[i],X=d==='pub'?20:850,y=ny[d][i];
+  s+=`<g class="nd${x.off?' off':''}" data-n="${i}" data-l="" transform="translate(${X},${y})"><rect class="nb" width="230" height="38" rx="3"/><text x="8" y="16" class="b">${esc(cut(x.id,24))}</text><text x="8" y="31" class="d">${esc(cut(x.kind+(x.legacy?'*':'')+' · '+x.label,31))}</text></g>`});
+ $('#view').innerHTML=s+'</svg>';
+ for(const j in live){const c=$(`.cnt[data-c="${j}"]`);if(c)c.textContent='×'+live[j].n}
+ const sv=$('#sv');
+ const focus=(ns,ls)=>{sv.classList.add('dm');sv.querySelectorAll('[data-n]').forEach(e=>{const n=e.dataset.n,l=e.dataset.l;if((n!==''&&ns.has(+n))&&(l===''||ls.has(+l))||(l!==''&&n===''&&ls.has(+l)))e.classList.add('hl')})};
+ const clear=()=>{sv.classList.remove('dm');sv.querySelectorAll('.hl').forEach(e=>e.classList.remove('hl'))};
+ const nodeSets=i=>{const ls=new Set(links.filter(k=>k.n===i).map(k=>k.l)),ns=new Set([i]);links.forEach(k=>{if(ls.has(k.l)&&k.x)ns.add(k.n)});return[ns,ls]};
+ const laneSets=j=>[new Set(links.filter(k=>k.l===j).map(k=>k.n)),new Set([j])];
+ sv.onmouseover=e=>{const g=e.target.closest('[data-n]');if(!g)return;clear();const[ns,ls]=g.dataset.l===''?nodeSets(+g.dataset.n):g.dataset.n===''?laneSets(+g.dataset.l):[new Set([+g.dataset.n]),new Set([+g.dataset.l])];
+  focus(ns,ls);sv.querySelectorAll('.nd').forEach(e=>ns.has(+e.dataset.n)&&e.classList.add('hl'))};
+ sv.onmouseleave=clear;
+ sv.onclick=e=>{const g=e.target.closest('.nd,.la');if(!g)return;g.classList.contains('nd')?detail(N[+g.dataset.n]):laneDetail(lanes[+g.dataset.l])};
+ window._pin=(nodes,topics)=>{clear();const ns=new Set(),ls=new Set();N.forEach((x,i)=>nodes.includes(x.id)&&ns.add(i));(topics||[]).forEach(t=>lanes.forEach((l,j)=>l.t===t&&ls.add(j)));
+  ns.forEach(i=>links.forEach(k=>k.n===i&&ls.add(k.l)));if(!ns.size&&!ls.size)return;ls.forEach(j=>links.forEach(k=>k.l===j&&k.x&&ns.add(k.n)));focus(ns,ls);sv.querySelectorAll('.nd').forEach(e=>ns.has(+e.dataset.n)&&e.classList.add('hl'))};
+}
+function side(extra){
+ const{I,edge,N,lanes}=M,cnt={err:0,warn:0,note:0};I.forEach(i=>cnt[i.sev]++);
+ let h=`<h2>Wiring checks <span class="dim">${cnt.err} errors · ${cnt.warn} warnings · ${cnt.note} notes</span></h2>`;
+ h+=I.length?I.map((i,k)=>`<div class="is ${i.sev}" data-i="${k}">${esc(i.msg)}</div>`).join(''):'<div class="dim">No problems found.</div>';
+ const sec=(t,a)=>a.length?`<h2>${t}</h2>`+a.map(x=>`<div class="m">${esc(x)}</div>`).join(''):'';
+ h+=sec('HTTP sites',edge.sites)+sec('Rewrites (applied first)',edge.rewrites)+sec('Reverse proxies (not on the bus)',edge.proxies);
+ h+=`<h2>${N.length} executives · ${lanes.length} topics</h2><div class="dim">Hover a node or lane to trace its path; click for details. Dashed edges go through a wildcard match. “ext?” = nothing here publishes it (fed externally); “none” = no subscriber. * = legacy cli_bridges.</div>`;
+ $('#sd').innerHTML=h+(extra||'');
+ $('#side').onclick=e=>{const d=e.target.closest('[data-i]');if(d){const i=I[+d.dataset.i];window._pin(i.nodes||[],i.topics)}};
+}
+const detail=x=>side(`<h2>${esc(x.id)} <span class="dim">${x.kind}${x.off?' (disabled)':''}</span></h2><div class="m">subscribes: ${esc(x.sub.join(', ')||'-')}<br>publishes: ${esc(x.pub.join(', ')||'-')}</div><pre>${esc(JSON.stringify(x.cfg,null,1))}</pre>`);
+const laneDetail=l=>{const{N}=M,L=live[M.lanes.indexOf(l)];side(`<h2>${esc(l.t)} <span class="dim">topic${L?' · ×'+L.n:''}</span></h2><div class="m">publishers: ${esc([...new Set(l.pubs)].map(i=>N[i].id).join(', ')||'none in this conf')}<br>subscribers: ${esc([...new Set(l.subs)].map(i=>N[i].id).join(', ')||'none')}</div>${L?`<h2>last message <span class="dim">${esc(L.last.topic)} ← ${esc(L.last.source)}</span></h2><pre>${esc(JSON.stringify(L.last.payload,null,1).slice(0,1500))}</pre>`:''}`)};
+function show(){if(!files.length)return;let c;try{c=merge(files);M=build(c)}catch(e){$('#sd').innerHTML='<div class="is err">'+esc(e.message)+'</div>';return}
+ if(ws)ws.close();live={};const wp=((c.executives||{}).ws||{}).port;if(wp&&!$('#wu').dataset.t)$('#wu').value='ws://127.0.0.1:'+wp;
+ $('#fn').textContent=files.map(f=>f.name).join(' + ');draw();side()}
+function add(obj,name,keep){if(!keep)files=[];files.push({name,obj});show()}
+function parse(txt,name,keep){try{add(JSON.parse(txt.replace(/^\uFEFF/,'')),name,keep)}catch(e){$('#sd').innerHTML=`<div class="is err">${esc(name)}: not valid JSON - ${esc(e.message)}</div>`}}
+async function load(fl,keep){let first=!keep;for(const f of fl){parse(await f.text(),f.name,!first);first=false}}
+$('#f').onchange=e=>{load([...e.target.files],false);e.target.value=''};$('#fa').onchange=e=>{load([...e.target.files],true);e.target.value=''};
+$('#un').onchange=()=>M&&draw();
+$('#pb').onclick=()=>$('#dlg').showModal();$('#dlg').onclose=()=>{if($('#dlg').returnValue==='ok'&&$('#ta').value.trim())parse($('#ta').value,'pasted',false)};
+addEventListener('dragover',e=>e.preventDefault());addEventListener('drop',e=>{e.preventDefault();load([...e.dataTransfer.files],e.shiftKey)});
+const DEMO={http_sites:[{id:'web',port:8080,static_dir:'static'}],rewrites:[{match:'^/blog/([0-9]+)/?$',to:'/post.php?id=$1'}],
+ cgi:[{id:'php',prefix:'/',command:'{PHP_CGI_BIN_FILENAME}',doc_root:'www',fallback:'/index.php'}],
+ runners:[{id:'hello',command:'php scripts/hello.php',subscribe:'hello.in'}],
+ http_routes:[{id:'hello',prefix:'/hello',allow:'GET,POST'},{id:'ghost',prefix:'/ghost',in_topic:'ghost.in'}],
+ processes:[{id:'echo',command:'php echo.php',subscribe:'echo.in',publish_allow:'echo.>'},{id:'irc',command:'hogircd',subscribe:'irc.in,chat.>',publish_allow:'chat.out,http.reply.*',queue_group:'workers'}],
+ socket_clients:[{id:'feed',host:'example.org',port:6667,publish:'chat.in'}],templates:[{id:'tpl',dir:'templates'}],buckets:[{id:'audit',subscribe:'chat.>,echo.>'}]};
+// ---- live mode: subscribe to exactly the lanes drawn, pulse them as messages arrive
+let ws=null,seen=new Set(),pend=[],dots=0;
+const wsS=t=>$('#ws').textContent=t;
+function dot(e){dots++;const c=document.createElementNS(NS,'circle'),a=document.createElementNS(NS,'animateMotion');c.setAttribute('r',3.5);c.setAttribute('fill',e.getAttribute('stroke'));
+ a.setAttribute('dur','.7s');a.setAttribute('path',e.getAttribute('d'));a.setAttribute('fill','freeze');c.appendChild(a);e.parentNode.appendChild(c);setTimeout(()=>{c.remove();dots--},750)}
+function pulse(j,f){const sv=$('#sv');if(!sv)return;const c=sv.querySelector(`.cnt[data-c="${j}"]`);if(c)c.textContent='×'+live[j].n;
+ const lg=sv.querySelector(`.la[data-l="${j}"]`);if(lg){lg.classList.add('pulse');setTimeout(()=>lg.classList.remove('pulse'),250)}
+ const es=[...sv.querySelectorAll(`.e[data-l="${j}"]`)].filter(e=>!e.classList.contains('x')),pub=es.filter(e=>e.dataset.d==='pub'),mine=pub.filter(e=>M.N[+e.dataset.n].id===f.source);
+ [...(mine.length?mine:pub),...es.filter(e=>e.dataset.d==='sub')].forEach(e=>{if(dots<60)dot(e)})}
+function feed(f){const d=document.createElement('div'),t=new Date().toTimeString().slice(0,8);d.textContent=`${t} ${f.topic} ← ${f.source}  ${JSON.stringify(f.payload).slice(0,110)}`;const fe=$('#feed');if(fe.classList.contains('dim')){fe.classList.remove('dim');fe.textContent=''}fe.prepend(d);while(fe.children.length>40)fe.lastChild.remove()}
+function tick(){let n=0;while(pend.length&&n++<40){const f=pend.shift();if(seen.has(f.seq))continue;seen.add(f.seq);if(seen.size>500)seen.delete(seen.values().next().value);
+  M.lanes.forEach((l,j)=>{if(!tm(l.t,f.topic))return;const L=live[j]=live[j]||{n:0};L.n++;L.last=f;pulse(j,f)});feed(f)}
+ if(pend.length>2000)pend.splice(0,pend.length-500);requestAnimationFrame(tick)}
+requestAnimationFrame(tick);
+$('#wu').oninput=e=>e.target.dataset.t=1;
+$('#wc').onclick=()=>{if(ws){ws.close();return}
+ if(!M){wsS('load a conf first');return}
+ try{ws=new WebSocket($('#wu').value.trim())}catch(e){wsS(e.message);ws=null;return}
+ live={};seen.clear();pend=[];draw();$('#feed').textContent='waiting for messages…';wsS('connecting…');$('#wc').textContent='Disconnect';
+ const den=[],me=ws;
+ ws.onopen=()=>{const a={method:'sys.auth',token:$('#wt').value},p=$('#wp').value.trim();if(p)a.profile=p;me.send(JSON.stringify(a))};
+ ws.onmessage=e=>{let f;try{f=JSON.parse(e.data)}catch(x){return}
+  if(f.event==='auth.ok'){wsS('live'+(f.profile?' as '+f.profile:''));M.lanes.forEach(l=>me.send(JSON.stringify({method:'subscribe',filter:l.t})))}
+  else if(f.event==='auth.fail')wsS('auth failed - check profile / token')
+  else if(f.event==='denied'){den.push(f.topic);wsS(`live - ${den.length} lane(s) not allowed for this profile: ${den.slice(0,3).join(', ')}`)}
+  else if(f.event==='dropped')wsS(`live - server dropped ${f.count} frames (viewer too slow)`)
+  else if(f.topic!==undefined)pend.push(f)};
+ ws.onclose=()=>{if(ws===me)ws=null;$('#wc').textContent='Go live';wsS('disconnected')};ws.onerror=()=>wsS('connection error')};
+$('#db').onclick=()=>add(DEMO,'demo',false);
+add(DEMO,'demo',false);
+</script></body></html>

@@ -596,6 +596,45 @@ does. This is usually the right tool for anything that needs to *push*
 updates to a browser continuously (chat, live state, notifications) -
 prefer it over polling a bus-CLI route.
 
+### 5a. What a client may do - `ws_profiles`
+
+Still one listener, but you can define *profiles* that decide what a
+client is allowed to subscribe to and publish:
+
+```json
+"ws_profiles": [
+  { "id": "viewer", "token": "vt", "subscribe_allow": ["demo.>", "http.reply.*"],
+    "publish_allow": [], "default_subscribe": "demo.>", "max_queue": 2000 },
+  { "id": "feeder", "token": "ft", "publish_allow": ["demo.>"] }
+]
+```
+
+`sys.auth` picks the profile: `{"method":"sys.auth","token":"vt"}` selects
+the profile whose token matches, `{"method":"sys.auth","profile":"viewer","token":"vt"}`
+names it (a profile with no `token` is open to anyone who names it - real
+per-profile auth is a later step). A bad token gets `{"event":"auth.fail"}`;
+`auth.ok` now carries the `profile`. After that:
+
+- **subscribe** must be *covered* by `subscribe_allow`: `demo.>` allows
+  `demo.x` and `demo.*` but not `>`; `demo.*` does not allow `demo.>`.
+- **publish** must match `publish_allow` (deny-by-default, same semantics as a
+  process's `publish_allow`). `sys.*` - the admin surface - is therefore
+  unreachable unless a profile lists it.
+- A refused call is answered with `{"event":"denied","method":...,"topic":...}`.
+- `default_subscribe` is applied right after a successful `sys.auth`
+  (filters outside `subscribe_allow` are skipped with a warning).
+- `max_queue` (default 5000, also the default without profiles) bounds the
+  frames held for a slow client; beyond it the *oldest* are dropped and the
+  client later receives `{"event":"dropped","count":N}`.
+
+With **no** `ws_profiles` the old rules stand (any non-empty token, then
+anything - startup logs a warning), and `executives.ws.default_subscribe`
+keeps working; once profiles exist it is ignored.
+
+Frames sent to a client are always valid JSON: a payload that already is
+JSON is embedded as-is, anything else (e.g. a plain-text log line) is sent as
+a JSON string. `ws_test/` has a black-box test (`ws_test.py`).
+
 **Internally**, a connection is actually two cooperating executives, not
 one - purely an implementation detail (the JSON-RPC surface above is
 unchanged either way), but worth knowing if you're reading logs or
@@ -815,8 +854,10 @@ scripts) resolve against that same working directory - see the gotcha in
 - The reverse proxy adds no `X-Forwarded-*` headers.
 - CGI output is buffered whole (no streaming), and has no size cap.
 
-- No authentication on the `sys.*` admin surface, or on WebSocket
-  (`sys.auth` accepts any non-empty token) - fine for a single-operator
+- The `sys.*` admin surface is only protected on WebSocket when `ws_profiles`
+  are defined (§5a); without them `sys.auth` accepts any non-empty token and
+  that client can publish `sys.quit`. Tokens are compared in plain text and
+  there is no per-token expiry - fine for a single-operator
   dev box, not yet for anything multi-tenant. This matters more now that
   §2-§4d mean more things than before are reachable purely by knowing a
   topic name - there's no per-topic access control yet, only "can you

@@ -695,6 +695,62 @@ begin
   end;
 end;
 
+// ws_profiles: what a WebSocket client may do, chosen by its sys.auth.
+//   id               required; a client can name it: {"method":"sys.auth","profile":"viewer"}
+//   token            optional; if set, sys.auth must present it (matching it alone also
+//                    selects the profile). Empty = anyone naming the profile gets it
+//                    (real per-profile auth comes later)
+//   subscribe_allow  filters a client may subscribe to; a filter must be COVERED
+//                    ("a.>" allows "a.b" and "a.*"; "a.*" does not allow "a.>")
+//   publish_allow    topics a client may publish to (deny-by-default, like a
+//                    process's publish_allow); "sys.*" is only reachable if listed
+//   default_subscribe  subscribed right after sys.auth (must be inside subscribe_allow)
+//   max_queue        frames held for a slow client before the oldest are dropped (5000)
+// With no ws_profiles at all, the old rules apply: any non-empty token, then anything.
+procedure SetupWSProfiles(AConfig: TVDRX_Config; AWS: TVDRX_WebSocketExecutive);
+var
+  Rows: TVDRX_ConfigRows;
+  Row: TStringList;
+  Profiles: TVDRX_WSProfiles;
+  n: Integer;
+begin
+  SetLength(Profiles, 0);
+  Rows := AConfig.GetObjectArray('ws_profiles');
+  try
+    for Row in Rows do
+    begin
+      if Row.Values['id'] = '' then
+      begin
+        WriteLn('  Skipping ws_profiles entry - needs an id.');
+        Continue;
+      end;
+      if not ConfBool(Row.Values['enabled'], True) then Continue;
+      n := Length(Profiles);
+      SetLength(Profiles, n + 1);
+      Profiles[n].ID := Row.Values['id'];
+      Profiles[n].Token := Row.Values['token'];
+      Profiles[n].SubscribeAllow := Row.Values['subscribe_allow'];
+      Profiles[n].PublishAllow := Row.Values['publish_allow'];
+      Profiles[n].DefaultSubscribe := Row.Values['default_subscribe'];
+      Profiles[n].MaxQueue := StrToIntDef(Row.Values['max_queue'], 5000);
+      WriteLn('  WebSocket profile "', Profiles[n].ID, '": subscribe=[', Profiles[n].SubscribeAllow,
+        '] publish=[', Profiles[n].PublishAllow, ']', IfThen(Profiles[n].Token <> '', ' (token required)', ' (no token)'));
+    end;
+  finally
+    Rows.Free;
+  end;
+  if not Assigned(AWS) then
+  begin
+    if Length(Profiles) > 0 then WriteLn('  ws_profiles defined but executives.ws is not enabled - ignored.');
+    Exit;
+  end;
+  AWS.Profiles := Profiles;
+  if Length(Profiles) = 0 then
+    WriteLn('  WebSocket: no ws_profiles - ANY non-empty token may subscribe to and publish anything, sys.* included.')
+  else if AWS.DefaultSubscribe <> '' then
+    WriteLn('  WebSocket: executives.ws.default_subscribe is ignored while ws_profiles exist - use a profile''s default_subscribe.');
+end;
+
 // runners: run an ordinary command-line program once per bus message (see
 // vdrx_runner.pas). Config:
 //   id            required; defaults: subscribe "<id>.in", publish "<id>.out"
@@ -980,6 +1036,7 @@ begin
       Kernel.Registry.Register(WS, 'ws', 'sys.none');
     end;
 
+    SetupWSProfiles(Config, WS);
     SetupProcesses(Config, Kernel.Registry, ShutdownGraceMs, Routes.Proxy);
     SetupSocketClients(Config, Kernel.Registry, ShutdownGraceMs);
     SetupRewrites(Config, Routes.Rewrites);

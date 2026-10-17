@@ -7,7 +7,7 @@ interface
 uses
   Classes, SysUtils, StrUtils, Sockets, SyncObjs, Process, vdrx_core,
   vdrx_config, vdrx_templates, vdrx_procutil, Generics.Collections,
-  openssl, resolve, {$IFDEF UNIX}BaseUnix,{$ENDIF} base64, sha1, fpjson, jsonparser, DateUtils, RegExpr;
+  openssl, resolve, {$IFDEF UNIX}BaseUnix,{$ENDIF} base64, sha1, fpjson, jsonparser, DateUtils, RegExpr, Types;
 
 type
 
@@ -68,6 +68,20 @@ type
     ServerPort: Word;
     Secure: Boolean;
   end;
+
+  // One "ws_profiles" entry. A WebSocket client picks a profile with sys.auth and
+  // from then on may only subscribe to filters covered by SubscribeAllow and
+  // publish to topics matching PublishAllow (comma-separated topic patterns,
+  // deny-by-default - the same semantics as a process's publish_allow).
+  TVDRX_WSProfile = record
+    ID: string;
+    Token: string;            // '' = anyone who names the profile may use it
+    SubscribeAllow: string;
+    PublishAllow: string;
+    DefaultSubscribe: string; // subscribed right after a successful sys.auth
+    MaxQueue: Integer;        // outbound frames queued before the oldest are dropped
+  end;
+  TVDRX_WSProfiles = array of TVDRX_WSProfile;
 
   TVDRX_Transport = class
   public
@@ -267,6 +281,8 @@ type
     FPingThread: TThread;
     FStopping: Boolean;
     FLastPong: TDateTime;
+    FMaxQueue: Integer;   // 0 = unbounded
+    FDropped: Integer;    // data frames dropped since the client was last told
     procedure PingLoop;
     procedure SendLoop;
     procedure EnqueueFrame(const APayload: string; AOpcode: Byte);
@@ -277,6 +293,7 @@ type
     constructor Create(ABus: TVDRX_MessageQueue; AListener: TVDRX_WebSocketExecutive; ATransport: TVDRX_Transport);
     destructor Destroy; override;
     property PendingRequest: string read FPendingRequest write FPendingRequest;
+    property MaxQueue: Integer read FMaxQueue write FMaxQueue;
     procedure SendFrame(const APayload: string; AOpcode: Byte = 1);
     procedure Initialize; override;
     procedure Shutdown; override;
@@ -290,6 +307,9 @@ type
     FListener: TVDRX_WebSocketExecutive;
     FConn: TVDRX_WSConnection;
     FAuthenticated: Boolean;
+    FProfile: TVDRX_WSProfile;   // only meaningful when the listener has ws_profiles
+    procedure Deny(const AMethod, ATopic: string);
+    procedure ApplyDefaultSubscribe;
   public
     constructor Create(ABus: TVDRX_MessageQueue; AListener: TVDRX_WebSocketExecutive; AConn: TVDRX_WSConnection); reintroduce;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
@@ -302,11 +322,17 @@ type
     FConnCounter: Integer;
     FPingIntervalMs, FPongTimeoutMs: Integer;
     FDefaultSubscribe: string;
+    FProfiles: TVDRX_WSProfiles;
   protected
     procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
     constructor Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config; ARegistry: TVDRX_Registry); reintroduce;
     property Registry: TVDRX_Registry read FRegistry;
+    // ws_profiles. With none defined the old behaviour stands (any non-empty
+    // token passes, then the client may subscribe/publish anything).
+    property Profiles: TVDRX_WSProfiles read FProfiles write FProfiles;
+    function ProfileMode: Boolean;
+    function ResolveProfile(const AName, AToken: string; out AProfile: TVDRX_WSProfile): Boolean;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
     procedure ApplyConfig; override;
     function NextConnID: string;
@@ -2403,6 +2429,7 @@ begin
   FSendEvent := TEvent.Create(nil, False, False, '');
   FSendQueue := TStringList.Create;
   FControlQueue := TStringList.Create;
+  FMaxQueue := 5000;
 end;
 
 destructor TVDRX_WSConnection.Destroy;
@@ -2599,7 +2626,16 @@ begin
     if AOpcode >= 8 then
       FControlQueue.Add(Char(AOpcode) + APayload)
     else
+    begin
+      // a client that can't keep up loses its OLDEST data frames rather than
+      // growing the queue without limit; SendLoop tells it how many
+      if (FMaxQueue > 0) and (FSendQueue.Count >= FMaxQueue) then
+      begin
+        FSendQueue.Delete(0);
+        Inc(FDropped);
+      end;
       FSendQueue.Add(Char(AOpcode) + APayload);
+    end;
   finally
     FSendLock.Leave;
   end;
@@ -2647,6 +2683,12 @@ begin
       Frame := '';
       FSendLock.Enter;
       try
+        // once the backlog has drained a bit, say how much was dropped
+        if (FDropped > 0) and (FSendQueue.Count <= FMaxQueue div 2) then
+        begin
+          FSendQueue.Insert(0, Char(1) + Format('{"event":"dropped","count":%d}', [FDropped]));
+          FDropped := 0;
+        end;
         if FControlQueue.Count > 0 then
         begin
           Frame := FControlQueue[0];
@@ -2705,6 +2747,66 @@ end;
 
 { TVDRX_WSProtocolExecutive }
 
+// Does the allow-pattern AAllow cover EVERY topic the filter AFilter could match?
+// ("http.reply.*" covers "http.reply.1" and "http.reply.*"; "a.*" does not
+// cover "a.>"; ">" covers everything.) This is what a subscribe must satisfy -
+// a plain TopicMatches would let a client subscribe to ">" if "x" were allowed.
+function TopicFilterCovers(const AAllow, AFilter: string): Boolean;
+var
+  A, F: TStringDynArray;
+  i: Integer;
+begin
+  Result := False;
+  if (AAllow = '') or (AFilter = '') then Exit;
+  A := SplitString(AAllow, '.');
+  F := SplitString(AFilter, '.');
+  for i := 0 to High(A) do
+  begin
+    if A[i] = '>' then Exit(Length(F) > i);
+    if i > High(F) then Exit(False);
+    if F[i] = '>' then Exit(False);
+    if A[i] = '*' then Continue;
+    if (F[i] = '*') or (F[i] <> A[i]) then Exit(False);
+  end;
+  Result := Length(F) = Length(A);
+end;
+
+function AnyPatternCovers(const AList, AFilter: string): Boolean;
+var
+  P: string;
+begin
+  Result := False;
+  for P in SplitString(AList, ',') do
+    if TopicFilterCovers(Trim(P), AFilter) then Exit(True);
+end;
+
+function AnyPatternMatches(const AList, ATopic: string): Boolean;
+var
+  P: string;
+begin
+  Result := False;
+  if ATopic = '' then Exit;
+  for P in SplitString(AList, ',') do
+    if (Trim(P) <> '') and TopicMatches(Trim(P), ATopic) then Exit(True);
+end;
+
+// A WebSocket frame carries the bus payload as JSON. Payloads that already are
+// JSON go through unchanged; anything else (a plain-text log line, say) becomes
+// a JSON string, so a frame is always valid JSON.
+function PayloadAsJSON(const APayload: string): string;
+var
+  J: TJSONData;
+begin
+  Result := CleanUTF8(APayload);
+  if Trim(Result) = '' then Exit('""');
+  try
+    J := GetJSON(Result);
+    J.Free;
+  except
+    Result := JSONString(Result);
+  end;
+end;
+
 constructor TVDRX_WSProtocolExecutive.Create(ABus: TVDRX_MessageQueue; AListener: TVDRX_WebSocketExecutive; AConn: TVDRX_WSConnection);
 begin
   inherited Create(ABus);
@@ -2713,12 +2815,29 @@ begin
   FAuthenticated := False;
 end;
 
+procedure TVDRX_WSProtocolExecutive.Deny(const AMethod, ATopic: string);
+begin
+  Bus.Publish('log.warn', 'ws ' + FConn.ID + ': profile "' + FProfile.ID + '" may not ' + AMethod + ' "' + ATopic + '"', ID);
+  Bus.Publish(FConn.ID + '.rpc.out', Format('{"event":"denied","method":%s,"topic":%s}', [JSONString(AMethod), JSONString(CleanUTF8(ATopic))]), ID);
+end;
+
+procedure TVDRX_WSProtocolExecutive.ApplyDefaultSubscribe;
+var
+  F: string;
+begin
+  for F in SplitString(FProfile.DefaultSubscribe, ',') do
+    if (Trim(F) <> '') and AnyPatternCovers(FProfile.SubscribeAllow, Trim(F)) then
+      FListener.Registry.Register(FConn, FConn.ID, Trim(F))
+    else if Trim(F) <> '' then
+      Bus.Publish('log.warn', 'ws profile "' + FProfile.ID + '": default_subscribe "' + Trim(F) + '" is not covered by subscribe_allow - skipped', ID);
+end;
+
 procedure TVDRX_WSProtocolExecutive.HandlePacket(const AMsg: TVDRX_Message);
 var
   J: TJSONData;
   Obj: TJSONObject;
   PayloadData: TJSONData;
-  Method, Topic, Payload, Token, Src: string;
+  Method, Topic, Payload, Token, Src, ProfName: string;
 begin
   try
     J := GetJSON(AMsg.Payload);
@@ -2734,10 +2853,29 @@ begin
     if Method = 'sys.auth' then
     begin
       Token := Obj.Get('token', '');
+      ProfName := Obj.Get('profile', '');
       Src := Obj.Get('source', FConn.ID);
+      if FListener.ProfileMode then
+      begin
+        // ws_profiles: the token (or the named profile) selects what this client may do
+        FAuthenticated := FListener.ResolveProfile(ProfName, Token, FProfile);
+        if FAuthenticated then
+        begin
+          if FProfile.MaxQueue > 0 then FConn.MaxQueue := FProfile.MaxQueue;
+          Bus.Publish('log.info', 'ws ' + FConn.ID + ': authenticated as profile "' + FProfile.ID + '"', ID);
+          Bus.Publish(FConn.ID + '.rpc.out', Format('{"event":"auth.ok","source":%s,"profile":%s}', [JSONString(Src), JSONString(FProfile.ID)]), ID);
+          ApplyDefaultSubscribe;
+        end
+        else
+        begin
+          Bus.Publish('log.warn', 'ws ' + FConn.ID + ': sys.auth rejected (profile "' + ProfName + '")', ID);
+          Bus.Publish(FConn.ID + '.rpc.out', '{"event":"auth.fail"}', ID);
+        end;
+        Exit;
+      end;
       FAuthenticated := Token <> '';
       if FAuthenticated then
-        Bus.Publish('log.info', 'ws ' + FConn.ID + ': authenticated (stub - any nonempty token passes)', ID)
+        Bus.Publish('log.info', 'ws ' + FConn.ID + ': authenticated (no ws_profiles defined - any nonempty token passes)', ID)
       else
         Bus.Publish('log.warn', 'ws ' + FConn.ID + ': sys.auth sent with an empty token, rejected', ID);
       Bus.Publish(FConn.ID + '.rpc.out', Format('{"event":"auth.ok","source":%s}', [JSONString(Src)]), ID);
@@ -2753,6 +2891,11 @@ begin
     if Method = 'subscribe' then
     begin
       Topic := Obj.Get('filter', '');
+      if FListener.ProfileMode and not AnyPatternCovers(FProfile.SubscribeAllow, Topic) then
+      begin
+        Deny('subscribe', Topic);
+        Exit;
+      end;
       Bus.Publish('log.info', 'ws ' + FConn.ID + ': subscribe "' + Topic + '"', ID);
       FListener.Registry.Register(FConn, FConn.ID, Topic);
     end
@@ -2770,6 +2913,11 @@ begin
     else if Method = 'publish' then
     begin
       Topic := Obj.Get('topic', '');
+      if FListener.ProfileMode and not AnyPatternMatches(FProfile.PublishAllow, Topic) then
+      begin
+        Deny('publish', Topic);
+        Exit;
+      end;
       PayloadData := Obj.Find('payload');
       if not Assigned(PayloadData) then
         Payload := '{}'
@@ -2902,7 +3050,7 @@ begin
     Exit;
   end;
   SendFrame(Format('{"topic":%s,"payload":%s,"source":%s,"seq":%d}',
-    [JSONString(AMsg.Topic), AMsg.Payload, JSONString(AMsg.SourceID), AMsg.Seq]));
+    [JSONString(CleanUTF8(AMsg.Topic)), PayloadAsJSON(AMsg.Payload), JSONString(CleanUTF8(AMsg.SourceID)), AMsg.Seq]));
 end;
 
 { TVDRX_WebSocketExecutive }
@@ -2916,6 +3064,36 @@ begin
   FConnCounter := 0;
   FPingIntervalMs := 15000;
   FPongTimeoutMs := 10000;
+end;
+
+function TVDRX_WebSocketExecutive.ProfileMode: Boolean;
+begin
+  Result := Length(FProfiles) > 0;
+end;
+
+// By name ("profile" in sys.auth): that profile, if its token is empty or matches.
+// Without a name: the first profile whose (non-empty) token matches.
+function TVDRX_WebSocketExecutive.ResolveProfile(const AName, AToken: string; out AProfile: TVDRX_WSProfile): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 0 to High(FProfiles) do
+    if AName <> '' then
+    begin
+      if FProfiles[i].ID <> AName then Continue;
+      if (FProfiles[i].Token = '') or (FProfiles[i].Token = AToken) then
+      begin
+        AProfile := FProfiles[i];
+        Exit(True);
+      end;
+      Exit(False);
+    end
+    else if (FProfiles[i].Token <> '') and (FProfiles[i].Token = AToken) then
+    begin
+      AProfile := FProfiles[i];
+      Exit(True);
+    end;
 end;
 
 function TVDRX_WebSocketExecutive.NextConnID: string;
@@ -2937,7 +3115,8 @@ begin
   Bus.Publish('sys.ws.connected', Format('{"id":%s}', [JSONString(NewID)]), ID);
   Bus.Publish('log.info', 'ws: new connection ' + NewID, ID);
   FRegistry.Register(Conn, NewID, NewID + '.rpc.out');
-  if FDefaultSubscribe <> '' then
+  // with ws_profiles, nothing is subscribed until sys.auth picks a profile
+  if (FDefaultSubscribe <> '') and not ProfileMode then
     for Filter in SplitString(FDefaultSubscribe, ',') do
       FRegistry.Register(Conn, NewID, Trim(Filter));
   Protocol := TVDRX_WSProtocolExecutive.Create(Bus, Self, Conn);
