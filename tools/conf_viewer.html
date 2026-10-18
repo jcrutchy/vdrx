@@ -24,8 +24,15 @@ svg text{font:12px ui-monospace,Consolas,monospace;fill:var(--fg)}svg .d{fill:va
 .dm .nd,.dm .e,.dm .la{opacity:.12}.dm .hl{opacity:1!important}.dm .e.hl{stroke-width:2.6}
 input{font:12px ui-monospace,Consolas,monospace;color:var(--fg);background:var(--bg);border:1px solid var(--ln);border-radius:4px;padding:3px 6px}
 .lv{display:flex;gap:4px;align-items:center;margin-left:8px}
-.la .ln{transition:stroke-width .25s}.la.pulse .ln{stroke-width:10}.e.pulse{opacity:1;stroke-width:3}
-#feed div{border-top:1px solid var(--ln);padding:2px 0;word-break:break-all}
+.la .ln{transition:stroke-width .25s,filter .4s}.la.pulse .ln{stroke-width:10}.la.hot .ln{filter:drop-shadow(0 0 5px var(--c))}
+.fl{stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-dasharray:3 17;opacity:.3;animation:flow 2.6s linear infinite}
+.la.hot .fl{animation-duration:.45s;opacity:.95;stroke-width:3}.nd.hot .nb{stroke:var(--c);stroke-width:2;filter:drop-shadow(0 0 6px var(--c))}
+@keyframes flow{to{stroke-dashoffset:-20}}
+@media(prefers-reduced-motion:reduce){.fl{animation:none}}
+#term{border-top:1px solid var(--ln);background:var(--pn);height:200px;display:flex;flex-direction:column}#term.min{height:auto}#term.min #tb{display:none}
+#th{display:flex;gap:6px;align-items:center;padding:3px 10px;border-bottom:1px solid var(--ln)}#th b{font-size:12px}#th input{width:170px}
+#th button{padding:0 8px;font-size:12px}#tb{flex:1;overflow:auto;padding:4px 10px;font:12px/1.35 ui-monospace,Consolas,monospace}
+#tb div{white-space:pre-wrap;word-break:break-all;cursor:pointer}#tb .dim{cursor:default}
 dialog{background:var(--pn);color:var(--fg);border:1px solid var(--ln);border-radius:6px;width:min(640px,92vw)}
 textarea{width:100%;height:260px;background:var(--bg);color:var(--fg);border:1px solid var(--ln);font:12px ui-monospace,monospace}
 @media(max-width:800px){main{grid-template-columns:1fr;grid-template-rows:60vh auto}aside{border-left:0;border-top:1px solid var(--ln)}}
@@ -33,11 +40,12 @@ textarea{width:100%;height:260px;background:var(--bg);color:var(--fg);border:1px
 <header><h1>vdrx conf viewer</h1>
 <label class="b">Open…<input id="f" type="file" multiple hidden></label>
 <label class="b">Add file…<input id="fa" type="file" multiple hidden></label>
-<button id="pb">Paste…</button><button id="db">Demo</button>
+<button id="pb">Paste…</button><button id="ob" title="read a conf from the vdrx host through the bus">Open via bus…</button><button id="li" title="follow top-level includes through the bus">Load includes</button><button id="db">Demo</button>
 <span class="lv"><input id="wu" value="ws://127.0.0.1:8082" size="21" title="vdrx WebSocket"><input id="wp" value="viewer" size="7" title="ws_profiles id"><input id="wt" type="password" placeholder="token" size="8"><button id="wc">Go live</button></span><span id="ws" class="m dim"></span>
 <span id="fn" class="dim m"></span>
 <label class="chk"><input type="checkbox" id="un"> show unused default lanes</label></header>
-<main><div id="view"></div><aside id="side"><div id="sd"></div><h2>Live messages</h2><div id="feed" class="m dim">not connected</div></aside></main>
+<main><div id="view"></div><aside id="side"><div id="sd"></div></aside></main>
+<section id="term"><div id="th"><b>bus</b><input id="tf" placeholder="filter" title="show only lines containing this"><button id="tp">Pause</button><button id="tc">Clear</button><button id="tm" title="collapse / expand">▾</button></div><div id="tb"><div class="dim">not connected - press Go live to watch the bus</div></div></section>
 <dialog id="dlg"><form method="dialog"><textarea id="ta" placeholder="Paste vdrx.conf JSON"></textarea><p><button value="ok">Show</button> <button value="x">Cancel</button></p></form></dialog>
 <script>
 //#model
@@ -93,14 +101,14 @@ function build(c){
  N.forEach((x,i)=>{if(x.off)return;x.sub.forEach(s=>{if(s===x.id+'.in'||s==='>'||s.startsWith('sys.'))return;
    if(!N.some(y=>y!==x&&!y.off&&y.pub.some(p=>ov(p,s))))I.push({sev:'note',msg:`"${x.id}" subscribes to "${s}" but nothing in this conf publishes it (fine if fed externally).`,nodes:[x.id],topics:[s]})});
   x.pub.forEach(p=>{if(p===REPLY||(x.dflt||[]).includes(p))return;if(!N.some(y=>y!==x&&!y.off&&y.sub.some(s=>ov(s,p))))I.push({sev:'note',msg:`"${x.id}" may publish "${p}" but nothing subscribes to it.`,nodes:[x.id],topics:[p]})})});
- if(c.includes&&c.includes.length)I.push({sev:'note',msg:'This conf has "includes" - they are not followed. Use "Add file…" for each included file to see the whole system.',nodes:[]});
+ if(c.includes&&c.includes.length&&!c._inc)I.push({sev:'note',msg:'This conf has "includes" that are not loaded yet. Go live and press "Load includes" (needs the confserver runner), or use "Add file…" per file.',nodes:[]});
  const rank={err:0,warn:1,note:2};I.sort((a,b)=>rank[a.sev]-rank[b.sev]);
  const edge={sites:sites.map(s=>`${s.id||'?'}  :${s.port||'?'}${s.tls_port?' / tls '+s.tls_port:''}${s.static_dir?'  static='+s.static_dir:''}`),
   proxies:proxies.map(e=>`${e.prefix} → ${e.host||'127.0.0.1'}:${e.port||'?'}  (${e.id})`),rewrites:rw.map(e=>`${e.match} → ${e.to}${e.flag?' ['+e.flag+']':''}`)};
  return{N,lanes,links,I,edge}}
 //#view
 const $=s=>document.querySelector(s),NS='http://www.w3.org/2000/svg';
-let files=[],M=null,live={};
+let files=[],M=null,live={},incOK=false,authed=false;
 const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const cut=(s,k)=>s.length>k?s.slice(0,k-1)+'…':s;
 function draw(){
@@ -111,20 +119,22 @@ function draw(){
  const bary=(i,d)=>{const q=links.filter(k=>k.n===i&&k.d===d&&k.x&&vis[k.l]).map(k=>ly[k.l]);return q.length?q.reduce((a,b)=>a+b)/q.length:null};
  const col=d=>N.map((x,i)=>i).filter(i=>bary(i,d)!==null).sort((a,b)=>bary(a,d)-bary(b,d));
  const cl={pub:col('pub'),sub:col('sub')},ny={pub:{},sub:{}};
- for(const d in cl)cl[d].forEach((i,r)=>ny[d][i]=30+r*54);
- const H=Math.max(lo.length*34,cl.pub.length*54,cl.sub.length*54)+40;
+ const Hn=Math.max(cl.pub.length*54,cl.sub.length*54,lo.length*34),ax=30+Hn/2-8;   // common horizontal axis
+ for(const d in cl)cl[d].forEach((i,r)=>ny[d][i]=ax-(cl[d].length*54-16)/2+r*54);
+ lo.forEach((j,i)=>ly[j]=ax-(lo.length-1)*17+i*34);
+ const H=Hn+70;
  let s=`<svg viewBox="0 0 1100 ${H}" id="sv"><text x="20" y="14" class="d">publishes</text><text x="850" y="14" class="d">subscribes</text>`;
  const tag=(a,b,d)=>`data-n="${a}" data-l="${b}" data-d="${d}"`;
- links.forEach(k=>{if(!vis[k.l])return;const y=ny[k.d][k.n];if(y===undefined)return;const Y=ly[k.l],h=lanes[k.l].h,c=`hsl(${h} 65% 58%)`,m=y+19;
+ links.forEach(k=>{if(!vis[k.l])return;const y=ny[k.d][k.n];if(y===undefined)return;const Y=ly[k.l],h=lanes[k.l].h,c=`hsl(${h},65%,58%)`,m=y+19;
   s+=k.d==='pub'?`<path class="e${k.x?'':' x'}" ${tag(k.n,k.l,k.d)} stroke="${c}" d="M250,${m} C305,${m} 295,${Y} 340,${Y}"/>`
    :`<path class="e${k.x?'':' x'}" ${tag(k.n,k.l,k.d)} stroke="${c}" d="M760,${Y} C805,${Y} 805,${m} 850,${m}"/>`});
  lo.forEach(j=>{const l=lanes[j],y=ly[j],c=`hsl(${l.h} 65% 58%)`,np=links.some(k=>k.l===j&&k.x&&k.d==='pub'),ns=links.some(k=>k.l===j&&k.x&&k.d==='sub');
-  s+=`<g class="la" data-l="${j}" data-n="" style="cursor:pointer"><line class="ln" x1="340" x2="760" y1="${y}" y2="${y}" stroke="${c}"/><text x="348" y="${y-8}">${esc(cut(l.t,46))}</text><text class="d cnt" data-c="${j}" x="756" y="${y-8}" text-anchor="end"></text>`;
+  s+=`<g class="la" data-l="${j}" data-n="" style="cursor:pointer;--c:${c}"><line class="ln" x1="340" x2="760" y1="${y}" y2="${y}" stroke="${c}"/><line class="fl" x1="340" x2="760" y1="${y}" y2="${y}"/><text x="348" y="${y-8}">${esc(cut(l.t,46))}</text><text class="d cnt" data-c="${j}" x="756" y="${y-8}" text-anchor="end"></text>`;
   if(!np)s+=`<line x1="296" x2="340" y1="${y}" y2="${y}" stroke="${c}" stroke-dasharray="3 3"/><text class="d" x="270" y="${y+4}">ext?</text>`;
   if(!ns)s+=`<line x1="760" x2="804" y1="${y}" y2="${y}" stroke="${c}" stroke-dasharray="3 3"/><text class="d" x="808" y="${y+4}">none</text>`;
   s+='</g>'});
  for(const d in cl)cl[d].forEach(i=>{const x=N[i],X=d==='pub'?20:850,y=ny[d][i];
-  s+=`<g class="nd${x.off?' off':''}" data-n="${i}" data-l="" transform="translate(${X},${y})"><rect class="nb" width="230" height="38" rx="3"/><text x="8" y="16" class="b">${esc(cut(x.id,24))}</text><text x="8" y="31" class="d">${esc(cut(x.kind+(x.legacy?'*':'')+' · '+x.label,31))}</text></g>`});
+  s+=`<g class="nd${x.off?' off':''}" data-n="${i}" data-l="" data-d="${d}" transform="translate(${X},${y})"><rect class="nb" width="230" height="38" rx="3"/><text x="8" y="16" class="b">${esc(cut(x.id,24))}</text><text x="8" y="31" class="d">${esc(cut(x.kind+(x.legacy?'*':'')+' · '+x.label,31))}</text></g>`});
  $('#view').innerHTML=s+'</svg>';
  for(const j in live){const c=$(`.cnt[data-c="${j}"]`);if(c)c.textContent='×'+live[j].n}
  const sv=$('#sv');
@@ -151,10 +161,10 @@ function side(extra){
 }
 const detail=x=>side(`<h2>${esc(x.id)} <span class="dim">${x.kind}${x.off?' (disabled)':''}</span></h2><div class="m">subscribes: ${esc(x.sub.join(', ')||'-')}<br>publishes: ${esc(x.pub.join(', ')||'-')}</div><pre>${esc(JSON.stringify(x.cfg,null,1))}</pre>`);
 const laneDetail=l=>{const{N}=M,L=live[M.lanes.indexOf(l)];side(`<h2>${esc(l.t)} <span class="dim">topic${L?' · ×'+L.n:''}</span></h2><div class="m">publishers: ${esc([...new Set(l.pubs)].map(i=>N[i].id).join(', ')||'none in this conf')}<br>subscribers: ${esc([...new Set(l.subs)].map(i=>N[i].id).join(', ')||'none')}</div>${L?`<h2>last message <span class="dim">${esc(L.last.topic)} ← ${esc(L.last.source)}</span></h2><pre>${esc(JSON.stringify(L.last.payload,null,1).slice(0,1500))}</pre>`:''}`)};
-function show(){if(!files.length)return;let c;try{c=merge(files);M=build(c)}catch(e){$('#sd').innerHTML='<div class="is err">'+esc(e.message)+'</div>';return}
- if(ws)ws.close();live={};const wp=((c.executives||{}).ws||{}).port;if(wp&&!$('#wu').dataset.t)$('#wu').value='ws://127.0.0.1:'+wp;
+function show(){if(!files.length)return;let c;try{c=merge(files);c._inc=incOK;M=build(c)}catch(e){$('#sd').innerHTML='<div class="is err">'+esc(e.message)+'</div>';return}
+ live={};if(ws&&authed)subAll();const wp=((c.executives||{}).ws||{}).port;if(wp&&!$('#wu').dataset.t)$('#wu').value='ws://127.0.0.1:'+wp;
  $('#fn').textContent=files.map(f=>f.name).join(' + ');draw();side()}
-function add(obj,name,keep){if(!keep)files=[];files.push({name,obj});show()}
+function add(obj,name,keep,dir){if(!keep){files=[];incOK=false}files.push({name,obj,dir});show()}
 function parse(txt,name,keep){try{add(JSON.parse(txt.replace(/^\uFEFF/,'')),name,keep)}catch(e){$('#sd').innerHTML=`<div class="is err">${esc(name)}: not valid JSON - ${esc(e.message)}</div>`}}
 async function load(fl,keep){let first=!keep;for(const f of fl){parse(await f.text(),f.name,!first);first=false}}
 $('#f').onchange=e=>{load([...e.target.files],false);e.target.value=''};$('#fa').onchange=e=>{load([...e.target.files],true);e.target.value=''};
@@ -167,34 +177,72 @@ const DEMO={http_sites:[{id:'web',port:8080,static_dir:'static'}],rewrites:[{mat
  http_routes:[{id:'hello',prefix:'/hello',allow:'GET,POST'},{id:'ghost',prefix:'/ghost',in_topic:'ghost.in'}],
  processes:[{id:'echo',command:'php echo.php',subscribe:'echo.in',publish_allow:'echo.>'},{id:'irc',command:'hogircd',subscribe:'irc.in,chat.>',publish_allow:'chat.out,http.reply.*',queue_group:'workers'}],
  socket_clients:[{id:'feed',host:'example.org',port:6667,publish:'chat.in'}],templates:[{id:'tpl',dir:'templates'}],buckets:[{id:'audit',subscribe:'chat.>,echo.>'}]};
-// ---- live mode: subscribe to exactly the lanes drawn, pulse them as messages arrive
-let ws=null,seen=new Set(),pend=[],dots=0;
-const wsS=t=>$('#ws').textContent=t;
-function dot(e){dots++;const c=document.createElementNS(NS,'circle'),a=document.createElementNS(NS,'animateMotion');c.setAttribute('r',3.5);c.setAttribute('fill',e.getAttribute('stroke'));
- a.setAttribute('dur','.7s');a.setAttribute('path',e.getAttribute('d'));a.setAttribute('fill','freeze');c.appendChild(a);e.parentNode.appendChild(c);setTimeout(()=>{c.remove();dots--},750)}
+// ---- live mode: subscribe to exactly the lanes drawn; animate the bus as messages arrive
+let ws=null,seen=new Set(),pend=[],dots=0,req={},paused=false,den=[];
+const wsS=t=>$('#ws').textContent=t,RF='viewer.reply.*',C=h=>`hsl(${h},65%,58%)`;
+const tb=$('#tb'),T2=n=>String(n).padStart(2,'0'),stamp=()=>{const d=new Date();return`${T2(d.getHours())}:${T2(d.getMinutes())}:${T2(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3,'0')}`};
+function tline(txt,h,lane){if(paused&&h!=null)return;const d=document.createElement('div');d.textContent=txt;d.dataset.s=txt.toLowerCase();
+ if(h==null)d.className='dim';else{d.style.color=C(h);d.dataset.l=lane}
+ if(tb.firstChild&&tb.firstChild.className==='dim'&&tb.children.length===1&&tb.firstChild.textContent.startsWith('not connected'))tb.textContent='';
+ const q=$('#tf').value.toLowerCase();if(q&&!d.dataset.s.includes(q))d.style.display='none';
+ const stick=tb.scrollTop+tb.clientHeight>=tb.scrollHeight-30;tb.append(d);while(tb.children.length>600)tb.firstChild.remove();if(stick)tb.scrollTop=tb.scrollHeight}
+const sys=t=>tline(stamp()+'  '+t,null);
+$('#tf').oninput=()=>{const q=$('#tf').value.toLowerCase();for(const d of tb.children)d.style.display=!q||d.dataset.s.includes(q)?'':'none'};
+$('#tp').onclick=e=>{paused=!paused;e.target.textContent=paused?'Resume':'Pause'};
+$('#tc').onclick=()=>tb.textContent='';$('#tm').onclick=()=>$('#term').classList.toggle('min');
+tb.onclick=e=>{const d=e.target.closest('[data-l]');if(d&&window._pin)window._pin([],[d.dataset.l])};
+const bestLane=topic=>{let b=null;const wild=t=>/[*>]/.test(t);M.lanes.forEach((l,j)=>{if(!tm(l.t,topic))return;if(!b||(wild(b.l.t)&&!wild(l.t))||l.t===topic)b={l,j}});return b};
+function dot(d,color,dur,r){if(dots>70)return;dots++;const sv=$('#sv');if(!sv)return;const c=document.createElementNS(NS,'circle'),a=document.createElementNS(NS,'animateMotion');
+ c.setAttribute('r',r||3.5);c.setAttribute('fill',color);c.style.filter=`drop-shadow(0 0 4px ${color})`;a.setAttribute('dur',dur+'s');a.setAttribute('path',d);a.setAttribute('fill','freeze');
+ c.appendChild(a);sv.appendChild(c);setTimeout(()=>{c.remove();dots--},dur*1000+60)}
+function glow(el,ms){el.classList.add('hot');clearTimeout(el._t);el._t=setTimeout(()=>el.classList.remove('hot'),ms)}
 function pulse(j,f){const sv=$('#sv');if(!sv)return;const c=sv.querySelector(`.cnt[data-c="${j}"]`);if(c)c.textContent='×'+live[j].n;
- const lg=sv.querySelector(`.la[data-l="${j}"]`);if(lg){lg.classList.add('pulse');setTimeout(()=>lg.classList.remove('pulse'),250)}
- const es=[...sv.querySelectorAll(`.e[data-l="${j}"]`)].filter(e=>!e.classList.contains('x')),pub=es.filter(e=>e.dataset.d==='pub'),mine=pub.filter(e=>M.N[+e.dataset.n].id===f.source);
- [...(mine.length?mine:pub),...es.filter(e=>e.dataset.d==='sub')].forEach(e=>{if(dots<60)dot(e)})}
-function feed(f){const d=document.createElement('div'),t=new Date().toTimeString().slice(0,8);d.textContent=`${t} ${f.topic} ← ${f.source}  ${JSON.stringify(f.payload).slice(0,110)}`;const fe=$('#feed');if(fe.classList.contains('dim')){fe.classList.remove('dim');fe.textContent=''}fe.prepend(d);while(fe.children.length>40)fe.lastChild.remove()}
+ const lg=sv.querySelector(`.la[data-l="${j}"]`),col=C(M.lanes[j].h);if(!lg)return;
+ lg.classList.add('pulse');setTimeout(()=>lg.classList.remove('pulse'),220);glow(lg,1400);
+ const es=[...sv.querySelectorAll(`.e[data-l="${j}"]`)].filter(e=>!e.classList.contains('x')),pub=es.filter(e=>e.dataset.d==='pub'),mine=pub.filter(e=>M.N[+e.dataset.n].id===f.source),
+  ly=+lg.querySelector('.ln').getAttribute('y1');
+ // packet journey: publisher -> along the lane -> every subscriber
+ (mine.length?mine:pub).forEach(e=>{dot(e.getAttribute('d'),col,.5);const n=sv.querySelector(`.nd[data-n="${e.dataset.n}"][data-d="pub"]`);if(n){n.style.setProperty('--c',col);glow(n,700)}});
+ setTimeout(()=>dot(`M340,${ly} L760,${ly}`,col,.6,5),450);
+ setTimeout(()=>es.filter(e=>e.dataset.d==='sub').forEach(e=>{dot(e.getAttribute('d'),col,.5);const n=sv.querySelector(`.nd[data-n="${e.dataset.n}"][data-d="sub"]`);if(n){n.style.setProperty('--c',col);glow(n,700)}}),1030)}
 function tick(){let n=0;while(pend.length&&n++<40){const f=pend.shift();if(seen.has(f.seq))continue;seen.add(f.seq);if(seen.size>500)seen.delete(seen.values().next().value);
-  M.lanes.forEach((l,j)=>{if(!tm(l.t,f.topic))return;const L=live[j]=live[j]||{n:0};L.n++;L.last=f;pulse(j,f)});feed(f)}
+  const b=bestLane(f.topic);M.lanes.forEach((l,j)=>{if(!tm(l.t,f.topic))return;const L=live[j]=live[j]||{n:0};L.n++;L.last=f;pulse(j,f)});
+  tline(`${stamp()}  ${f.topic}  ← ${f.source}  ${typeof f.payload==='string'?f.payload:JSON.stringify(f.payload)}`.slice(0,400),b?b.l.h:200,b?b.l.t:'')}
  if(pend.length>2000)pend.splice(0,pend.length-500);requestAnimationFrame(tick)}
 requestAnimationFrame(tick);
+function subAll(){const w=ws;w.send(JSON.stringify({method:'unsubscribe_all'}));w.send(JSON.stringify({method:'subscribe',filter:RF}));M.lanes.forEach(l=>w.send(JSON.stringify({method:'subscribe',filter:l.t})))}
 $('#wu').oninput=e=>e.target.dataset.t=1;
 $('#wc').onclick=()=>{if(ws){ws.close();return}
  if(!M){wsS('load a conf first');return}
  try{ws=new WebSocket($('#wu').value.trim())}catch(e){wsS(e.message);ws=null;return}
- live={};seen.clear();pend=[];draw();$('#feed').textContent='waiting for messages…';wsS('connecting…');$('#wc').textContent='Disconnect';
- const den=[],me=ws;
+ live={};seen.clear();pend=[];den=[];draw();wsS('connecting…');$('#wc').textContent='Disconnect';sys('connecting to '+$('#wu').value.trim());
+ const me=ws;
  ws.onopen=()=>{const a={method:'sys.auth',token:$('#wt').value},p=$('#wp').value.trim();if(p)a.profile=p;me.send(JSON.stringify(a))};
  ws.onmessage=e=>{let f;try{f=JSON.parse(e.data)}catch(x){return}
-  if(f.event==='auth.ok'){wsS('live'+(f.profile?' as '+f.profile:''));M.lanes.forEach(l=>me.send(JSON.stringify({method:'subscribe',filter:l.t})))}
-  else if(f.event==='auth.fail')wsS('auth failed - check profile / token')
-  else if(f.event==='denied'){den.push(f.topic);wsS(`live - ${den.length} lane(s) not allowed for this profile: ${den.slice(0,3).join(', ')}`)}
-  else if(f.event==='dropped')wsS(`live - server dropped ${f.count} frames (viewer too slow)`)
-  else if(f.topic!==undefined)pend.push(f)};
- ws.onclose=()=>{if(ws===me)ws=null;$('#wc').textContent='Go live';wsS('disconnected')};ws.onerror=()=>wsS('connection error')};
+  if(f.event==='auth.ok'){authed=true;wsS('live'+(f.profile?' as '+f.profile:''));sys('authenticated'+(f.profile?' as profile "'+f.profile+'"':'')+' - subscribing to '+M.lanes.length+' lanes');subAll()}
+  else if(f.event==='auth.fail'){wsS('auth failed - check profile / token');sys('auth failed')}
+  else if(f.event==='denied'){if(f.topic!==RF){den.push(f.topic);wsS(`live - ${den.length} lane(s) not allowed for this profile: ${den.slice(0,3).join(', ')}`)}sys(`denied ${f.method} ${f.topic}`)}
+  else if(f.event==='dropped'){wsS(`live - server dropped ${f.count} frames (viewer too slow)`);sys(`server dropped ${f.count} frames`)}
+  else if(f.topic!==undefined){const r=req[f.topic];if(r){delete req[f.topic];clearTimeout(r.t);const e=f.payload||{};+e.status===200?r.ok(e.body):r.no(new Error(`${e.status} ${String(e.body||'').trim()||'(no detail)'}`))}else pend.push(f)}};
+ ws.onclose=()=>{if(ws===me){ws=null;authed=false}$('#wc').textContent='Go live';wsS('disconnected');sys('disconnected')};ws.onerror=()=>wsS('connection error')};
+// ---- reading conf files from the vdrx host: publish to confserver.in, wait for the reply on our own topic
+const fetchConf=path=>new Promise((ok,no)=>{if(!ws||!authed)return no(new Error('go live first (needs a profile allowed to publish confserver.in)'));
+ const t='viewer.reply.'+Math.random().toString(36).slice(2,9);req[t]={ok,no,t:setTimeout(()=>{delete req[t];no(new Error('timeout - is the confserver runner configured?'))},8000)};
+ ws.send(JSON.stringify({method:'publish',topic:'confserver.in',payload:{reply_to:t,params:{file:path}}}))}).then(b=>{const j=JSON.parse(b);return{path:j.path,obj:JSON.parse(j.text.replace(/^\uFEFF/,''))}});
+const dirOf=p=>p.replace(/[^\/]*$/,'').replace(/\/$/,''),isAbs=p=>/^([A-Za-z]:)?\//.test(p);
+function norm(p){const o=[];for(const s of p.split('/'))s==='..'?(o.length>1&&o.pop()):s==='.'||(s===''&&o.length)||o.push(s);return o.join('/')}
+function expand(str,dir,main){const v=Object.assign({},...files.map(f=>f.obj.variables||{}),{CONF_DIR:dir,MAIN_CONF_DIR:main,EXE_EXT:''});
+ for(let i=0;i<8;i++)str=str.replace(/\{([A-Z_a-z][A-Za-z0-9_]*)\}/g,(m,k)=>v[k]!=null&&v[k]!==undefined?String(v[k]):m);return str}
+$('#ob').onclick=async()=>{const p=prompt('Path of a vdrx conf file on the machine running vdrx:','vdrx.conf');if(!p)return;
+ try{const r=await fetchConf(p);files=[{name:r.path,obj:r.obj,dir:dirOf(r.path)}];incOK=false;show();sys('opened '+r.path)}catch(e){sys('open failed: '+e.message);wsS(e.message)}};
+$('#li').onclick=async()=>{if(!files.length)return;const seenp=new Set(files.map(f=>f.name)),q=[],bad=[];let n=0;
+ const push=f=>(Array.isArray(f.obj.includes)?f.obj.includes:[]).forEach(i=>q.push({p:typeof i==='string'?i:(i&&(i.path||i.file))||'',dir:f.dir,main:files[0].dir}));
+ files.forEach(push);
+ while(q.length&&n<40){const{p,dir,main}=q.shift();if(!p)continue;let path=expand(p,dir||'',main||'').replace(/\\/g,'/');
+  if(/\{[A-Za-z_]/.test(path)){bad.push(p);sys('include '+p+': unresolved variable - add it under "variables" or open the root conf via bus');continue}
+  if(!isAbs(path)&&dir)path=norm(dir+'/'+path);if(seenp.has(path))continue;seenp.add(path);
+  try{const r=await fetchConf(path);const f={name:r.path,obj:r.obj,dir:dirOf(r.path)};files.push(f);seenp.add(r.path);n++;sys('included '+r.path);push(f)}catch(e){bad.push(path);sys('include '+path+' failed: '+e.message+(!isAbs(path)&&!dir?'  (this conf was loaded from a local file, so its folder is unknown - use "Open via bus…" for the root conf)':''))}}
+ incOK=!bad.length;show();wsS(bad.length?`${n} include(s) loaded, ${bad.length} failed (see the bus terminal)`:`${n} include(s) loaded`)};
 $('#db').onclick=()=>add(DEMO,'demo',false);
 add(DEMO,'demo',false);
 </script></body></html>
