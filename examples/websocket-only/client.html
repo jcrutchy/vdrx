@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>vdrx ticker</title>
+<h1>clock.tick</h1>
+<pre id="out">connecting…</pre>
+<script>
+// Open this file straight from disk - no web server needed, only the WebSocket port.
+const ws = new WebSocket('ws://localhost:8082'), out = document.getElementById('out');
+ws.onopen = () => ws.send(JSON.stringify({method: 'sys.auth', profile: 'viewer'}));
+ws.onmessage = e => {
+  const f = JSON.parse(e.data);
+  if (f.event === 'auth.ok') out.textContent = 'authenticated as "' + f.profile + '" (profile default_subscribe gives us clock.>)\n';
+  else if (f.topic) out.textContent += f.topic + '  ' + JSON.stringify(f.payload) + '\n';
+};
+</script>

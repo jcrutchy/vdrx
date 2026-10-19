@@ -5,3 +5,11 @@
 *.ppu
 *.o
 backup/
+
+# build output
+bin/
+build/
+lib/
+*.lps
+# your own working config at the repo root (examples/ and docs/reference.vdrx.conf are the tracked ones)
+/vdrx.conf
