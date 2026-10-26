@@ -1,0 +1,4 @@
+jobs_state.json
+jobs_state.json.tmp
+jobs_test.jsonl*
+vdrx_daemon.log

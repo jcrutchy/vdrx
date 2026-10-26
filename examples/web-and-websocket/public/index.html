@@ -1,0 +1,37 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>vdrx chat</title>
+<style>
+  body{font:16px system-ui,sans-serif;max-width:40rem;margin:2rem auto;padding:0 1rem}
+  #log{height:18rem;overflow:auto;border:1px solid #bbb;padding:.5rem;margin:1rem 0;white-space:pre-wrap}
+  #log .me{color:#06c} #status{color:#666;font-size:.9em}
+  input{font:inherit;padding:.3rem}
+</style>
+<h1>vdrx chat</h1>
+<div id="status">connecting…</div>
+<div id="log"></div>
+<form id="f"><input id="user" size="8" placeholder="name"> <input id="text" size="30" placeholder="say something" autofocus> <button>Send</button></form>
+<script>
+// The whole "backend" is the vdrx bus: publish to chat.room, everyone subscribed to chat.room hears it.
+const ws = new WebSocket('ws://' + (location.hostname || 'localhost') + ':8082');
+const $ = s => document.querySelector(s), log = $('#log');
+$('#user').value = 'guest' + Math.floor(Math.random() * 900 + 100);
+const send = o => ws.send(JSON.stringify(o));
+ws.onopen = () => send({method: 'sys.auth', profile: 'browser'});
+ws.onclose = () => $('#status').textContent = 'disconnected';
+ws.onmessage = e => {
+  const f = JSON.parse(e.data);
+  if (f.event === 'auth.ok') { send({method: 'subscribe', filter: 'chat.room'}); $('#status').textContent = 'connected as profile "' + f.profile + '"'; }
+  else if (f.event === 'auth.fail') $('#status').textContent = 'auth failed';
+  else if (f.event === 'denied') $('#status').textContent = 'denied: ' + f.method + ' ' + f.topic;
+  else if (f.topic === 'chat.room') {
+    const d = document.createElement('div'); if (f.payload.user === $('#user').value) d.className = 'me';
+    d.textContent = f.payload.user + ': ' + f.payload.text; log.append(d); log.scrollTop = log.scrollHeight;
+  }
+};
+$('#f').onsubmit = e => {
+  e.preventDefault(); if (!$('#text').value) return;
+  send({method: 'publish', topic: 'chat.room', payload: {user: $('#user').value, text: $('#text').value}});
+  $('#text').value = '';
+};
+</script>

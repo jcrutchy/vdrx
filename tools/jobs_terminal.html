@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vdrx jobs</title>
+<style>
+:root{--bg:#13161b;--pn:#1a1e25;--ln:#2b323c;--fg:#d6dce4;--dim:#8592a1;--out:#7ee787;--err:#ff7b72;--ev:#6cc7d9;--ok:#3fb950;--bad:#f85149;--run:#58a6ff;--kill:#d29922;--hl:#e3b341;color-scheme:dark}
+@media(prefers-color-scheme:light){:root{--bg:#f4f5f7;--pn:#fff;--ln:#d3d9e0;--fg:#1c2330;--dim:#5b6a7a;--out:#1a7f37;--err:#cf222e;--ev:#0a6f86;--ok:#1a7f37;--bad:#cf222e;--run:#0969da;--kill:#9a6700;--hl:#d4a72c;color-scheme:light}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif;display:flex;flex-direction:column;height:100vh;height:100dvh}
+header{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--ln)}
+header b{font-size:15px}
+input[type=text],input[type=password],input:not([type]){font:12px ui-monospace,Consolas,monospace;color:var(--fg);background:var(--bg);border:1px solid var(--ln);border-radius:4px;padding:4px 6px}
+button{font:inherit;color:var(--fg);background:var(--pn);border:1px solid var(--ln);border-radius:4px;padding:3px 10px;cursor:pointer}
+button:hover:not(:disabled){border-color:var(--dim)}button:disabled{opacity:.4;cursor:default}
+.dim{color:var(--dim)}.sp{margin-left:auto}
+#st::before{content:"";display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:var(--dim)}
+#st.on::before{background:var(--ok)}#st.bad::before{background:var(--bad)}#st.wait::before{background:var(--kill)}
+main{flex:1;min-height:0;display:grid;grid-template-columns:300px 1fr}
+aside{border-right:1px solid var(--ln);overflow:auto;background:var(--pn)}
+.jr{padding:7px 12px;border-bottom:1px solid var(--ln);border-left:3px solid transparent;cursor:pointer}
+.jr:hover{background:var(--bg)}.jr.sel{border-left-color:var(--hl);background:var(--bg)}
+.jr.all{position:sticky;top:0;z-index:1;background:var(--pn)}.jr.all.sel{background:var(--bg)}
+.jr .top{display:flex;align-items:center;gap:7px}
+.jr .nm{font:13px ui-monospace,Consolas,monospace;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.jr .meta{font-size:12px;color:var(--dim);margin:2px 0 0 17px}
+.jr .btns{margin-left:auto;display:flex;gap:4px}.jr .btns button{padding:0 7px;font-size:12px;line-height:20px}
+.dot{width:10px;height:10px;border-radius:50%;flex:none;background:var(--dim)}
+.dot.ok{background:var(--ok)}.dot.bad{background:var(--bad)}.dot.kill{background:var(--kill)}
+.dot.run{background:var(--run);animation:pulse 1.1s ease-in-out infinite}.dot.off{background:transparent;border:2px solid var(--dim)}
+@keyframes pulse{50%{opacity:.35}}
+section{display:flex;flex-direction:column;min-width:0;min-height:0}
+#tb{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:6px 12px;border-bottom:1px solid var(--ln)}
+#tb label{display:flex;gap:4px;align-items:center;color:var(--dim);font-size:13px;cursor:pointer}
+#out{flex:1;min-height:0;overflow:auto;padding:6px 0;font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;background:var(--bg)}
+.ln{padding:0 12px;white-space:pre-wrap;overflow-wrap:anywhere}.ln:hover{background:var(--pn)}
+.pf{background:var(--hl);color:#111;padding:0 4px}.ar{color:var(--hl)}
+.k-out .tx{color:var(--out)}.k-err .tx{color:var(--err)}.k-start .tx,.k-exit .tx{color:var(--ev)}
+.k-exit.bad .tx,.k-error .tx{color:var(--err)}
+.k-skip .tx,.k-queued .tx,.k-restart .tx,.k-sys .tx{color:var(--dim)}
+.empty{padding:14px 12px;color:var(--dim)}
+@media(max-width:760px){main{grid-template-columns:1fr;grid-template-rows:34vh 1fr}aside{border-right:0;border-bottom:1px solid var(--ln)}}
+</style>
+</head>
+<body>
+<header>
+  <b>vdrx jobs</b>
+  <input id="wu" size="24" title="vdrx WebSocket URL">
+  <input id="wp" size="9" value="operator" title="ws_profiles id (blank = pick by token)">
+  <input id="wt" type="password" size="10" placeholder="token" title="the profile's token">
+  <button id="wc">Connect</button>
+  <span id="st" class="dim">not connected</span>
+  <span id="sum" class="dim sp"></span>
+</header>
+<main>
+  <aside id="jobs"></aside>
+  <section>
+    <div id="tb">
+      <input id="q" size="18" placeholder="filter text" title="show only lines containing this">
+      <label><input type="checkbox" id="co" checked>stdout</label>
+      <label><input type="checkbox" id="ce" checked>stderr</label>
+      <label><input type="checkbox" id="cv" checked>events</label>
+      <label><input type="checkbox" id="cl">local time</label>
+      <label class="sp"><input type="checkbox" id="fo" checked>follow</label>
+      <button id="cx">Clear</button>
+      <button id="sv">Save&hellip;</button>
+    </div>
+    <div id="out"></div>
+  </section>
+</main>
+<script>
+'use strict';
+const $ = s => document.querySelector(s);
+const MAX_MODEL = 20000, MAX_DOM = 4000;
+
+let ws = null, want = false, authed = false, retry = 0, retryTimer = 0, lastSeq = -1, keepSt = false;
+let sel = '';                       // job whose lines are shown ('' = all)
+let maxConc = 0, active = 0;
+const jobs = new Map();             // id -> state (order = insertion order)
+const model = [];                   // every line received (capped), newest last
+let pending = [];                   // lines waiting for the next animation frame
+
+// ---- settings --------------------------------------------------------------------
+const qs = new URLSearchParams(location.search);
+function load(k, d) { try { return localStorage.getItem('vdrxjobs.' + k) || d } catch (e) { return d } }
+function save(k, v) { try { localStorage.setItem('vdrxjobs.' + k, v) } catch (e) {} }
+const defUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + (/^https?:$/.test(location.protocol) ? location.hostname : '127.0.0.1') + ':8082';
+$('#wu').value = qs.get('url') || load('url', defUrl);
+$('#wp').value = qs.get('profile') || load('profile', 'operator');
+
+// ---- formatting ------------------------------------------------------------------
+function fmtDur(ms) {
+  if (ms == null) return '';
+  if (ms < 1000) return ms + 'ms';
+  if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
+  return Math.floor(ms / 60000) + 'm' + Math.floor(ms % 60000 / 1000) + 's';
+}
+function fmtIn(sec) {
+  if (sec <= 0) return 'now';
+  if (sec < 90) return sec + 's';
+  if (sec < 5400) return Math.round(sec / 60) + 'm';
+  if (sec < 172800) return (sec / 3600).toFixed(1).replace(/\.0$/, '') + 'h';
+  return Math.round(sec / 86400) + 'd';
+}
+function fmtTime(t) {
+  const d = new Date(t);
+  return $('#cl').checked ? d.toTimeString().slice(0, 8) : d.toISOString().slice(11, 19);
+}
+const stripAnsi = s => s.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]|\x1b./g, '');
+
+// ---- the terminal ------------------------------------------------------------------
+function visible(l) {
+  if (l.kind !== 'sys' && sel && l.job !== sel) return false;
+  if (l.kind === 'out' && !$('#co').checked) return false;
+  if (l.kind === 'err' && !$('#ce').checked) return false;
+  if (l.kind !== 'out' && l.kind !== 'err' && l.kind !== 'sys' && !$('#cv').checked) return false;
+  const q = $('#q').value.trim().toLowerCase();
+  return !q || l.text.toLowerCase().includes(q) || l.job.toLowerCase().includes(q);
+}
+function lineEl(l) {
+  const d = document.createElement('div');
+  d.className = 'ln k-' + l.kind + (l.bad ? ' bad' : '');
+  d.title = new Date(l.t).toISOString();
+  const p = document.createElement('span'); p.className = 'pf';
+  p.textContent = fmtTime(l.t) + ' ' + (l.kind === 'sys' ? 'vdrx' : l.job + (l.pid ? ':' + l.pid : ''));
+  const a = document.createElement('span'); a.className = 'ar'; a.textContent = ' \u25BA';
+  const x = document.createElement('span'); x.className = 'tx'; x.textContent = ' ' + l.text;
+  d.append(p, a, x);
+  return d;
+}
+function pushLine(l) {
+  model.push(l);
+  if (model.length > MAX_MODEL) model.splice(0, MAX_MODEL / 10);
+  pending.push(l);
+  if (pending.length === 1) requestAnimationFrame(flush);
+}
+function flush() {
+  const out = $('#out'), frag = document.createDocumentFragment();
+  for (const l of pending) if (visible(l)) frag.appendChild(lineEl(l));
+  pending = [];
+  const e = out.querySelector('.empty'); if (e && frag.childNodes.length) e.remove();
+  out.appendChild(frag);
+  while (out.childElementCount > MAX_DOM) out.firstElementChild.remove();
+  if ($('#fo').checked) out.scrollTop = out.scrollHeight;
+}
+function renderAll() {
+  const out = $('#out'), frag = document.createDocumentFragment();
+  pending = [];
+  const keep = [];
+  for (let i = model.length - 1; i >= 0 && keep.length < MAX_DOM; i--) if (visible(model[i])) keep.push(model[i]);
+  for (let i = keep.length - 1; i >= 0; i--) frag.appendChild(lineEl(keep[i]));
+  out.textContent = '';
+  if (!keep.length) {
+    const e = document.createElement('div'); e.className = 'empty';
+    e.textContent = model.length ? 'No lines match the current filter.' : 'Waiting for job output. Only lines published after you connected are shown.';
+    out.appendChild(e);
+  }
+  out.appendChild(frag);
+  if ($('#fo').checked) out.scrollTop = out.scrollHeight;
+}
+function sys(text, bad) { pushLine({ t: Date.now(), job: '', pid: 0, kind: 'sys', text, bad: !!bad }); }
+
+// ---- jobs ---------------------------------------------------------------------------
+function job(id) {
+  let j = jobs.get(id);
+  if (!j) { j = { id, enabled: true, interval: 0, running: false, pid: 0, runs: 0, status: '', code: null, dur: null, nextAt: null }; jobs.set(id, j); }
+  return j;
+}
+function applyState(p) {
+  maxConc = p.max_concurrent || 0; active = p.active || 0;
+  const seen = new Set();
+  for (const r of p.jobs || []) {
+    const j = job(r.job); seen.add(r.job);
+    j.enabled = r.enabled; j.interval = r.interval_sec || 0; j.overlap = r.overlap;
+    j.running = !!r.running; j.pid = r.pid || 0; j.runs = r.runs || 0;
+    j.status = r.last_status || ''; j.code = r.last_code == null ? null : r.last_code; j.dur = r.last_duration_ms == null ? null : r.last_duration_ms;
+    j.nextAt = (r.next_in_sec != null && !j.running) ? Date.now() + r.next_in_sec * 1000 : null;
+  }
+  for (const id of [...jobs.keys()]) if (!seen.has(id)) jobs.delete(id);
+  renderJobs();
+}
+function dotClass(j) {
+  if (j.running) return 'run';
+  if (j.status === 'ok') return 'ok';
+  if (j.status === 'killed') return 'kill';
+  if (j.status) return 'bad';
+  return j.enabled ? '' : 'off';
+}
+function jobRow(id, label, meta, j) {
+  const r = document.createElement('div'); r.className = 'jr' + (sel === id ? ' sel' : '') + (id === '' ? ' all' : '');
+  const top = document.createElement('div'); top.className = 'top';
+  if (j) { const d = document.createElement('span'); d.className = 'dot ' + dotClass(j); top.appendChild(d); }
+  const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = label; nm.title = label; top.appendChild(nm);
+  if (j) {
+    const b = document.createElement('span'); b.className = 'btns';
+    const run = document.createElement('button'); run.textContent = '\u25B6'; run.title = 'run now (jobs.run)'; run.disabled = !authed;
+    run.onclick = e => { e.stopPropagation(); publish('jobs.run', id); };
+    const kill = document.createElement('button'); kill.textContent = '\u25A0'; kill.title = 'stop (jobs.kill)'; kill.disabled = !authed || !j.running;
+    kill.onclick = e => { e.stopPropagation(); publish('jobs.kill', id); };
+    b.append(run, kill); top.appendChild(b);
+  }
+  r.appendChild(top);
+  const m = document.createElement('div'); m.className = 'meta';
+  m.textContent = meta;
+  if (j && j.nextAt) { const n = document.createElement('span'); n.dataset.next = id; m.appendChild(n); }
+  r.appendChild(m);
+  r.onclick = () => { sel = (sel === id ? '' : id); renderJobs(); renderAll(); };
+  return r;
+}
+function jobMeta(j) {
+  const p = [];
+  p.push(j.interval ? 'every ' + fmtIn(j.interval) : 'manual');
+  if (!j.enabled) p.push('disabled');
+  if (j.overlap && j.overlap !== 'skip') p.push('overlap ' + j.overlap);
+  if (j.running) p.push('running, pid ' + j.pid);
+  else if (j.status) p.push(j.status + (j.status === 'failed' ? ' (' + j.code + ')' : '') + (j.dur != null ? ' in ' + fmtDur(j.dur) : ''));
+  return p.join(' \u00B7 ') + (j.nextAt && !j.running ? ' \u00B7 next in ' : '');
+}
+let lastSig = '';
+function renderJobs() {
+  // Rebuild only when something visible changed: a rebuild resets the list's scroll
+  // position and would swallow a click that straddles the 5-second refresh.
+  const sig = JSON.stringify([sel, authed, maxConc, [...jobs.values()].map(j => [j.id, j.enabled, j.interval, j.overlap, j.running, j.pid, j.status, j.code, j.dur, !!j.nextAt])]);
+  if (sig === lastSig) { tick(); return; }
+  lastSig = sig;
+  const box = $('#jobs'), keep = box.scrollTop; box.textContent = '';
+  box.appendChild(jobRow('', 'All jobs', jobs.size + ' defined' + (maxConc ? ', max ' + maxConc + ' at once' : ''), null));
+  for (const j of jobs.values()) box.appendChild(jobRow(j.id, j.id, jobMeta(j), j));
+  box.scrollTop = keep;
+  let run = 0, bad = 0;
+  for (const j of jobs.values()) { if (j.running) run++; else if (j.status && j.status !== 'ok' && j.status !== 'killed') bad++; }
+  $('#sum').textContent = jobs.size ? run + ' running \u00B7 ' + bad + ' failing' : '';
+  tick();
+}
+function tick() {
+  for (const n of document.querySelectorAll('[data-next]')) {
+    const j = jobs.get(n.dataset.next);
+    n.textContent = j && j.nextAt ? fmtIn(Math.max(0, Math.round((j.nextAt - Date.now()) / 1000))) : '';
+  }
+}
+setInterval(tick, 1000);
+
+// ---- messages ---------------------------------------------------------------------------
+function onFrame(f) {
+  if (f.event) {
+    if (f.event === 'auth.ok') {
+      authed = true; retry = 0;
+      setSt('connected' + (f.profile ? ' as ' + f.profile : ''), 'on');
+      send({ method: 'subscribe', filter: 'job.>' });
+      send({ method: 'subscribe', filter: 'jobs.>' });
+      publish('jobs.list', '');
+      renderJobs();
+    } else if (f.event === 'auth.fail') {
+      want = false; keepSt = true; setSt('authentication failed - check the profile and token', 'bad');
+      sys('authentication failed', true); if (ws) ws.close();
+    } else if (f.event === 'denied') {
+      sys('denied: ' + (f.method || '') + ' ' + (f.topic || f.filter || '') + ' (not allowed by this profile)', true);
+    } else if (f.event === 'dropped') {
+      sys('this client fell behind: ' + f.count + ' message(s) dropped', true);
+    }
+    return;
+  }
+  if (typeof f.seq === 'number') { if (f.seq <= lastSeq) return; lastSeq = f.seq; } // a filter subscribed twice delivers twice
+  const p = f.payload, t = f.topic || '';
+  if (!p || typeof p !== 'object') return;
+  if (t === 'jobs.state') { applyState(p); return; }
+  const m = /^job\.([^.]+)\.([a-z]+)$/.exec(t);
+  if (!m) return;
+  const id = m[1], kind = m[2], j = job(id);
+  const ts = Date.parse(p.ts) || Date.now(), pid = p.pid || 0;
+  let text = '', bad = false;
+  if (kind === 'out' || kind === 'err') {
+    text = stripAnsi(String(p.line == null ? '' : p.line)); bad = kind === 'err';
+  } else if (kind === 'start') {
+    j.running = true; j.pid = pid; j.nextAt = null; text = 'started (' + (p.trigger || '') + ')';
+  } else if (kind === 'exit') {
+    j.running = false; j.pid = 0; j.runs++; j.status = p.status; j.code = p.code; j.dur = p.duration_ms;
+    j.nextAt = j.enabled && j.interval ? Date.now() + j.interval * 1000 : null;
+    if (p.status === 'ok') text = 'finished in ' + fmtDur(p.duration_ms);
+    else {
+      bad = p.status !== 'killed';
+      text = p.status + (p.stop && p.stop !== p.status ? ' (' + p.stop + ')' : '') + (p.status === 'failed' ? ', exit code ' + p.code : '') + ' after ' + fmtDur(p.duration_ms) + (p.error ? ': ' + p.error : '');
+    }
+    clearTimeout(onFrame.t); onFrame.t = setTimeout(() => { if (authed) publish('jobs.list', ''); }, 400);
+  } else if (kind === 'skip' || kind === 'queued' || kind === 'restart') {
+    text = kind + ': ' + (p.reason || '');
+  } else if (kind === 'error') {
+    text = p.reason || 'error'; bad = true;
+  } else return;
+  if (kind === 'start' || kind === 'exit') renderJobs();
+  pushLine({ t: ts, job: id, pid, kind, text, bad });
+}
+
+// ---- connection ---------------------------------------------------------------------------
+function setSt(text, cls) { const s = $('#st'); s.textContent = text; s.className = cls || 'dim'; }
+function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+function publish(topic, payload) { send({ method: 'publish', topic, payload }); }
+function connect() {
+  clearTimeout(retryTimer); want = true; keepSt = false;
+  const url = $('#wu').value.trim();
+  save('url', url); save('profile', $('#wp').value.trim());
+  try { ws = new WebSocket(url); } catch (e) { setSt('bad URL: ' + e.message, 'bad'); want = false; return; }
+  const mine = ws; lastSeq = -1; authed = false;
+  setSt('connecting\u2026', 'wait'); $('#wc').textContent = 'Disconnect';
+  mine.onopen = () => {
+    const a = { method: 'sys.auth', token: $('#wt').value }, p = $('#wp').value.trim();
+    if (p) a.profile = p;
+    mine.send(JSON.stringify(a));
+  };
+  mine.onmessage = e => { let f; try { f = JSON.parse(e.data); } catch (x) { return; } onFrame(f); };
+  mine.onclose = () => {
+    if (mine !== ws) return;
+    const was = authed; authed = false; renderJobs();
+    if (!want) { if (!keepSt) setSt('not connected'); $('#wc').textContent = 'Connect'; return; }
+    const s = Math.min(15, 1 << Math.min(retry++, 4));
+    setSt((was ? 'connection lost' : 'cannot connect') + ' - retrying in ' + s + 's', 'wait');
+    if (was) sys('connection lost - reconnecting', true);
+    retryTimer = setTimeout(connect, s * 1000);
+  };
+  mine.onerror = () => {};
+}
+function disconnect() { want = false; clearTimeout(retryTimer); if (ws) ws.close(); setSt('not connected'); $('#wc').textContent = 'Connect'; }
+$('#wc').onclick = () => (want ? disconnect() : connect());
+for (const id of ['#wu', '#wp', '#wt']) $(id).onkeydown = e => { if (e.key === 'Enter') { if (want) disconnect(); connect(); } };
+
+// ---- toolbar ---------------------------------------------------------------------------------
+for (const id of ['#co', '#ce', '#cv', '#cl']) $(id).onchange = renderAll;
+$('#q').oninput = renderAll;
+$('#cx').onclick = () => { model.length = 0; renderAll(); };
+$('#out').onscroll = () => { const o = $('#out'); $('#fo').checked = o.scrollHeight - o.scrollTop - o.clientHeight < 30; };
+$('#fo').onchange = () => { if ($('#fo').checked) $('#out').scrollTop = $('#out').scrollHeight; };
+$('#sv').onclick = () => {
+  const text = model.filter(visible).map(l => new Date(l.t).toISOString() + ' ' + (l.kind === 'sys' ? 'vdrx' : l.job + (l.pid ? ':' + l.pid : '')) + ' ' + l.kind + ' ' + l.text).join('\n') + '\n';
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+  a.download = 'vdrx-jobs-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.log';
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
+setInterval(() => { if (authed) publish('jobs.list', ''); }, 5000);
+
+renderJobs(); renderAll();
+if (qs.get('connect') === '1') connect();
+</script>
+</body>
+</html>
