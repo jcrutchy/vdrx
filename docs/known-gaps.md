@@ -14,10 +14,9 @@
   tools; not yet a front-line web server.
 - The route/rewrite tables, `cgi` entries and runners are read at startup;
   `reload` only re-applies `http_sites` settings.
-- The logger records every bus message at INFO - which now includes whole HTTP
-  request envelopes (POST bodies, cookies). Don't point it at anything
-  sensitive without lowering `log_max_payload_bytes` or filtering `http.reply.*`
-  and `<id>.in` topics.
+- The logger masks credentials by pattern (`log_redact`, on by default, bodies
+  included). That is a safety net: a secret carried in a member the patterns do
+  not know, or in a job's own output, is logged as-is. Buckets are never masked.
 - A TLS client that stalls mid-handshake blocks the TLS accept loop (the
   handshake runs on the accept thread).
 - The reverse proxy adds no `X-Forwarded-*` headers.

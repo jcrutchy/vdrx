@@ -6,7 +6,7 @@ tests/run.sh          # build everything, run the unit test, then the integratio
 
 | Folder | What | How to run |
 |---|---|---|
-| `unit/` | `test_jsonconf` - the JSON config loader (includes, variables, reload) | `bin/test_jsonconf` (built by `./build.sh tests`) |
+| `unit/` | `test_jsonconf` - the JSON config loader (includes, variables, reload); `test_redact` - log credential masking | `bin/test_jsonconf`, `bin/test_redact` (built by `./build.sh tests`) |
 | `integration/` | starts the real daemon on each `examples/` folder and on the fixtures `integration/cgi` and `integration/ws`, then checks responses over HTTP/WebSocket | `tests/integration/run.sh [section ...]` |
 | `stress/` | load/soak driver for HTTP, WebSocket and process churn (`vdrx_stress`) | build with `./build.sh tests`, copy `vdrx_stress.conf.example` and edit, run `bin/vdrx_stress` |
 | `manual/` | `test_stall`, `test_socket_stall`: timeline demos for hung child processes / non-reading peers (they write a `.log` to read, no pass/fail) | `bin/test_stall`, `bin/test_socket_stall` |

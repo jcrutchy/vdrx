@@ -76,8 +76,14 @@ e = exits("hang")[0]; check("status timeout, stop=timeout, took about 1s", e["st
 def slow_running():
     st = state(s, 2); return st and [j for j in st["jobs"] if j["job"] == "slow"][0]["running"]
 check("(slow is running)", wait_for(s, slow_running, 10), None)
-n = len(exits("slow")); kill(s, "slow")
-check("jobs.kill stops a running job (status killed)", wait_for(s, lambda: [x for x in exits("slow")[n:] if x["status"] == "killed"], 6), exits("slow")[n:])
+n = len(exits("slow"))
+def kill_slow():
+    # "slow" runs 4 s and is rescheduled every 1 s, so for up to a second per cycle nothing is
+    # running and a kill finds nothing to stop (a slow machine makes the state check above stale).
+    # jobs.kill on an idle job is a no-op, so just keep asking until a run is actually killed.
+    kill(s, "slow")
+    return [x for x in exits("slow")[n:] if x["status"] == "killed"]
+check("jobs.kill stops a running job (status killed)", wait_for(s, kill_slow, 10), exits("slow")[n:])
 
 # --- text handling / environment ---------------------------------------------------
 run(s, "ansi"); run(s, "ansiraw"); run(s, "envjob")

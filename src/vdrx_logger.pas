@@ -5,7 +5,7 @@ unit vdrx_logger;
 interface
 
 uses
-  Classes, SysUtils, SyncObjs, vdrx_core;
+  Classes, SysUtils, SyncObjs, vdrx_core, vdrx_redact;
 
 // ANSI Color Constants
 const
@@ -31,6 +31,8 @@ type
     FFileStream: TFileStream;
     FThreshold: TLogLevel;
     FMaxPayload: Integer;
+    FRedactor: TVDRX_Redactor;     // nil = redaction off
+    FRedactLock: TCriticalSection;
     FLock: TCriticalSection;
     FSignal: TEvent;
     FFileLines: string;     // pending, guarded by FLock
@@ -57,6 +59,11 @@ type
     // else is logged as before. Call before the kernel starts. Typical use: a
     // chatty family of topics that has a better home elsewhere (job output goes
     // to the job console and a rotating bucket - see docs/jobs.md).
+    // Credential masking (see vdrx_redact.pas). ON by default, bodies included:
+    // an HTTP request envelope otherwise puts cookies, Authorization headers,
+    // POSTed passwords and the WebSocket login token into the log file and
+    // onto the console. Call before the kernel starts.
+    procedure ConfigureRedaction(AEnabled, ARedactBodies: Boolean);
     procedure ExcludeFromConsole(const AFilter: string);
     procedure ExcludeFromFile(const AFilter: string);
   end;
@@ -90,6 +97,8 @@ begin
   inherited Create(ABus);
   FThreshold := ALevel;
   FMaxPayload := AMaxPayload;
+  FRedactLock := TCriticalSection.Create;
+  FRedactor := TVDRX_Redactor.Create(True);
   FLock := TCriticalSection.Create;
   FSignal := TEvent.Create(nil, False, False, '');
   FConsoleExclude := TStringList.Create;
@@ -114,7 +123,25 @@ begin
   FConsoleExclude.Free;
   FSignal.Free;
   FLock.Free;
+  FRedactor.Free;
+  FRedactLock.Free;
   inherited;
+end;
+
+procedure TVDRX_LoggerExecutive.ConfigureRedaction(AEnabled, ARedactBodies: Boolean);
+begin
+  FRedactLock.Acquire;
+  try
+    if AEnabled then
+    begin
+      if FRedactor = nil then FRedactor := TVDRX_Redactor.Create(ARedactBodies);
+      FRedactor.RedactBodies := ARedactBodies;
+    end
+    else
+      FreeAndNil(FRedactor);
+  finally
+    FRedactLock.Release;
+  end;
 end;
 
 procedure TVDRX_LoggerExecutive.ExcludeFromConsole(const AFilter: string);
@@ -227,12 +254,32 @@ begin
   end;
 end;
 
+// Clip first, then mask: the regexes only ever see a bounded string (the
+// dispatch thread must not stall on a multi-megabyte body), and whatever the
+// clip cut off can't leak. With masking on, "unlimited" is capped at 1 MB for
+// the same reason.
 function TVDRX_LoggerExecutive.ClipPayload(const APayload: string): string;
+const
+  REDACT_SCAN_CAP = 1048576;
+var
+  Limit: Integer;
+  Text: string;
+  Clipped: Boolean;
 begin
-  if (FMaxPayload > 0) and (Length(APayload) > FMaxPayload) then
-    Result := Copy(APayload, 1, FMaxPayload) + ' ...[' + IntToStr(Length(APayload)) + ' bytes total, truncated]'
+  FRedactLock.Acquire;
+  try
+    Limit := FMaxPayload;
+    if (Limit <= 0) and (FRedactor <> nil) then Limit := REDACT_SCAN_CAP;
+    Clipped := (Limit > 0) and (Length(APayload) > Limit);
+    if Clipped then Text := Copy(APayload, 1, Limit) else Text := APayload;
+    if FRedactor <> nil then Text := FRedactor.Redact(Text);
+  finally
+    FRedactLock.Release;
+  end;
+  if Clipped then
+    Result := Text + ' ...[' + IntToStr(Length(APayload)) + ' bytes total, truncated]'
   else
-    Result := APayload;
+    Result := Text;
 end;
 
 procedure TVDRX_LoggerExecutive.HandlePacket(const AMsg: TVDRX_Message);

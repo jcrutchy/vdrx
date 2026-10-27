@@ -1204,6 +1204,12 @@ begin
 
     Logger := TVDRX_LoggerExecutive.Create(Kernel.Queue, 'vdrx_daemon.log', lvlINFO,
       Config.GetInteger('log_max_payload_bytes', 4096));
+    Logger.ConfigureRedaction(Config.GetBoolean('log_redact', True),
+      Config.GetBoolean('log_redact_bodies', True));
+    if not Config.GetBoolean('log_redact', True) then
+      WriteLn('  WARNING: log_redact is off - cookies, Authorization headers, tokens and request bodies will appear in the log.')
+    else if not Config.GetBoolean('log_redact_bodies', True) then
+      WriteLn('  Logging: credentials masked; HTTP bodies are NOT (log_redact_bodies is off).');
     for Filter in Config.GetStringArray('log_console_exclude') do
       Logger.ExcludeFromConsole(Filter);
     for Filter in Config.GetStringArray('log_file_exclude') do

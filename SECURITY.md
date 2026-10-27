@@ -27,4 +27,6 @@ bodies, and the absence of per-topic access control beyond `ws_profiles`.
 - Keep `max_connections` at a sensible figure for the expected number of clients (default 256 per listener).
 - Run vdrx as an unprivileged account that can only read what it serves.
 - Treat `vdrx.conf` as sensitive; keep tokens in environment variables (`{ENV:NAME}`).
-- Lower `log_max_payload_bytes` or filter `http.reply.*` topics if request bodies are sensitive.
+- Keep `log_redact` and `log_redact_bodies` on (the defaults). They mask cookies, Authorization headers, tokens,
+  passwords and request bodies in the log and console; buckets are not masked, so don't record credential-bearing topics.
+- Treat `vdrx_daemon.log` as sensitive anyway (restrictive file permissions, rotation, no world-readable share).

@@ -6,7 +6,7 @@
 #   tests/integration/run.sh php-cgi ws   run only the named sections
 #
 # Sections: static-site php-cgi python-cgi cli-api templates websocket-only
-#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout jobs
+#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction jobs
 # Needs: bin/vdrx (./build.sh), curl, python3. php-cgi / php / sort,tr,wc,head,grep
 # are only needed by the sections that use them; those sections skip if missing.
 # Uses ports 8080, 8082, 18080, 18082 - it refuses to run if one is already taken,
@@ -176,6 +176,43 @@ if want ws-lockout "$@"; then section "tests/integration/ws (failed-login lockou
   if need python3 && start tests/integration/ws 18082; then
     out=$(cd tests/integration/ws && python3 ws_lockout_test.py 2>&1); echo "$out" | sed 's/^/  /'
     case "$out" in *"all passed"*) ok "lockout suite";; *) bad "lockout suite" "see output above";; esac
+  fi
+fi
+
+# Sends one request carrying credentials in every place a client can put them, plus a good and a bad
+# WebSocket login, then waits for the logger's writer thread to flush.
+redact_probe() {
+  curl -s -o /dev/null --max-time 10 -X POST "http://127.0.0.1:18080/echo.py?api_key=URLQUERYSECRET" \
+    -H 'Authorization: Bearer SUPERSECRETBEARER' -H 'Cookie: session=SESSIONCOOKIE123' \
+    --data 'username=bob&password=HUNTER2PASSWORD'
+  python3 -c '
+import sys; sys.path.insert(0, "tests/integration")
+from wsclient import *
+c = connect(); send(c, {"method": "sys.auth", "token": "WSSECRETTOKEN999"}); frames(c, .5)
+x = connect(); send(x, {"method": "sys.auth", "token": "WRONGGUESSTOKEN777"}); frames(x, .5)'
+  sleep 2
+}
+redact_count() { # <secret> <dir>  -> total occurrences in the log file + console output
+  a=$(grep -c "$1" "$2/vdrx_daemon.log" 2>/dev/null); b=$(grep -c "$1" "$OUT" 2>/dev/null); echo $((a + b))
+}
+
+if want log-redaction "$@"; then section "log redaction (credentials must not reach the log or console)"
+  if need python3 && start tests/integration/log-redaction 18080 18082; then
+    redact_probe
+    d=tests/integration/log-redaction
+    for s in SUPERSECRETBEARER SESSIONCOOKIE123 HUNTER2PASSWORD URLQUERYSECRET WSSECRETTOKEN999 WRONGGUESSTOKEN777; do
+      equals "redaction on: $s is not in the log or console" "$(redact_count $s $d)" 0
+    done
+    equals "redaction on: the per-process _edge_token is not logged" "$(grep -c '_edge_token" : "[0-9A-F]' $d/vdrx_daemon.log)" 0
+    expect "redaction on: the request is still logged (method and path)" "$(cat $d/vdrx_daemon.log)" '"path" : "/echo.py"'
+    expect "redaction on: the masking is visible in the log" "$(cat $d/vdrx_daemon.log)" "[REDACTED]"
+  fi
+  if need python3 && start tests/integration/log-redaction-off 18080 18082; then
+    redact_probe
+    d=tests/integration/log-redaction-off
+    for s in SUPERSECRETBEARER SESSIONCOOKIE123 WSSECRETTOKEN999; do
+      expect "log_redact=false: $s does show up (so the checks above are meaningful)" "$(cat $d/vdrx_daemon.log)" $s
+    done
   fi
 fi
 

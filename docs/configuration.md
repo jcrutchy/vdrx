@@ -30,7 +30,11 @@ work, with a warning). The older `cli_bridges` protocols (`cgi`, `bus`,
 
 # 6. Everything else in `vdrx.conf`
 
-- **`log_max_payload_bytes`** (default 4096) - the logger clips each bus payload to this many bytes. Request bodies and cookies are part of the HTTP envelopes the logger sees, so lower it (e.g. `200`) if the log must not contain them.
+- **`log_max_payload_bytes`** (default 4096) - the logger clips each bus payload to this many bytes.
+- **`log_redact`** (default `true`) - mask credentials before anything is written to `vdrx_daemon.log` or the console: JSON members named `Authorization`, `Cookie`, `Set-Cookie`, `token`, `_edge_token`, `password`, `api_key`, `secret` and similar; `api_key=` / `token=` / `password=` / `session=` / `sig=` style parameters in query strings and forms; and `Bearer` / `Basic` credentials. The member name stays, the value becomes `[REDACTED]`. It is a safety net, not a guarantee - a secret in a member with some other name is not recognised, so keep secrets out of topics you log. Setting it to `false` prints a startup warning.
+- **`log_redact_bodies`** (default `true`) - also replace the `body` / `body_b64` of HTTP request and reply envelopes with `[body redacted]`. Turn it off only when you need to debug payloads, and not on a shared machine.
+
+  Bus messages are clipped to `log_max_payload_bytes` *before* masking, so a secret beyond the clip point is never even seen. The JSONL buckets (`buckets`) record exactly the topics you configure and are **not** masked - don't bucket topics that carry credentials.
 - **`log_console_exclude`**, **`log_file_exclude`** (arrays of topic filters, default none) - messages matching a filter (`*` = one segment, `>` = the rest) are not printed to the console / not written to `vdrx_daemon.log`. Use them to keep a chatty topic family, such as job output (§11), out of the daemon log.
 - **`jobs`** and **`executives.jobs`** - scheduled programs whose output streams onto the bus: see [jobs.md](jobs.md) (§11).
 

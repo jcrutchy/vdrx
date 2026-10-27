@@ -9,7 +9,7 @@ All Pascal source lives in `src/`.
 | `vdrx_config.pas` | Thin `TVDRX_Config` subclass of `TJsonConf` that adds the `VDRX_*` reserved variables |
 | `vdrx_admin.pas` | `sys.>` admin commands (`sys.reload`/`sys.quit`/`sys.kill`/...) |
 | `vdrx_stdin.pas` | Console command reader, feeds `vdrx_admin` |
-| `vdrx_logger.pas` | Everything on the bus → colored console + `vdrx_daemon.log`, written from its own thread; long payloads are clipped (`log_max_payload_bytes`, default 4096); `log_console_exclude` / `log_file_exclude` topic filters; `ConsoleWrite`, the locked console writer shared with the job console |
+| `vdrx_logger.pas` | Everything on the bus → colored console + `vdrx_daemon.log`, written from its own thread; long payloads are clipped (`log_max_payload_bytes`, default 4096) and then credential-masked (`vdrx_redact.pas`, `log_redact`); `log_console_exclude` / `log_file_exclude` topic filters; `ConsoleWrite`, the locked console writer shared with the job console |
 | `vdrx_procutil.pas` | Cross-platform process wait/terminate/kill helpers |
 | `vdrx_bridge.pas` | `TVDRX_BridgeExecutive` - supervised external processes (§2) |
 | `vdrx_bucket.pas` | Append-only JSONL topic recorder (§6) |

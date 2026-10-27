@@ -22,6 +22,12 @@ def send(s, obj):
     h = bytes([0x81]) + (bytes([0x80 | len(p)]) if len(p) < 126 else bytes([0x80 | 126]) + struct.pack(">H", len(p)))
     s.sendall(h + m + bytes(b ^ m[i % 4] for i, b in enumerate(p)))
 
+def pong(s, payload=b""):
+    # A real client answers the server's pings; the daemon closes a connection that has not
+    # sent a pong for ping_interval + pong_timeout (15 s + 10 s by default).
+    m = os.urandom(4)
+    s.sendall(bytes([0x8A, 0x80 | len(payload)]) + m + bytes(b ^ m[i % 4] for i, b in enumerate(payload)))
+
 def need(s, n):
     while len(s.rest) < n: s.rest += s.recv(65536)
     d, s.rest = s.rest[:n], s.rest[n:]; return d
@@ -34,7 +40,8 @@ def frames(s, wait=0.6):
             if ln == 126: ln = struct.unpack(">H", need(s, 2))[0]
             elif ln == 127: ln = struct.unpack(">Q", need(s, 8))[0]
             p = need(s, ln)
-            if b0 & 0xF == 1: out.append(json.loads(p))      # must be valid JSON
+            if b0 & 0xF == 9: pong(s, p)                      # ping -> pong (keeps the connection alive)
+            elif b0 & 0xF == 1: out.append(json.loads(p))     # must be valid JSON
         except socket.timeout: pass
     return out
 

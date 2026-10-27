@@ -69,6 +69,10 @@
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
+        <Filename Value="vdrx_redact.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
         <Filename Value="vdrx_procutil.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
