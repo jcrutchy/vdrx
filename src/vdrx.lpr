@@ -109,11 +109,11 @@ begin
   WriteLn('  ', AName, ' listening on ', AListener.BindAddress, ':', AListener.Port, '.');
   if (AListener.BindAddress = '0.0.0.0') or (AListener.BindAddress = '') then
     WriteLn('  ', AName, ' WARNING: bound to ALL network interfaces - make sure a firewall limits who can reach it.');
-  if AListener.TLSActive then
-    WriteLn('  ', AName, ' also listening TLS on port ', AListener.TLSPort, '.')
-  else if AListener.TLSPort <> 0 then
-    WriteLn('  ', AName, ' TLS was configured (port ', AListener.TLSPort,
-      ') but failed to come up - check tls_cert/tls_key and that libssl is loadable.');
+  // The TLS listener is created when the kernel starts the executive, which is
+  // after this runs - so whether it came up cannot be known here. A failure is
+  // logged as an error by TVDRX_SocketListenerExecutive.Initialize.
+  if AListener.TLSPort <> 0 then
+    WriteLn('  ', AName, ' TLS configured on port ', AListener.TLSPort, ' (a failure to load the certificate is logged as an error).');
 end;
 
 // A random, per-process secret (see GVDRXEdgeToken in vdrx_network.pas) that
@@ -231,7 +231,7 @@ begin
 end;
 
 function SetupHTTPSites(AConfig: TVDRX_Config; ARegistry: TVDRX_Registry;
-  AGracefulMs: Integer; const ARoutes: TVDRX_RouteTable): TVDRX_HTTPSites;
+  AGracefulMs: Integer; const ARoutes: TVDRX_RouteTable; AWS: TVDRX_WebSocketExecutive): TVDRX_HTTPSites;
 var
   Rows: TVDRX_ConfigRows;
   Row: TStringList;
@@ -264,6 +264,16 @@ begin
       Site.HTTP.Backlog := StrToIntDef(Row.Values['backlog'], Site.HTTP.Backlog);
       if Row.Values['bind'] <> '' then Site.HTTP.BindAddress := Row.Values['bind'];
       Site.HTTP.MaxConnections := StrToIntDef(Row.Values['max_connections'], Site.HTTP.MaxConnections);
+      if Row.Values['websocket_path'] <> '' then
+      begin
+        if AWS = nil then
+          WriteLn('  WARNING: HTTP site "', Site.ID, '" has websocket_path but executives.ws.enabled is false - WebSocket upgrades are NOT served on it.')
+        else
+        begin
+          Site.HTTP.WebSocket := AWS;
+          Site.HTTP.WebSocketPath := Row.Values['websocket_path'];
+        end;
+      end;
 
       // Default CORS headers if "cors": true is declared
       if (Row.Values['cors'] = 'True') or (Row.Values['cors'] = 'true') or (Row.Values['cors'] = '1') then
@@ -1204,6 +1214,8 @@ begin
 
     Logger := TVDRX_LoggerExecutive.Create(Kernel.Queue, 'vdrx_daemon.log', lvlINFO,
       Config.GetInteger('log_max_payload_bytes', 4096));
+    VDRX_ConfigureHTTPTimeouts(Config.GetInteger('http_read_timeout_ms', 10000),
+      Config.GetInteger('http_request_timeout_ms', 30000));
     Logger.ConfigureRedaction(Config.GetBoolean('log_redact', True),
       Config.GetBoolean('log_redact_bodies', True));
     if not Config.GetBoolean('log_redact', True) then
@@ -1234,7 +1246,11 @@ begin
       WS.BindAddress := Config.GetString('executives.ws.bind', WS.BindAddress);
       WS.MaxConnections := Config.GetInteger('executives.ws.max_connections', WS.MaxConnections);
       WS.AllowOpenAccess := Config.GetBoolean('executives.ws.allow_open_access', False);
+      WS.MaxFrameBytes := Config.GetInteger('executives.ws.max_frame_bytes', WS.MaxFrameBytes);
+      WS.FrameTimeoutMs := Config.GetInteger('executives.ws.frame_timeout_ms', WS.FrameTimeoutMs);
       WS.DefaultSubscribe := Config.GetString('executives.ws.default_subscribe', '');
+      for Filter in Config.GetStringArray('executives.ws.allowed_origins') do
+        WS.AllowedOrigins.Add(Trim(Filter));
       ConfigureListenerTLS(WS, 'executives.ws');
       Kernel.Registry.Register(WS, 'ws', 'sys.none');
     end;
@@ -1254,12 +1270,15 @@ begin
     SetupBuckets(Config, Kernel.Registry);
     SetupJobs(Config, Kernel.Registry, ShutdownGraceMs);
 
-    HTTPSites := SetupHTTPSites(Config, Kernel.Registry, ShutdownGraceMs, Routes);
+    HTTPSites := SetupHTTPSites(Config, Kernel.Registry, ShutdownGraceMs, Routes, WS);
 
     Kernel.Start;
 
     WriteLn('VDRX daemon running.');
-    if Assigned(WS) then ReportListener(WS, 'WebSocket');
+    if Assigned(WS) and (WS.Port = 0) and (WS.TLSPort = 0) then
+      WriteLn('  WebSocket: no listener of its own (port 0) - served only on HTTP sites that set websocket_path.')
+    else if Assigned(WS) then
+      ReportListener(WS, 'WebSocket');
     for i := 0 to High(HTTPSites) do
       ReportListener(HTTPSites[i].HTTP, 'HTTP (' + HTTPSites[i].ID + ')');
     WriteLn('  Logger writing to vdrx_daemon.log (console threshold: INFO).');

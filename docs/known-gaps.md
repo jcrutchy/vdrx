@@ -1,11 +1,16 @@
 # 9. Known gaps
 
-- **No WebSocket upgrade on the HTTP port.** The WebSocket server only listens
-  on its own port (`executives.ws.port`); an HTTP site that receives
-  `Upgrade: websocket` answers it as an ordinary request. The hook for handing a
-  connection over exists (`TVDRX_WebSocketExecutive.AdoptConnection` takes the
-  already-read request), but the HTTP side doesn't call it yet. Use two ports
-  for now ([guides/web-and-websocket.md](guides/web-and-websocket.md)).
+- **The Origin check is not a defence against DNS rebinding.** A WebSocket
+  handshake from a browser is refused unless its `Origin` names the same host as
+  the `Host` header or is in `allowed_origins`. An attacker's page that rebinds
+  its own hostname to your internal address sends matching `Origin` and `Host`
+  and passes. The real protection is a token on every profile that matters (and,
+  if you want to be thorough, a reverse proxy that only answers for your own
+  host names).
+- **Shared-port connections are capped per WebSocket executive, not per site.**
+  `executives.ws.max_connections` limits live WebSocket connections across the
+  WS port and every HTTP site's `websocket_path` together. While one is being
+  upgraded it also occupies an HTTP connection slot, briefly.
 - **One config path.** vdrx always reads `vdrx.conf` from the current
   directory; there is no `--config` option.
 - HTTP is one request per connection (`Connection: close`): no keep-alive, no
@@ -17,8 +22,12 @@
 - The logger masks credentials by pattern (`log_redact`, on by default, bodies
   included). That is a safety net: a secret carried in a member the patterns do
   not know, or in a job's own output, is logged as-is. Buckets are never masked.
-- A TLS client that stalls mid-handshake blocks the TLS accept loop (the
-  handshake runs on the accept thread).
+- Slow or idle clients are bounded, not blocked: each connection costs one
+  thread until it finishes or times out, so a flood is limited by
+  `max_connections` (default 256 per listener), not by a thread limit. An
+  attacker who fills those slots can still deny service to everyone else for as
+  long as they keep reconnecting; put a rate-limiting proxy or firewall in front
+  if that matters.
 - The reverse proxy adds no `X-Forwarded-*` headers.
 - CGI output is buffered whole (no streaming), and has no size cap.
 

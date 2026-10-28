@@ -21,6 +21,11 @@ bodies, and the absence of per-topic access control beyond `ws_profiles`.
 
 - Define `ws_profiles` with long random tokens, and give every profile a token. With no profiles the
   WebSocket rejects all logins (`allow_open_access` exists for throwaway dev setups only).
+- Slow clients are cut off (`http_read_timeout_ms`, `http_request_timeout_ms`, WebSocket `frame_timeout_ms`) and
+  WebSocket frames are capped (`max_frame_bytes`, 1 MiB). Keep `max_connections` at what you actually expect.
+- WebSocket handshakes from a browser must come from the same host as the request (or an entry in
+  `executives.ws.allowed_origins`); `max_connections` caps live WebSocket connections. Pages and WebSocket can
+  share one port with an HTTP site's `websocket_path`.
 - Failed WebSocket logins are rate-limited per address (8 per minute, then a one-minute lockout).
 - Listeners bind to `127.0.0.1` by default. Set `bind` to the one interface that needs to be
   reachable (avoid `0.0.0.0`) and firewall the port to the hosts that need it.

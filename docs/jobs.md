@@ -126,7 +126,14 @@ rotating bucket instead:
 console on, `job.>` is excluded from the logger's console automatically.
 
 **A browser - `tools/jobs_terminal.html`.** A single HTML file, no dependencies. Open
-it, fill in the WebSocket URL, a profile id and its token, press *Connect*:
+it, fill in the WebSocket URL, a profile id and its token, press *Connect*.
+
+> **Opened from disk (`file://`)?** A browser sends `Origin: null` for such a page, and the WebSocket server
+> refuses a browser handshake whose origin is not the same host as the request or listed in
+> `executives.ws.allowed_origins`. Either serve the page from one of your HTTP sites (then it is the same
+> host and just works), or add `"null"` to `allowed_origins`. `null` is also what a sandboxed iframe on any
+> website sends, so only do it together with a profile that has a **token**.
+
 
 - **Job list** (left): every job with a state dot (pulsing blue = running, green =
   last run ok, red = failed or timed out, amber = killed, hollow = disabled), its

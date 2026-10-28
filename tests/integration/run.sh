@@ -6,7 +6,7 @@
 #   tests/integration/run.sh php-cgi ws   run only the named sections
 #
 # Sections: static-site php-cgi python-cgi cli-api templates websocket-only
-#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction jobs
+#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction limits ws-shared jobs
 # Needs: bin/vdrx (./build.sh), curl, python3. php-cgi / php / sort,tr,wc,head,grep
 # are only needed by the sections that use them; those sections skip if missing.
 # Uses ports 8080, 8082, 18080, 18082 - it refuses to run if one is already taken,
@@ -128,12 +128,19 @@ assert got and got[0]["payload"]["text"] == "hi", got
 send(b, {"method": "subscribe", "filter": "sys.>"})
 assert any(f.get("event") == "denied" for f in frames(b, .5)), "sys.> must be denied"
 PY
-    # Known gap, reported but not a failure: HTTP connections don't hand a WebSocket upgrade to the WS server.
-    up=$(printf 'GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n' | python3 -c "
-import socket,sys; s=socket.create_connection(('127.0.0.1',8080)); s.settimeout(2); s.sendall(sys.stdin.buffer.read())
-try: print(s.recv(200).split(b'\r\n')[0].decode())
-except Exception as e: print('no answer')")
-    case "$up" in *101*) echo "  note  WebSocket upgrade on the HTTP port works";; *) echo "  note  known gap: a WebSocket upgrade on the HTTP port is not supported yet (got: $up) - use the separate WebSocket port";; esac
+    # The page uses the HTTP port: websocket_path hands the upgrade to the WebSocket server.
+    python3 - <<'PY' && ok "chat round trip over the SHARED port (ws on 8080, path /ws)" || bad "shared-port chat" "see output above"
+import sys; sys.path.insert(0, "tests/integration")
+from wsclient import *
+a, b = connect("127.0.0.1", 8080, "/ws"), connect("127.0.0.1", 8080, "/ws")
+for c in (a, b): send(c, {"method": "sys.auth", "profile": "browser"})
+assert any(f.get("event") == "auth.ok" for f in frames(a, .5)), "auth over the shared port"
+frames(b, .3)
+send(b, {"method": "subscribe", "filter": "chat.room"}); frames(b, .3)
+send(a, {"method": "publish", "topic": "chat.room", "payload": {"user": "t", "text": "shared"}})
+got = [f for f in frames(b, .8) if f.get("topic") == "chat.room"]
+assert got and got[0]["payload"]["text"] == "shared", got
+PY
   fi
 fi
 
@@ -213,6 +220,28 @@ if want log-redaction "$@"; then section "log redaction (credentials must not re
     for s in SUPERSECRETBEARER SESSIONCOOKIE123 WSSECRETTOKEN999; do
       expect "log_redact=false: $s does show up (so the checks above are meaningful)" "$(cat $d/vdrx_daemon.log)" $s
     done
+  fi
+fi
+
+if want limits "$@"; then section "limits (slow clients, oversize frames, TLS handshake stalls)"
+  d=tests/integration/limits
+  if command -v openssl >/dev/null 2>&1 && [ ! -f $d/cert.pem ]; then
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout $d/key.pem -out $d/cert.pem -subj /CN=localhost -days 2 >/dev/null 2>&1
+  fi
+  if need python3 && start $d 18080 18082; then
+    out=$(cd $d && python3 limits_test.py 2>&1); echo "$out" | sed 's/^/  /'
+    case "$out" in *"all passed"*) ok "limits suite";; *) bad "limits suite" "see output above";; esac
+  fi
+fi
+
+if want ws-shared "$@"; then section "ws-shared (WebSocket on the HTTP port, Origin check, connection cap, no handshake leak)"
+  d=tests/integration/ws-shared
+  if command -v openssl >/dev/null 2>&1 && [ ! -f $d/cert.pem ]; then
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout $d/key.pem -out $d/cert.pem -subj /CN=localhost -days 2 >/dev/null 2>&1
+  fi
+  if need python3 && start $d 18080 18082; then
+    out=$(cd $d && python3 ws_shared_test.py 2>&1); echo "$out" | sed 's/^/  /'
+    case "$out" in *"all passed"*) ok "ws-shared suite";; *) bad "ws-shared suite" "see output above";; esac
   fi
 fi
 

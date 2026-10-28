@@ -31,6 +31,7 @@ work, with a warning). The older `cli_bridges` protocols (`cgi`, `bus`,
 # 6. Everything else in `vdrx.conf`
 
 - **`log_max_payload_bytes`** (default 4096) - the logger clips each bus payload to this many bytes.
+- **`http_read_timeout_ms`** (default `10000`) and **`http_request_timeout_ms`** (default `30000`) - how long an HTTP client may be silent between two reads, and how long it may take to send a whole request (headers and body). A client that exceeds them is dropped (a `408` if it had sent something), so idle or dribbling connections cannot hold a `max_connections` slot. `0` turns a limit off.
 - **`log_redact`** (default `true`) - mask credentials before anything is written to `vdrx_daemon.log` or the console: JSON members named `Authorization`, `Cookie`, `Set-Cookie`, `token`, `_edge_token`, `password`, `api_key`, `secret` and similar; `api_key=` / `token=` / `password=` / `session=` / `sig=` style parameters in query strings and forms; and `Bearer` / `Basic` credentials. The member name stays, the value becomes `[REDACTED]`. It is a safety net, not a guarantee - a secret in a member with some other name is not recognised, so keep secrets out of topics you log. Setting it to `false` prints a startup warning.
 - **`log_redact_bodies`** (default `true`) - also replace the `body` / `body_b64` of HTTP request and reply envelopes with `[body redacted]`. Turn it off only when you need to debug payloads, and not on a shared machine.
 

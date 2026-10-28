@@ -157,10 +157,19 @@ type
   private
     FOwner: TVDRX_SocketListenerExecutive;
     FTransport: TVDRX_Transport;
+    // TLS: the accepted socket whose handshake THIS thread performs (nil
+    // transport until it is done). Doing it here instead of in the accept loop
+    // means a client that stalls mid-handshake only stalls itself.
+    FPendingSock: TSocket;
+    FPendingAddr: string;
+    FPendingPort: Word;
   protected
     procedure Execute; override;
   public
     constructor Create(AOwner: TVDRX_SocketListenerExecutive; ATransport: TVDRX_Transport);
+    constructor CreateTLS(AOwner: TVDRX_SocketListenerExecutive; ASock: TSocket;
+      const APeerAddr: string; APeerPort: Word);
+    // nil while a TLS handshake is still in progress
     property Transport: TVDRX_Transport read FTransport;
   end;
 
@@ -186,6 +195,7 @@ type
     FRejectedSinceLog: Integer;
 
     function BindListenSocket(APort: Word): TSocket;
+    function CompleteTLSHandshake(ASock: TSocket; const APeerAddr: string; APeerPort: Word): TVDRX_Transport;
     function ConnectionLimitReached: Boolean;
     procedure NoteRejected;
     procedure AcceptLoopPlain;
@@ -235,6 +245,8 @@ type
     FRoutes: TVDRX_RouteTable;
     FRegistry: TVDRX_Registry;
     FCustomHeaders: TStringList;
+    FWebSocket: TVDRX_WebSocketExecutive;
+    FWebSocketPath: string;
   protected
     procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
@@ -246,6 +258,10 @@ type
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
     procedure ApplyConfig; override;
     property CustomHeaders: TStringList read FCustomHeaders;
+    // Shared port: a WebSocket upgrade request for exactly WebSocketPath on this site is handed to
+    // WebSocket (same profiles, lockout, limits and Origin check as the WS port). nil / '' = off.
+    property WebSocket: TVDRX_WebSocketExecutive read FWebSocket write FWebSocket;
+    property WebSocketPath: string read FWebSocketPath write FWebSocketPath;
     class function BuildResponse(const ARequest: string;
       ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
       const ARoutes: TVDRX_RouteTable; const AConn: TVDRX_ConnInfo;
@@ -270,7 +286,11 @@ type
     FRegistry: TVDRX_Registry;
     FSourceID: string;
     FCustomHeaders: TStringList;
+    FWebSocket: TVDRX_WebSocketExecutive;
+    FWebSocketPath: string;
   public
+    property WebSocket: TVDRX_WebSocketExecutive read FWebSocket write FWebSocket;
+    property WebSocketPath: string read FWebSocketPath write FWebSocketPath;
     constructor Create(ABus: TVDRX_MessageQueue; ATransport: TVDRX_Transport;
       ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
       const ARoutes: TVDRX_RouteTable; const AConn: TVDRX_ConnInfo;
@@ -337,6 +357,10 @@ type
   TVDRX_WebSocketExecutive = class(TVDRX_SocketListenerExecutive)
   private
     FAllowOpenAccess: Boolean;
+    FLiveConns: LongInt;
+    FAllowedOrigins: TStringList;
+    FMaxFrameBytes: Integer;
+    FFrameTimeoutMs: Integer;
     FAuthLock: TCriticalSection;
     FAuthTrack: specialize TDictionary<string, TVDRX_AuthTrack>;
     FConfig: TVDRX_Config;
@@ -356,6 +380,19 @@ type
     // passes, then the client may subscribe to anything and publish outside
     // sys.>) - for a throwaway dev setup only.
     property AllowOpenAccess: Boolean read FAllowOpenAccess write FAllowOpenAccess;
+    // Browsers always send an Origin header on a WebSocket handshake, and any web page the user
+    // visits can ask their browser to connect to an internal address. A handshake whose Origin is
+    // neither the same host as the Host header nor listed here is refused (403). Clients that send
+    // no Origin (scripts, other servers) are not affected. Entries are full origins, e.g.
+    // "https://dash.corp.example".
+    property AllowedOrigins: TStringList read FAllowedOrigins;
+    function OriginAllowed(const ARequest: string): Boolean;
+    // Called by a WS connection when it has fully ended (frees its slot in the live count).
+    procedure ConnectionEnded;
+    // Largest WebSocket frame a client may send (default 1 MiB). Bigger -> the connection is closed.
+    property MaxFrameBytes: Integer read FMaxFrameBytes write FMaxFrameBytes;
+    // Once a frame has started, how long each further read may take (default 15 s).
+    property FrameTimeoutMs: Integer read FFrameTimeoutMs write FFrameTimeoutMs;
     // Failed-login lockout, per client address: AUTH_MAX_FAILURES failures
     // inside AUTH_WINDOW_MS locks that address out of sys.auth for AUTH_LOCKOUT_MS.
     function AuthLocked(const AIP: string): Boolean;
@@ -368,7 +405,11 @@ type
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
     procedure ApplyConfig; override;
     function NextConnID: string;
-    procedure AdoptConnection(ATransport: TVDRX_Transport; const AInitialRequest: string);
+    // Takes over an accepted connection (from the WS port, or handed over by an HTTP site on a
+    // shared port). The transport is ALWAYS consumed: closed and freed here if the connection is
+    // refused, owned by the new WS connection otherwise. AInitialRequest = the HTTP upgrade
+    // request when it has already been read. False = refused (connection cap).
+    function AdoptConnection(ATransport: TVDRX_Transport; const AInitialRequest: string): Boolean;
     property PingIntervalMs: Integer read FPingIntervalMs write FPingIntervalMs;
     property PongTimeoutMs: Integer read FPongTimeoutMs write FPongTimeoutMs;
     property DefaultSubscribe: string read FDefaultSubscribe write FDefaultSubscribe;
@@ -468,9 +509,44 @@ function ConnectTCP(const AHost: string; APort: Word): TVDRX_Transport;
 function ConnectTCPHost(const AHost: string; APort: Word): TVDRX_Transport;
 procedure ApplyOpenSSLDLLOverrides(AConfig: TVDRX_Config);
 
+// How long an HTTP client may take to send its request: AReadMs is the longest
+// gap between two reads (idle / slow-loris), ARequestMs the total allowed for
+// the whole request (headers + body). 0 turns that limit off.
+procedure VDRX_ConfigureHTTPTimeouts(AReadMs, ARequestMs: Integer);
+
 implementation
 
-function ReadFullRequest(ATransport: TVDRX_Transport; out ATooLarge: Boolean): string; forward;
+var
+  HTTPReadTimeoutMs: Integer = 10000;
+  HTTPRequestTimeoutMs: Integer = 30000;
+
+procedure VDRX_ConfigureHTTPTimeouts(AReadMs, ARequestMs: Integer);
+begin
+  if AReadMs >= 0 then HTTPReadTimeoutMs := AReadMs;
+  if ARequestMs >= 0 then HTTPRequestTimeoutMs := ARequestMs;
+end;
+
+// Reads exactly ACount bytes. TCP is a byte stream: a 2-byte header may arrive
+// as 1 + 1, so a single short Read is normal and is not an error. False on EOF,
+// error or timeout.
+function ReadExact(ATransport: TVDRX_Transport; var ABuf; ACount: Integer): Boolean;
+var
+  P: PByte;
+  Got, N: Integer;
+begin
+  Result := False;
+  P := @ABuf;
+  Got := 0;
+  while Got < ACount do
+  begin
+    N := ATransport.Read((P + Got)^, ACount - Got);
+    if N <= 0 then Exit;
+    Inc(Got, N);
+  end;
+  Result := True;
+end;
+
+function ReadFullRequest(ATransport: TVDRX_Transport; out ATooLarge, ATimedOut: Boolean): string; forward;
 
 function ParseIPv4(const AHost: string; out AAddr: Cardinal): Boolean;
 var
@@ -820,15 +896,44 @@ begin
   inherited Create(True);
   FOwner := AOwner;
   FTransport := ATransport;
+  FPendingSock := -1;
+  FreeOnTerminate := False;
+end;
+
+constructor TVDRX_ListenerConnThread.CreateTLS(AOwner: TVDRX_SocketListenerExecutive; ASock: TSocket;
+  const APeerAddr: string; APeerPort: Word);
+begin
+  inherited Create(True);
+  FOwner := AOwner;
+  FTransport := nil;
+  FPendingSock := ASock;
+  FPendingAddr := APeerAddr;
+  FPendingPort := APeerPort;
   FreeOnTerminate := False;
 end;
 
 procedure TVDRX_ListenerConnThread.Execute;
+var
+  T: TVDRX_Transport;
 begin
+  // Registered first, so a connection that is still handshaking already counts
+  // against max_connections and is waited for at shutdown.
   FOwner.RegisterConnection(Self);
   try
     try
-      FOwner.HandleConnection(FTransport);
+      if FPendingSock <> -1 then
+      begin
+        T := FOwner.CompleteTLSHandshake(FPendingSock, FPendingAddr, FPendingPort);
+        FPendingSock := -1;
+        FTransport := T;               // nil = handshake failed or timed out (socket already closed)
+      end;
+      if FTransport <> nil then
+      begin
+        if FOwner.Stopping then
+          FTransport.Free
+        else
+          FOwner.HandleConnection(FTransport);
+      end;
     except
     end;
   finally
@@ -950,16 +1055,28 @@ end;
 procedure TVDRX_SocketListenerExecutive.NoteRejected;
 var
   Now: QWord;
+  Count: Integer;
+  DoLog: Boolean;
 begin
-  Inc(FRejectedSinceLog);
-  Now := GetTickCount64;
-  if (FLastRejectLog = 0) or (Now - FLastRejectLog >= 10000) then
-  begin
-    Bus.Publish('log.warn', ID + ': connection limit (' + IntToStr(FMaxConnections) +
-      ') reached - closed ' + IntToStr(FRejectedSinceLog) + ' new connection(s)', ID);
-    FLastRejectLog := Now;
-    FRejectedSinceLog := 0;
+  DoLog := False;
+  Count := 0;
+  FCriticalSection.Acquire;
+  try
+    Inc(FRejectedSinceLog);
+    Now := GetTickCount64;
+    if (FLastRejectLog = 0) or (Now - FLastRejectLog >= 10000) then
+    begin
+      DoLog := True;
+      Count := FRejectedSinceLog;
+      FLastRejectLog := Now;
+      FRejectedSinceLog := 0;
+    end;
+  finally
+    FCriticalSection.Release;
   end;
+  if DoLog then
+    Bus.Publish('log.warn', ID + ': connection limit (' + IntToStr(FMaxConnections) +
+      ') reached - closed ' + IntToStr(Count) + ' new connection(s)', ID);
 end;
 
 procedure TVDRX_SocketListenerExecutive.AcceptLoopPlain;
@@ -1017,12 +1134,33 @@ begin
   end;
 end;
 
+function TVDRX_SocketListenerExecutive.CompleteTLSHandshake(ASock: TSocket; const APeerAddr: string;
+  APeerPort: Word): TVDRX_Transport;
+var
+  T: TVDRX_TLSTransport;
+begin
+  Result := nil;
+  // Bound the handshake itself (see SetRawSocketReadTimeout's comment);
+  // restored to unlimited once it has actually completed.
+  SetRawSocketReadTimeout(ASock, TLS_HANDSHAKE_TIMEOUT_MS);
+  T := TVDRX_TLSTransport.Create(ASock, FTLSContext.Ctx);
+  if not T.Handshook then
+  begin
+    T.Free;
+    Exit;
+  end;
+  T.SetReadTimeout(0);
+  T.PeerAddr := APeerAddr;
+  T.PeerPort := APeerPort;
+  T.Secure := True;
+  Result := T;
+end;
+
 procedure TVDRX_SocketListenerExecutive.AcceptLoopTLS;
 var
   ClientAddr: TInetSockAddr;
   AddrLen: TSockLen;
   ClientSock: TSocket;
-  Transport: TVDRX_TLSTransport;
   ConnThread: TVDRX_ListenerConnThread;
 begin
   FTLSSocket := BindListenSocket(FTLSPort);
@@ -1049,29 +1187,17 @@ begin
       Continue;
     end;
 
-    // Bound the handshake itself (see SetRawSocketReadTimeout's comment);
-    // restored to unlimited below once it has actually completed.
-    SetRawSocketReadTimeout(ClientSock, TLS_HANDSHAKE_TIMEOUT_MS);
-    Transport := TVDRX_TLSTransport.Create(ClientSock, FTLSContext.Ctx);
-    if not Transport.Handshook then
-    begin
-      Transport.Free;
-      Continue;
-    end;
-    Transport.SetReadTimeout(0);
-
-    Transport.PeerAddr := NetAddrToStr(ClientAddr.sin_addr);
-    Transport.PeerPort := ntohs(ClientAddr.sin_port);
-    Transport.Secure := True;
-
+    // The handshake is NOT done here: this loop must get straight back to
+    // accept(). The connection thread performs it (see TVDRX_ListenerConnThread).
     FCriticalSection.Acquire;
     try
       if FStopping then
       begin
-        Transport.Free;
+        CloseSocket(ClientSock);
         Break;
       end;
-      ConnThread := TVDRX_ListenerConnThread.Create(Self, Transport);
+      ConnThread := TVDRX_ListenerConnThread.CreateTLS(Self, ClientSock,
+        NetAddrToStr(ClientAddr.sin_addr), ntohs(ClientAddr.sin_port));
     finally
       FCriticalSection.Release;
     end;
@@ -1105,6 +1231,8 @@ begin
     begin
       FTLSContext.Free;
       FTLSContext := nil;
+      Bus.Publish('log.error', ID + ': TLS port ' + IntToStr(FTLSPort) + ' NOT started - could not load certificate "' +
+        FTLSCertFile + '" / key "' + FTLSKeyFile + '", or libssl is not loadable', ID);
     end
     else
     begin
@@ -1190,7 +1318,10 @@ begin
       if not WaitConnGone(ConnThread, FGracefulTimeoutMs) then
       begin
         Bus.Publish('log.warn', ID + ': connection thread did not exit in time - forcing its socket closed', ID);
-        try ConnThread.Transport.Close; except end;
+        try
+          if ConnThread.Transport <> nil then ConnThread.Transport.Close;
+        except
+        end;
         if not WaitConnGone(ConnThread, FGracefulTimeoutMs) then
           Bus.Publish('log.warn', ID + ': connection thread still stuck after forcing its socket closed - abandoning it', ID);
       end;
@@ -1296,19 +1427,104 @@ begin
   end;
 end;
 
-function ReadFullRequest(ATransport: TVDRX_Transport; out ATooLarge: Boolean): string;
+// 'http://Dash.Corp:8080/x' -> 'dash.corp'; 'dash.corp:8080' -> 'dash.corp'; '[::1]:80' -> '[::1]'.
+function HostNameOf(const AValue: string): string;
+var
+  S: string;
+  p: Integer;
+begin
+  S := Trim(AValue);
+  p := Pos('://', S);
+  if p > 0 then Delete(S, 1, p + 2);
+  p := Pos('/', S);
+  if p > 0 then SetLength(S, p - 1);
+  if (S <> '') and (S[1] = '[') then
+  begin
+    p := Pos(']', S);
+    if p > 0 then SetLength(S, p);
+  end
+  else
+  begin
+    p := Pos(':', S);
+    if p > 0 then SetLength(S, p - 1);
+  end;
+  Result := LowerCase(S);
+end;
+
+// True when a comma-separated header value (e.g. "keep-alive, Upgrade") contains AToken.
+function ValueHasToken(const AValue, AToken: string): Boolean;
+var
+  Part: string;
+begin
+  Result := False;
+  for Part in LowerCase(AValue).Split([',']) do
+    if Trim(Part) = LowerCase(AToken) then Exit(True);
+end;
+
+// Reads one HTTP request. Returns '' when the request is not usable:
+//   * ATooLarge  - declared body over MAX_BODY_SIZE (caller answers 413)
+//   * ATimedOut  - the client sent something and then went too slow or silent
+//                  (caller answers 408); a client that never sent a byte is
+//                  just dropped
+// A request cut off in the middle of its body is dropped too, instead of being
+// handled with a shorter body than it declared.
+function ReadFullRequest(ATransport: TVDRX_Transport; out ATooLarge, ATimedOut: Boolean): string;
 var
   Buf: array[0..4095] of Byte;
-  Received, HeaderEnd, ContentLength, BodySoFar, ToRead, TotalLen: Integer;
+  Received, HeaderEnd, ContentLength, BodySoFar, ToRead, Used, Cap: Integer;
   HeaderBlock, CLStr: string;
+  StartTick, ReadStart: QWord;
+  Armed: Int64;
+
+  // Sets the socket read timeout for the next read: the per-read limit, or what is
+  // left of the total, whichever is smaller. False = the total has already run out.
+  function ArmTimeout: Boolean;
+  var
+    Left: Int64;
+  begin
+    Result := True;
+    Left := HTTPReadTimeoutMs;
+    if HTTPRequestTimeoutMs > 0 then
+    begin
+      Armed := Int64(HTTPRequestTimeoutMs) - Int64(GetTickCount64 - StartTick);
+      if Armed <= 0 then Exit(False);
+      if (Left <= 0) or (Armed < Left) then Left := Armed;
+    end;
+    Armed := Left;
+    if Left > 0 then ATransport.SetReadTimeout(Integer(Left));
+  end;
+
+  // After a read that returned nothing: was that our timeout firing (as opposed to the peer closing)?
+  function LooksLikeTimeout: Boolean;
+  begin
+    Result := (Armed > 0) and (Int64(GetTickCount64 - ReadStart) + 150 >= Armed);
+  end;
+
 begin
   Result := '';
   ATooLarge := False;
+  ATimedOut := False;
   HeaderEnd := 0;
+  StartTick := GetTickCount64;
+  Armed := 0;
   while (HeaderEnd = 0) and (Length(Result) < MAX_HEADER_SIZE) do
   begin
+    if not ArmTimeout then
+    begin
+      ATimedOut := Result <> '';
+      Exit('');
+    end;
+    ReadStart := GetTickCount64;
     Received := ATransport.Read(Buf[0], SizeOf(Buf));
-    if Received <= 0 then Exit(Result);
+    if Received <= 0 then
+    begin
+      if LooksLikeTimeout then
+      begin
+        ATimedOut := Result <> '';
+        Exit('');
+      end;
+      Exit(Result);
+    end;
     SetLength(Result, Length(Result) + Received);
     Move(Buf[0], Result[Length(Result) - Received + 1], Received);
     HeaderEnd := Pos(#13#10#13#10, Result);
@@ -1333,28 +1549,42 @@ begin
     // rather than a silently truncated 200 anyway. The caller closes the
     // connection either way.
     ATooLarge := True;
-    Exit;
+    Exit('');
   end;
 
+  // The body buffer grows as bytes actually arrive. Reserving the declared
+  // Content-Length up front (up to 10 MB) let a client that only SAYS it will
+  // send a big body pin that much address space/commit per connection.
   BodySoFar := Length(Result) - (HeaderEnd + 3);
-  if ContentLength > BodySoFar then
-  begin
-    TotalLen := Length(Result) + (ContentLength - BodySoFar);
-    SetLength(Result, TotalLen);
-  end;
+  Used := Length(Result);
+  Cap := Used;
   while BodySoFar < ContentLength do
   begin
+    if not ArmTimeout then
+    begin
+      ATimedOut := True;
+      Exit('');
+    end;
     ToRead := ContentLength - BodySoFar;
     if ToRead > SizeOf(Buf) then ToRead := SizeOf(Buf);
+    ReadStart := GetTickCount64;
     Received := ATransport.Read(Buf[0], ToRead);
     if Received <= 0 then
     begin
-      SetLength(Result, HeaderEnd + 3 + BodySoFar);
-      Break;
+      ATimedOut := LooksLikeTimeout;
+      Exit('');                       // truncated body: do not process half a request
     end;
-    Move(Buf[0], Result[HeaderEnd + 3 + BodySoFar + 1], Received);
+    if Used + Received > Cap then
+    begin
+      Cap := Used + Received + (Used div 2) + 65536;
+      if Cap > HeaderEnd + 3 + ContentLength then Cap := HeaderEnd + 3 + ContentLength;
+      SetLength(Result, Cap);
+    end;
+    Move(Buf[0], Result[Used + 1], Received);
+    Inc(Used, Received);
     Inc(BodySoFar, Received);
   end;
+  SetLength(Result, Used);
 end;
 
 // Maps a URL path (e.g. '/app/index.php') onto a directory, segment by segment.
@@ -2424,14 +2654,16 @@ end;
 procedure TVDRX_HTTPConnection.Run(const ARequest: string);
 var
   Request, Response, Method, Path: string;
-  HeadEnd, Sent, N: Integer;
-  TooLarge: Boolean;
+  HeadEnd, Sent, N, p: Integer;
+  Head, PathOnly: string;
+  TooLarge, TimedOut: Boolean;
 begin
   TooLarge := False;
+  TimedOut := False;
   if ARequest <> '' then
     Request := ARequest
   else
-    Request := ReadFullRequest(FTransport, TooLarge);
+    Request := ReadFullRequest(FTransport, TooLarge, TimedOut);
 
   if TooLarge then
   begin
@@ -2446,9 +2678,48 @@ begin
       Inc(Sent, N);
     end;
   end
+  else if TimedOut then
+  begin
+    // The client started a request and then stalled (slow-loris) - say so and hang up.
+    Bus.Publish('log.info', 'http: request not completed in time - 408', FSourceID);
+    Response := PlainResponse('408 Request Timeout', 'text/plain', 'Request not completed in time.');
+    Sent := 0;
+    while Sent < Length(Response) do
+    begin
+      N := FTransport.Write(Response[Sent + 1], Length(Response) - Sent);
+      if N <= 0 then Break;
+      Inc(Sent, N);
+    end;
+  end
   else if Request <> '' then
   begin
     ParseRequestLine(Request, Method, Path);
+    if (FWebSocket <> nil) and (FWebSocketPath <> '') and (Method = 'GET') then
+    begin
+      Head := Copy(Request, 1, Pos(#13#10#13#10, Request));
+      PathOnly := Path;
+      p := Pos('?', PathOnly);
+      if p > 0 then SetLength(PathOnly, p - 1);
+      if (PathOnly = FWebSocketPath) and ValueHasToken(ExtractHeaderValue(Head, 'Upgrade'), 'websocket') then
+      begin
+        if ValueHasToken(ExtractHeaderValue(Head, 'Connection'), 'upgrade') and
+           (ExtractHeaderValue(Head, 'Sec-WebSocket-Key') <> '') and
+           (ExtractHeaderValue(Head, 'Sec-WebSocket-Version') = '13') then
+        begin
+          // Hand the connection over. From here the WebSocket code owns the transport (it also
+          // answers the handshake); this HTTP connection must neither close nor free it.
+          Bus.Publish('log.info', 'http: ' + Path + ' -> WebSocket upgrade', FSourceID);
+          FWebSocket.AdoptConnection(FTransport, Request);
+          FTransport := nil;
+          Exit;
+        end;
+        Response := 'HTTP/1.1 426 Upgrade Required'#13#10'Sec-WebSocket-Version: 13'#13#10 +
+          'Connection: close'#13#10'Content-Length: 0'#13#10#13#10;
+        FTransport.Write(Response[1], Length(Response));
+        FTransport.Close;
+        Exit;
+      end;
+    end;
     Response := TVDRX_HTTPExecutive.BuildResponse(Request, FTemplates, FConfig, FStaticDir,
       FRoutes, FConn, Bus, FRegistry, FSourceID, FCustomHeaders);
     Bus.Publish('log.info', Format('http: %s %s -> %s', [Method, Path, StatusOf(Response)]), FSourceID);
@@ -2487,6 +2758,8 @@ begin
   if Info.Secure then Info.ServerPort := TLSPort else Info.ServerPort := Port;
   Conn := TVDRX_HTTPConnection.Create(Bus, ATransport, FTemplates, FConfig, FStaticDir,
     FRoutes, Info, FRegistry, ID, FCustomHeaders);
+  Conn.WebSocket := FWebSocket;
+  Conn.WebSocketPath := FWebSocketPath;
   try
     Conn.Run;
   finally
@@ -2727,6 +3000,15 @@ begin
   // for plain ASCII header text), while Key itself is extracted from
   // the ORIGINAL Request, not the uppercased copy - the base64 key
   // value is case-sensitive and must be preserved exactly as sent.
+  if not FListener.OriginAllowed(Request) then
+  begin
+    Bus.Publish('log.warn', 'ws ' + ID + ': handshake refused - Origin "' +
+      Copy(ExtractHeaderValue(Copy(Request, 1, Pos(#13#10#13#10, Request)), 'Origin'), 1, 100) +
+      '" is not allowed (same host as the Host header, or listed in allowed_origins)', ID);
+    Header := 'HTTP/1.1 403 Forbidden'#13#10'Connection: close'#13#10'Content-Length: 0'#13#10#13#10;
+    FTransport.Write(Header[1], Length(Header));
+    Exit;
+  end;
   i := Pos(UpperCase(KeyHeaderName), UpperCase(Request));
   if i = 0 then
   begin
@@ -2765,53 +3047,74 @@ var
   Len: Int64;
   Mask: array[0..3] of Byte;
   Data: array of Byte;
-  Received, i: Integer;
+  Received, i, Chunk, MaxLen: Integer;
   LenByte: Byte;
+  FrameStart: QWord;
 begin
   Result := False;
-  if FTransport.Read(Hdr[0], 2) <> 2 then Exit;
-  AOpcode := Hdr[0] and $0F;
-  if AOpcode = 8 then Exit;
-  LenByte := Hdr[1] and $7F;
-  Len := LenByte;
-  if LenByte = 126 then
-  begin
-    if FTransport.Read(Ext[0], 2) <> 2 then Exit;
-    Len := (Ext[0] shl 8) or Ext[1];
-    // always <= 65535 here, well under WS_MAX_FRAME_LEN - checked anyway so
-    // the cap is enforced the same way on both extended-length encodings
-    // rather than relying on that numeric coincidence.
-    if Len > WS_MAX_FRAME_LEN then Exit;
-  end
-  else if LenByte = 127 then
-  begin
-    if FTransport.Read(Ext8[0], 8) <> 8 then Exit;
-    Len := 0;
-    for i := 0 to 7 do
-      Len := (Len shl 8) or Ext8[i];
-    if (Len < 0) or (Len > WS_MAX_FRAME_LEN) then Exit;
+  APayload := '';
+  AOpcode := 0;
+  Data := nil;
+  // The first byte may take as long as the client likes - an idle connection is
+  // fine, the ping/pong loop watches whether it is still alive. Once a frame
+  // has BEGUN the rest of it has to follow promptly (a client that sends a
+  // header and then goes quiet would otherwise hold this thread and a
+  // connection slot forever).
+  if FTransport.Read(Hdr[0], 1) <> 1 then Exit;
+  FrameStart := GetTickCount64;
+  FTransport.SetReadTimeout(FListener.FrameTimeoutMs);
+  try
+    // TCP may deliver a frame in pieces; every field is read in full.
+    if not ReadExact(FTransport, Hdr[1], 1) then Exit;
+    AOpcode := Hdr[0] and $0F;
+    if AOpcode = 8 then Exit;
+    // RFC 6455 5.1: a client MUST mask every frame it sends.
+    if (Hdr[1] and $80) = 0 then Exit;
+    LenByte := Hdr[1] and $7F;
+    Len := LenByte;
+    if LenByte = 126 then
+    begin
+      if not ReadExact(FTransport, Ext[0], 2) then Exit;
+      Len := (Ext[0] shl 8) or Ext[1];
+    end
+    else if LenByte = 127 then
+    begin
+      if not ReadExact(FTransport, Ext8[0], 8) then Exit;
+      Len := 0;
+      for i := 0 to 7 do
+        Len := (Len shl 8) or Ext8[i];
+      if Len < 0 then Exit;
+    end;
+    MaxLen := FListener.MaxFrameBytes;
+    if (MaxLen <= 0) or (MaxLen > WS_MAX_FRAME_LEN) then MaxLen := WS_MAX_FRAME_LEN;
+    if Len > MaxLen then Exit;
+    // Control frames (close/ping/pong): at most 125 bytes and never fragmented (RFC 6455 5.5).
+    if (AOpcode >= 8) and ((Len > 125) or ((Hdr[0] and $80) = 0)) then Exit;
+    if not ReadExact(FTransport, Mask[0], 4) then Exit;
+
+    // The buffer grows as the bytes actually arrive; a header that merely
+    // DECLARES a large frame reserves nothing.
+    Received := 0;
+    while Received < Len do
+    begin
+      if GetTickCount64 - FrameStart > QWord(FListener.FrameTimeoutMs) * 4 then Exit;   // dribbling
+      Chunk := Integer(Len - Received);
+      if Chunk > 65536 then Chunk := 65536;
+      if Length(Data) < Received + Chunk then SetLength(Data, Received + Chunk);
+      i := FTransport.Read(Data[Received], Chunk);
+      if i <= 0 then Exit;
+      Inc(Received, i);
+    end;
+    for i := 0 to Integer(Len) - 1 do
+      Data[i] := Data[i] xor Mask[i mod 4];
+    if Len > 0 then
+      SetString(APayload, PAnsiChar(@Data[0]), Integer(Len))
+    else
+      APayload := '';
+    Result := True;
+  finally
+    FTransport.SetReadTimeout(0);
   end;
-  if (Hdr[1] and $80) <> 0 then
-  begin
-    if FTransport.Read(Mask[0], 4) <> 4 then Exit;
-  end
-  else
-    FillChar(Mask, SizeOf(Mask), 0);
-  SetLength(Data, Integer(Len));
-  Received := 0;
-  while Received < Len do
-  begin
-    i := FTransport.Read(Data[Received], Integer(Len - Received));
-    if i <= 0 then Exit;
-    Inc(Received, i);
-  end;
-  for i := 0 to Integer(Len) - 1 do
-    Data[i] := Data[i] xor Mask[i mod 4];
-  if Len > 0 then
-    SetString(APayload, PAnsiChar(@Data[0]), Integer(Len))
-  else
-    APayload := '';
-  Result := True;
 end;
 
 procedure TVDRX_WSConnection.SendFrame(const APayload: string; AOpcode: Byte);
@@ -3178,27 +3481,32 @@ var
   Payload: string;
   Opcode: Byte;
 begin
-  if not DoHandshake then
+  // The teardown below must run whether or not the handshake succeeds. It used to be skipped on a
+  // failed handshake, which left this connection's send thread, protocol executive and registry
+  // entries behind: one leaked thread per junk connection, a remote denial of service.
+  if DoHandshake then
   begin
-    Bus.Publish('log.warn', 'ws ' + ID + ': handshake failed, dropping connection', ID);
-    Exit;
-  end;
+    FLastPong := Now;
+    FPingThread := TVDRX_WorkerThread.Create(@PingLoop);
+    FPingThread.Start;
 
-  FLastPong := Now;
-  FPingThread := TVDRX_WorkerThread.Create(@PingLoop);
-  FPingThread.Start;
-
-  while True do
-  begin
-    if not ReadFrame(Payload, Opcode) then Break;
-    case Opcode of
-      1: Bus.Publish(ID + '.rpc.in', Payload, ID);
-      9: SendFrame(Payload, 10);
-      10: FLastPong := Now;
+    while True do
+    begin
+      if not ReadFrame(Payload, Opcode) then Break;
+      case Opcode of
+        1: Bus.Publish(ID + '.rpc.in', Payload, ID);
+        9: SendFrame(Payload, 10);
+        10: FLastPong := Now;
+      end;
     end;
-  end;
+  end
+  else
+    Bus.Publish('log.warn', 'ws ' + ID + ': handshake failed, dropping connection', ID);
 
   FStopping := True;
+  // The connection is over: give its slot back now, not after the chores below (joining the ping
+  // thread can take a second). Must stay before UnregisterSelf, which can destroy this object.
+  FListener.ConnectionEnded;
   if Assigned(FPingThread) then
   begin
     WaitThreadOrTimeout(FPingThread, 1000);
@@ -3303,6 +3611,11 @@ begin
   FPingIntervalMs := 15000;
   FPongTimeoutMs := 10000;
   FAllowOpenAccess := False;
+  FLiveConns := 0;
+  FAllowedOrigins := TStringList.Create;
+  FAllowedOrigins.CaseSensitive := False;
+  FMaxFrameBytes := 1024 * 1024;
+  FFrameTimeoutMs := 15000;
   FAuthLock := TCriticalSection.Create;
   FAuthTrack := specialize TDictionary<string, TVDRX_AuthTrack>.Create;
 end;
@@ -3311,6 +3624,7 @@ destructor TVDRX_WebSocketExecutive.Destroy;
 begin
   FAuthTrack.Free;
   FAuthLock.Free;
+  FAllowedOrigins.Free;
   inherited Destroy;
 end;
 
@@ -3443,13 +3757,28 @@ begin
   Result := 'ws.conn.' + IntToStr(FConnCounter);
 end;
 
-procedure TVDRX_WebSocketExecutive.AdoptConnection(ATransport: TVDRX_Transport; const AInitialRequest: string);
+function TVDRX_WebSocketExecutive.AdoptConnection(ATransport: TVDRX_Transport; const AInitialRequest: string): Boolean;
+const
+  REFUSED = 'HTTP/1.1 503 Service Unavailable'#13#10'Connection: close'#13#10'Content-Length: 0'#13#10#13#10;
 var
   Conn: TVDRX_WSConnection;
   Protocol: TVDRX_WSProtocolExecutive;
   NewID: string;
   Filter: string;
 begin
+  // max_connections counts LIVE WebSocket connections. (The accept loop's own count only covers
+  // the moment of accepting: a WS connection runs on its own threads and leaves that list at once.)
+  Result := False;
+  if (FMaxConnections > 0) and (InterlockedIncrement(FLiveConns) > FMaxConnections) then
+  begin
+    InterlockedDecrement(FLiveConns);
+    try ATransport.Write(REFUSED[1], Length(REFUSED)); except end;
+    ATransport.Free;
+    NoteRejected;
+    Exit;
+  end;
+  if FMaxConnections <= 0 then InterlockedIncrement(FLiveConns);
+  Result := True;
   Conn := TVDRX_WSConnection.Create(Bus, Self, ATransport);
   Conn.PendingRequest := AInitialRequest;
   NewID := NextConnID;
@@ -3463,6 +3792,25 @@ begin
   Protocol := TVDRX_WSProtocolExecutive.Create(Bus, Self, Conn);
   FRegistry.Register(Protocol, NewID + '.rpc', NewID + '.rpc.in');
   Conn.Initialize;
+end;
+
+procedure TVDRX_WebSocketExecutive.ConnectionEnded;
+begin
+  InterlockedDecrement(FLiveConns);
+end;
+
+function TVDRX_WebSocketExecutive.OriginAllowed(const ARequest: string): Boolean;
+var
+  HeadBlock, Origin, HostHdr: string;
+  p: Integer;
+begin
+  p := Pos(#13#10#13#10, ARequest);
+  if p > 0 then HeadBlock := Copy(ARequest, 1, p - 1) else HeadBlock := ARequest;
+  Origin := ExtractHeaderValue(HeadBlock, 'Origin');
+  if Origin = '' then Exit(True);                       // not a browser
+  if FAllowedOrigins.IndexOf(Origin) >= 0 then Exit(True);
+  HostHdr := ExtractHeaderValue(HeadBlock, 'Host');
+  Result := (HostHdr <> '') and (HostNameOf(Origin) = HostNameOf(HostHdr));
 end;
 
 procedure TVDRX_WebSocketExecutive.HandleConnection(ATransport: TVDRX_Transport);

@@ -17,3 +17,6 @@ lib/
 # python bytecode
 __pycache__/
 *.pyc
+
+# generated at test time by tests/integration/run.sh (limits section)
+tests/integration/*/*.pem

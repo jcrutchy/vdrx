@@ -13,8 +13,7 @@ tests/run.sh          # build everything, run the unit test, then the integratio
 
 **Integration tests** need `curl` and `python3`; sections that need `php-cgi`, `php` or Unix tools skip themselves
 if those aren't on `PATH`. They use ports 8080, 8082, 18080, 18082 and refuse to start if one is taken. They only
-ever stop the daemon they started. A "known gap" note (not a failure) reports that WebSocket upgrade on the HTTP
-port isn't supported yet.
+ever stop the daemon they started.
 
 Windows: the scripts are plain `sh`; they should work from Git Bash if `curl` and `python3` are on `PATH` (they look for
 `bin/vdrx.exe` too), but only Linux has been tried - WSL is the safe choice.

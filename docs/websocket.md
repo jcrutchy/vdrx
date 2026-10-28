@@ -8,9 +8,44 @@ on top:
 { "enabled": true, "port": 8082, "ping_interval_ms": 15000, "pong_timeout_ms": 10000 }
 ```
 
-`bind` and `max_connections` work exactly as for `http_sites` (§4): loopback only by default,
-256 simultaneous connections by default. WebSocket connections are long-lived, so size
-`max_connections` for the number of browser tabs you expect.
+`bind` works exactly as for `http_sites` (§4): loopback only by default.
+
+**`max_connections`** (default `256`) is the number of *live* WebSocket connections, counted across the
+WebSocket port and any HTTP site's shared port (below). A new connection over the limit is answered
+`503` and closed. Size it for the number of browser tabs you expect.
+
+## One port for pages and WebSocket
+
+Set `websocket_path` on an HTTP site and an `Upgrade: websocket` request for exactly that path is handed
+to the WebSocket server - same profiles, same login lockout, same frame limits, same Origin check, and
+over TLS (`wss://`) when the site has a `tls_port`:
+
+```json
+{
+  "http_sites": [ { "id": "web", "port": 8080, "static_dir": "public", "websocket_path": "/ws" } ],
+  "executives": { "ws": { "enabled": true, "port": 0 } }
+}
+```
+
+A page then opens `new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws')`.
+`"port": 0` means the WebSocket server has no listener of its own and is reachable only through sites
+that set `websocket_path`; leave a real port there to keep both. Only the exact path matches (a query
+string is ignored); anything else on that site is ordinary HTTP. An upgrade request that is malformed
+(no `Sec-WebSocket-Key`, a version other than 13, no `Connection: Upgrade`) gets `426`.
+
+**Origin check.** A browser handshake whose `Origin` is not the same host as the request's `Host` header
+(any port) and is not listed in `executives.ws.allowed_origins` is refused with `403`, because any web
+page a user visits can ask their browser to connect to an address on your network. List full origins,
+e.g. `"allowed_origins": ["https://dash.corp.example"]`. Clients that send no `Origin` (scripts, other
+servers) are not affected. A page opened from disk (`file://`) sends `Origin: null`; allow it with
+`"allowed_origins": ["null"]` only together with a profile that has a token (a sandboxed iframe on any
+website sends `null` too). It does not stop DNS rebinding - see [known-gaps.md](known-gaps.md).
+
+**Frame limits.** A client frame larger than `max_frame_bytes` (default `1048576`, 1 MiB) closes the
+connection; so does an unmasked frame (RFC 6455 requires clients to mask), a control frame over 125
+bytes, or a frame that stalls part-way: once a frame has started, each further read may take at most
+`frame_timeout_ms` (default `15000`). An idle connection between frames is fine - the ping/pong
+heartbeat watches whether it is still alive. Both options go under `executives.ws`.
 
 **Authentication is required, and closed by default.** A client must `sys.auth` before anything
 else. Without `ws_profiles` **every `sys.auth` is rejected** - define profiles (below). For a

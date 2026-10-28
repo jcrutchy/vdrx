@@ -6,7 +6,7 @@ whose **entire backend is the vdrx bus**.
 
 ```json
 {
-  "http_sites": [ { "id": "web", "port": 8080, "static_dir": "public" } ],
+  "http_sites": [ { "id": "web", "port": 8080, "static_dir": "public", "websocket_path": "/ws" } ],
   "executives": { "ws": { "enabled": true, "port": 8082 } },
   "ws_profiles": [
     { "id": "browser", "subscribe_allow": ["chat.>"], "publish_allow": ["chat.>"] }
@@ -16,17 +16,17 @@ whose **entire backend is the vdrx bus**.
 
 Run vdrx from the example folder and open <http://localhost:8080/> in two tabs.
 
-> **Two ports for now.** The web server and the WebSocket server each listen on their own port
-> (8080 and 8082 above). Serving both on *one* port (an `Upgrade: websocket` request on the HTTP port
-> being handed to the WebSocket server) is not implemented yet - see [../known-gaps.md](../known-gaps.md).
-> Pages simply open `ws://<same host>:8082`.
+> **One port or two.** The page connects to `/ws` on the port it was served from (8080): the
+> `websocket_path` on the site hands that upgrade to the WebSocket server. The WebSocket server also
+> keeps its own port (8082) here, so either works; set `"port": 0` to serve it on the shared port only.
+> See [../websocket.md](../websocket.md).
 
 ## How the chat works
 
 There is no chat code on the server. The browser does this (see `public/index.html`):
 
 ```js
-const ws = new WebSocket('ws://' + location.hostname + ':8082');
+const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
 ws.onopen = () => ws.send(JSON.stringify({method: 'sys.auth', profile: 'browser'}));   // pick a profile
 // after {"event":"auth.ok"}:
 ws.send(JSON.stringify({method: 'subscribe', filter: 'chat.room'}));

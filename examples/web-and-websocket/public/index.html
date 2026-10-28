@@ -13,7 +13,7 @@
 <form id="f"><input id="user" size="8" placeholder="name"> <input id="text" size="30" placeholder="say something" autofocus> <button>Send</button></form>
 <script>
 // The whole "backend" is the vdrx bus: publish to chat.room, everyone subscribed to chat.room hears it.
-const ws = new WebSocket('ws://' + (location.hostname || 'localhost') + ':8082');
+const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + (location.host || 'localhost:8080') + '/ws');
 const $ = s => document.querySelector(s), log = $('#log');
 $('#user').value = 'guest' + Math.floor(Math.random() * 900 + 100);
 const send = o => ws.send(JSON.stringify(o));

@@ -7,15 +7,29 @@ class C:
     def sendall(self, b): self.s.sendall(b)
     def recv(self, n): return self.s.recv(n)
 
-def connect(host="127.0.0.1", port=18082):
-    s = socket.create_connection((host, port)); s.settimeout(1.0)
-    key = base64.b64encode(os.urandom(16)).decode()
-    s.sendall(("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+def open_ws(host="127.0.0.1", port=18082, path="/", headers=None, version="13", key=True, sock=None):
+    """Send a WebSocket upgrade request and return (socket, response_head_bytes, bytes_after_head).
+    Does not insist on 101, so tests can look at refusals (403 / 426 / 503 / plain HTTP)."""
+    s = sock or socket.create_connection((host, port)); s.settimeout(1.0)
+    h = {"Host": "x", "Upgrade": "websocket", "Connection": "Upgrade", "Sec-WebSocket-Version": version}
+    if key: h["Sec-WebSocket-Key"] = base64.b64encode(os.urandom(16)).decode()
+    for k, v in (headers or {}).items():
+        for existing in [e for e in h if e.lower() == k.lower()]: del h[existing]
+        if v is not None: h[k] = v
+    req = f"GET {path} HTTP/1.1\r\n" + "".join(f"{k}: {v}\r\n" for k, v in h.items()) + "\r\n"
+    s.sendall(req.encode())
     buf = b""
-    while b"\r\n\r\n" not in buf: buf += s.recv(4096)
-    assert b" 101 " in buf.split(b"\r\n")[0], buf
-    return C(s, buf.split(b"\r\n\r\n", 1)[1])
+    while b"\r\n\r\n" not in buf:
+        d = s.recv(4096)
+        if not d: break
+        buf += d
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    return s, head, rest
+
+def connect(host="127.0.0.1", port=18082, path="/", headers=None):
+    s, head, rest = open_ws(host, port, path, headers)
+    assert b" 101 " in head.split(b"\r\n")[0], head
+    return C(s, rest)
 
 def send(s, obj):
     p = json.dumps(obj).encode(); m = os.urandom(4)

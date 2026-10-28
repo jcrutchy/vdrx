@@ -24,6 +24,9 @@ rate-limited `log.warn`. Both apply to the plain and the TLS port.
 { "id": "intranet", "port": 8081, "bind": "10.1.2.3", "max_connections": 256 }
 ```
 
+**`websocket_path`** (e.g. `"/ws"`) serves WebSocket upgrades for that exact path on this site's port,
+so pages and WebSocket share one port - see [websocket.md](websocket.md). It needs `executives.ws.enabled`.
+
 Requests are handled in this order:
 
 1. **`rewrites`** - regex path rewrites / redirects (§4g).
