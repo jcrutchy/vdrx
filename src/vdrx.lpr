@@ -25,7 +25,8 @@ uses
   vdrx_runner,
   vdrx_cgi,
   vdrx_jobs,
-  vdrx_procutil;
+  vdrx_procutil
+  {$IFDEF UNIX}, BaseUnix{$ENDIF};
 
 type
   // Polls GShutdownRequested (vdrx_procutil.pas) from ordinary thread
@@ -1214,6 +1215,16 @@ begin
 
     Logger := TVDRX_LoggerExecutive.Create(Kernel.Queue, 'vdrx_daemon.log', lvlINFO,
       Config.GetInteger('log_max_payload_bytes', 4096));
+    VDRX_ConfigureChildPolicy(Config.GetBoolean('child_env_inherit', False),
+      Config.GetStringArray('child_env_passthrough'), Config.GetInteger('max_child_output_bytes', 32 * 1024 * 1024));
+    if Config.GetBoolean('child_env_inherit', False) then
+      WriteLn('  WARNING: child_env_inherit is on - CGI and cli_bridges programs receive the daemon''s whole environment (tokens, passwords, keys).');
+    VDRX_ConfigureStaticPolicy(Config.GetStringArray('static_deny_extensions'),
+      Config.GetStringArray('static_allow_extensions'), Config.GetBoolean('static_follow_symlinks', False));
+    {$IFDEF UNIX}
+    if fpGeteuid = 0 then
+      WriteLn('  WARNING: running as root. Run vdrx as an unprivileged account that can read only what it serves; a bug in vdrx, a CGI script or a job would otherwise have the whole machine.');
+    {$ENDIF}
     VDRX_ConfigureHTTPTimeouts(Config.GetInteger('http_read_timeout_ms', 10000),
       Config.GetInteger('http_request_timeout_ms', 30000));
     Logger.ConfigureRedaction(Config.GetBoolean('log_redact', True),

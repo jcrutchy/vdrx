@@ -22,6 +22,15 @@
 - The logger masks credentials by pattern (`log_redact`, on by default, bodies
   included). That is a safety net: a secret carried in a member the patterns do
   not know, or in a job's own output, is logged as-is. Buckets are never masked.
+- **Programs are not sandboxed.** A CGI program, `cli_bridges` command, job or process runs with the
+  daemon's own user, file access and network. The clean environment and output cap limit what a
+  *request* can do to the daemon, not what a program the administrator configured can do on the
+  machine: run vdrx as an unprivileged account (it warns when it finds itself running as root).
+  When a timeout kills a program, only that process is killed, not children it started itself.
+- **`.bat` / `.cmd` programs.** Windows runs them through `cmd.exe`, which re-parses the command line;
+  a `cli_bridges` request value containing `& | < > ^ % " ( ) !` or a line break is refused when the
+  program is a batch file. This is covered by unit tests but was not run on Windows. Prefer a real
+  executable or an interpreter (`python`, `php`) over a batch file for anything a request can reach.
 - Slow or idle clients are bounded, not blocked: each connection costs one
   thread until it finishes or times out, so a flood is limited by
   `max_connections` (default 256 per listener), not by a thread limit. An

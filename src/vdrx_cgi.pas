@@ -156,15 +156,24 @@ begin
         Continue;
       end;
       if SameText(Name, 'Content-Length') or SameText(Name, 'Proxy') then Continue;
+      // Only plain header names become variables. "-" and "_" both map to "_", so "X_Forwarded_For"
+      // would collide with (and could impersonate) "X-Forwarded-For" that a proxy in front sets;
+      // nginx and Apache drop such headers, and so do we. Names with any other character used to
+      // have it silently deleted ("X.Foo" -> HTTP_XFOO), which invents names the sender picks.
       Up := '';
       for j := 1 to Length(Name) do
         case Name[j] of
           'a'..'z': Up := Up + UpCase(Name[j]);
-          'A'..'Z', '0'..'9', '_': Up := Up + Name[j];
+          'A'..'Z', '0'..'9': Up := Up + Name[j];
           '-': Up := Up + '_';
+        else
+          Up := '';
+          Break;
         end;
-      if Up <> '' then
-        AEnv.Add('HTTP_' + Up + '=' + NoCRLF(Headers.Items[i].AsString));
+      if (Up = '') or (Length(Name) <> Length(Up)) then Continue;
+      // two spellings of one name ("X-Foo", "x-foo"): the first wins - which one a program saw used to depend on its language
+      if AEnv.IndexOfName('HTTP_' + Up) >= 0 then Continue;
+      AEnv.Add('HTTP_' + Up + '=' + NoCRLF(Headers.Items[i].AsString));
     end;
   end;
 end;
@@ -440,6 +449,12 @@ begin
         begin
           Bus.Publish('log.error', 'cgi ' + ID + ': ' + ScriptFile + ' exceeded ' + IntToStr(TimeoutMs) + 'ms, killed it', ID);
           Reply(ReplyTo, 504, 'text/plain', 'CGI program timed out', '', -1);
+          Exit;
+        end;
+      rrOutputTooLarge:
+        begin
+          Bus.Publish('log.error', 'cgi ' + ID + ': ' + ScriptFile + ' wrote more than max_child_output_bytes (' + IntToStr(VDRX_MaxChildOutputBytes) + '), killed it', ID);
+          Reply(ReplyTo, 502, 'text/plain', 'CGI program produced too much output', '', -1);
           Exit;
         end;
     end;

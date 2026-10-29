@@ -101,7 +101,19 @@ SCRIPT_NAME, SCRIPT_FILENAME, DOCUMENT_ROOT, PATH_INFO, PATH_TRANSLATED,
 QUERY_STRING, REMOTE_ADDR, REMOTE_HOST, REMOTE_PORT, CONTENT_TYPE,
 CONTENT_LENGTH, HTTPS` (TLS only), `REDIRECT_STATUS`, `HTTP_*` for each
 request header (never `HTTP_PROXY` - httpoxy), plus `env` from the config -
-the body on stdin, and the script's directory as cwd. Because it is real CGI,
+the body on stdin, and the script's directory as cwd.
+
+**What the program does *not* get.** Its environment is *clean*: the variables above plus `PATH`,
+`LANG`/`LC_*`, `TZ`, the temp-dir variables and (Windows) what a program needs to start - **not** the
+daemon's own environment, which may hold tokens, passwords or cloud keys. If a script legitimately needs
+one of them, name it: `"child_env_passthrough": ["DB_HOST", "HTTPS_PROXY"]` (top level of `vdrx.conf`);
+`"child_env_inherit": true` restores the old "everything" behaviour and prints a warning at startup.
+A request header becomes `HTTP_*` only if its name is plain (letters, digits, `-`): `X_Forwarded_For`
+and `X.Foo` are dropped, and when two spellings of one name arrive the first wins - otherwise a client
+could impersonate a header your reverse proxy sets. Output is capped at `max_child_output_bytes`
+(default 32 MiB per stream; the program is killed and the client gets `502`), the request body is
+written from a helper thread so a program that ignores stdin cannot stall the timeout (`504`), and
+a body that is not valid text - including any NUL byte - reaches the program as exact bytes. Because it is real CGI,
 `php-cgi` populates `$_GET`, `$_POST`, `$_COOKIE`, `$_FILES` and `$_SERVER`
 itself.
 

@@ -106,6 +106,10 @@ type
     procedure SetExitStatus(const APairs: string);
   end;
 
+// See their definitions: they guard request values passed to .bat/.cmd programs.
+function IsBatchScript(const AExe: string): Boolean;
+function HasBatchMetaChars(const AValue: string): Boolean;
+
 implementation
 
 const
@@ -332,6 +336,26 @@ begin
   until Stopping and not Have;
 end;
 
+// Windows starts a .bat/.cmd file through cmd.exe, which re-parses the whole command line: a value
+// containing & | < > ^ % " ( ) ! or a line break is then a COMMAND, not an argument ("BatBadBut").
+// Quoting cannot be relied on, so such values are refused when the program is a batch file.
+function IsBatchScript(const AExe: string): Boolean;
+var
+  Ext: string;
+begin
+  Ext := LowerCase(ExtractFileExt(AExe));
+  Result := (Ext = '.bat') or (Ext = '.cmd');
+end;
+
+function HasBatchMetaChars(const AValue: string): Boolean;
+var
+  i: Integer;
+begin
+  for i := 1 to Length(AValue) do
+    if AValue[i] in ['&', '|', '<', '>', '^', '%', '"', '(', ')', '!', #10, #13] then Exit(True);
+  Result := False;
+end;
+
 // Builds the argument list: the config's templates with %%name%% placeholders
 // filled from AParams.
 //   %%name%%    required - a missing parameter is an error (-> 400)
@@ -396,6 +420,11 @@ begin
             if WholeToken and (Value <> '') and (Value[1] = '-') then
             begin
               AError := 'parameter "' + Name + '" may not start with "-"';
+              Exit;
+            end;
+            if (FCommandParts.Count > 0) and IsBatchScript(FCommandParts[0]) and HasBatchMetaChars(Value) then
+            begin
+              AError := 'parameter "' + Name + '" contains characters that are not allowed for a .bat/.cmd program';
               Exit;
             end;
             Out_ := Out_ + Value;
@@ -523,6 +552,12 @@ begin
           Reply(ReplyTo, 504, 'text/plain', 'Program timed out', '', -1);
           Exit;
         end;
+      rrOutputTooLarge:
+        begin
+          Bus.Publish('log.warn', 'runner ' + ID + ': "' + Exe + '" wrote more than max_child_output_bytes, killed it', ID);
+          Reply(ReplyTo, 502, 'text/plain', 'Program produced too much output', '', -1);
+          Exit;
+        end;
     end;
 
     if Code = 0 then
@@ -595,6 +630,12 @@ begin
         begin
           Bus.Publish('log.error', 'runner ' + ID + ': "' + Exe + '" exceeded ' + IntToStr(FTimeoutMs) + 'ms, killed it', ID);
           Reply(ReplyTo, 504, 'text/plain', 'Script timed out', '', -1);
+          Exit;
+        end;
+      rrOutputTooLarge:
+        begin
+          Bus.Publish('log.error', 'runner ' + ID + ': "' + Exe + '" wrote more than max_child_output_bytes, killed it', ID);
+          Reply(ReplyTo, 502, 'text/plain', 'Script produced too much output', '', -1);
           Exit;
         end;
     end;

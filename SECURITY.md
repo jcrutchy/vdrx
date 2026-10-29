@@ -31,7 +31,12 @@ bodies, and the absence of per-topic access control beyond `ws_profiles`.
   reachable (avoid `0.0.0.0`) and firewall the port to the hosts that need it.
 - Keep `max_connections` at a sensible figure for the expected number of clients (default 256 per listener).
 - Run vdrx as an unprivileged account that can only read what it serves.
-- Treat `vdrx.conf` as sensitive; keep tokens in environment variables (`{ENV:NAME}`).
+- Treat `vdrx.conf` as sensitive; keep tokens in environment variables (`{ENV:NAME}`). CGI and `cli_bridges`
+  programs get a clean environment, so those variables do not reach them unless you list them in
+  `child_env_passthrough`.
+- Run vdrx as an unprivileged account (it warns at startup if it is root). The static server refuses
+  configuration, log, key, backup and script-source files by extension and does not follow symbolic
+  links by default (`static_deny_extensions`, `static_allow_extensions`, `static_follow_symlinks`).
 - Keep `log_redact` and `log_redact_bodies` on (the defaults). They mask cookies, Authorization headers, tokens,
   passwords and request bodies in the log and console; buckets are not masked, so don't record credential-bearing topics.
 - Treat `vdrx_daemon.log` as sensitive anyway (restrictive file permissions, rotation, no world-readable share).

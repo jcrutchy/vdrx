@@ -45,7 +45,7 @@ job: publish `jobs.run` (or `sched.<id>`).
 | `command` | required | The program, plus any fixed leading arguments (split on spaces, FPC quoting rules). |
 | `args` | `[]` | More arguments, passed exactly as written - no shell, no re-splitting. Prefer this for paths that may contain spaces. |
 | `work_dir` | VDRX's own | Working directory of the program. |
-| `env` | `{}` | Extra environment variables. The daemon's own environment is inherited. |
+| `env` | `{}` | Extra environment variables. The daemon's own environment is inherited (jobs are written by the administrator and not reachable from a web request, unlike CGI programs, which get a clean environment - see `child_env_inherit`). |
 | `interval_sec` | `0` | Seconds between runs (`interval` also accepted). `0` = never scheduled; only `jobs.run` / `sched.<id>` start it. |
 | `enabled` | `true` | `false` = not scheduled. A disabled job can still be run by hand (`jobs.run`). |
 | `run_on_start` | `true` | A job that has never run is due immediately. `false` = its first run is one interval after it first sees the job. |

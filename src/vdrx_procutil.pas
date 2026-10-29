@@ -15,7 +15,29 @@ uses
 function WaitThreadOrTimeout(AThread: TThread; ATimeoutMs: Integer): Boolean;
 
 type
-  TVDRX_RunResult = (rrExited, rrStartFailed, rrTimedOut);
+  TVDRX_RunResult = (rrExited, rrStartFailed, rrTimedOut, rrOutputTooLarge);
+
+var
+  // Policy for programs started on behalf of a request (CGI, cli_bridges):
+  //  * the child gets a CLEAN environment: the CGI/config variables plus a short list of harmless
+  //    ones (PATH, LANG, LC_*, TZ, temp dirs, and what Windows programs need to start). The
+  //    daemon's own environment - which may hold tokens, passwords or cloud keys - is NOT handed
+  //    to code that web requests can reach. VDRX_ChildEnvInherit = True restores the old
+  //    "inherit everything"; VDRX_ChildEnvPassthrough names extra variables to pass on.
+  //  * each of stdout and stderr is capped at VDRX_MaxChildOutputBytes (0 = unlimited): a program
+  //    that writes without end is killed and answered with rrOutputTooLarge instead of eating memory.
+  VDRX_ChildEnvInherit: Boolean = False;
+  VDRX_ChildEnvPassthrough: TStringList = nil;
+  VDRX_MaxChildOutputBytes: Int64 = 32 * 1024 * 1024;
+
+procedure VDRX_ConfigureChildPolicy(AInheritEnv: Boolean; const APassthrough: array of string;
+  AMaxOutputBytes: Int64);
+
+// The environment a request-driven child receives. ADaemonEnv = the daemon's own "NAME=value" lines
+// (the real ones come from GetEnvironmentString; tests pass their own), AEnv = lines to add or
+// override. Never returns an empty list (an empty list would mean "inherit everything").
+procedure BuildChildEnvironment(ADaemonEnv, AEnv: TStrings; AInherit: Boolean;
+  APassthrough, ADest: TStrings);
 
 // Runs ACommandLine (program + space-separated args, FPC TProcess quoting
 // rules) to completion: AStdin is written to the program's stdin and closed,
@@ -33,10 +55,11 @@ function RunProgramCapture(const ACommandLine, AWorkDir, AStdin: string;
 // (spaces, quotes) and are never re-interpreted. Prefer this whenever any part
 // of the argument list comes from outside the config file.
 //
-// AEnv (optional): extra "NAME=value" lines for the child's environment. The
-// child still inherits the daemon's own environment (Windows programs need
-// SystemRoot, PATH etc. to start at all); an AEnv entry with the same name
-// replaces the inherited one. Used by the CGI executive (vdrx_cgi.pas).
+// AEnv (optional): "NAME=value" lines for the child's environment, added to the
+// clean base environment described at VDRX_ChildEnvInherit above (an entry with
+// the same name replaces the base one). Used by the CGI executive (vdrx_cgi.pas).
+// The request body (AStdin) is written from a helper thread, so a program that
+// does not read its stdin cannot stall the timeout.
 function RunProgramCaptureArgs(const AExe: string; AArgs: TStrings;
   const AWorkDir, AStdin: string; ATimeoutMs: Integer; out AExitCode: Integer;
   out AStdout, AStderr, AError: string; AEnv: TStrings = nil): TVDRX_RunResult;
@@ -102,14 +125,140 @@ procedure InstallShutdownSignalHandler;
 
 implementation
 
+const
+  // What a request-driven child may inherit from the daemon (besides LC_*): nothing secret, but
+  // enough for programs to find their tools and, on Windows, to start at all.
+  BASE_ENV_NAMES: array[0..15] of string = ('PATH', 'LANG', 'LANGUAGE', 'LC_ALL', 'TZ', 'TMPDIR',
+    'TEMP', 'TMP', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'PATHEXT', 'OS',
+    'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE');
+
+procedure VDRX_ConfigureChildPolicy(AInheritEnv: Boolean; const APassthrough: array of string;
+  AMaxOutputBytes: Int64);
+var
+  i: Integer;
+begin
+  VDRX_ChildEnvInherit := AInheritEnv;
+  VDRX_MaxChildOutputBytes := AMaxOutputBytes;
+  if VDRX_ChildEnvPassthrough = nil then VDRX_ChildEnvPassthrough := TStringList.Create;
+  VDRX_ChildEnvPassthrough.Clear;
+  for i := Low(APassthrough) to High(APassthrough) do
+    if Trim(APassthrough[i]) <> '' then VDRX_ChildEnvPassthrough.Add(Trim(APassthrough[i]));
+end;
+
+function EnvLineName(const ALine: string): string;
+var
+  p: Integer;
+begin
+  p := Pos('=', ALine);
+  if p < 2 then Result := '' else Result := Copy(ALine, 1, p - 1);   // Windows has "=C:=..." lines: no name
+end;
+
+procedure BuildChildEnvironment(ADaemonEnv, AEnv: TStrings; AInherit: Boolean;
+  APassthrough, ADest: TStrings);
+var
+  i, j, k: Integer;
+  N, U: string;
+  Allowed: Boolean;
+begin
+  ADest.Clear;
+  if Assigned(ADaemonEnv) then
+    for i := 0 to ADaemonEnv.Count - 1 do
+    begin
+      N := EnvLineName(ADaemonEnv[i]);
+      if N = '' then Continue;
+      Allowed := AInherit;
+      if not Allowed then
+      begin
+        U := UpperCase(N);
+        if Copy(U, 1, 3) = 'LC_' then Allowed := True;
+        for k := Low(BASE_ENV_NAMES) to High(BASE_ENV_NAMES) do
+          if U = BASE_ENV_NAMES[k] then Allowed := True;
+        if (not Allowed) and Assigned(APassthrough) then
+          for k := 0 to APassthrough.Count - 1 do
+            if SameText(Trim(APassthrough[k]), N) then Allowed := True;
+      end;
+      if Allowed then ADest.Add(ADaemonEnv[i]);
+    end;
+  if Assigned(AEnv) then
+    for i := 0 to AEnv.Count - 1 do
+    begin
+      N := EnvLineName(AEnv[i]);
+      if N = '' then Continue;
+      for j := ADest.Count - 1 downto 0 do
+        if SameText(EnvLineName(ADest[j]), N) then ADest.Delete(j);
+      ADest.Add(AEnv[i]);
+    end;
+  if ADest.Count = 0 then ADest.Add('VDRX_CLEAN_ENV=1');
+end;
+
+type
+  // Feeds the request body to the child's stdin from its own thread. Writing it inline blocks as
+  // soon as the pipe is full (about 64 KB), and a program that is busy and not reading would then
+  // hold the worker for as long as it likes - the timeout loop below never even starts.
+  TStdinWriter = class(TThread)
+  private
+    FProc: TProcess;
+    FData: string;
+  public
+    OwnsProc: Boolean;       // set when the caller gave up waiting: the thread frees the process
+    constructor Create(AProc: TProcess; const AData: string);
+  protected
+    procedure Execute; override;
+  end;
+
+constructor TStdinWriter.Create(AProc: TProcess; const AData: string);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FProc := AProc;
+  FData := AData;
+end;
+
+procedure TStdinWriter.Execute;
+var
+  P, N, W: Integer;
+begin
+  P := 1;
+  try
+    while (P <= Length(FData)) and (not Terminated) do
+    begin
+      N := Length(FData) - P + 1;
+      if N > 8192 then N := 8192;
+      W := FProc.Input.Write(FData[P], N);
+      if W <= 0 then Break;
+      Inc(P, W);
+    end;
+  except
+    // the program closed stdin early - its exit code / stderr will explain
+  end;
+  try FProc.CloseInput; except end;
+  if OwnsProc then FProc.Free;
+end;
+
+// Appends N bytes to S (S doubles in size as needed, so collecting megabytes is not quadratic).
+procedure AppendBytes(var S: string; var Used, Cap: Integer; const Buf; N: Integer);
+begin
+  if Used + N > Cap then
+  begin
+    Cap := (Used + N) * 2;
+    if Cap < 65536 then Cap := 65536;
+    SetLength(S, Cap);
+  end;
+  Move(Buf, S[Used + 1], N);
+  Inc(Used, N);
+end;
+
 function RunProgramCaptureArgs(const AExe: string; AArgs: TStrings;
   const AWorkDir, AStdin: string; ATimeoutMs: Integer; out AExitCode: Integer;
   out AStdout, AStderr, AError: string; AEnv: TStrings = nil): TVDRX_RunResult;
 var
   Proc: TProcess;
-  i, p: Integer;
+  Writer: TStdinWriter;
+  KeepProc: Boolean;
+  DaemonEnv, ChildEnv: TStringList;
+  i: Integer;
   Buf: array[0..8191] of Byte;
-  N, Got: Integer;
+  N, Got, OutUsed, OutCap, ErrUsed, ErrCap: Integer;
   WasRunning: Boolean;
   Started: QWord;
   Found: string;
@@ -119,6 +268,9 @@ begin
   AStderr := '';
   AError := '';
   Result := rrExited;
+  OutUsed := 0; OutCap := 0; ErrUsed := 0; ErrCap := 0;
+  Writer := nil;
+  KeepProc := False;
   Proc := TProcess.Create(nil);
   try
     Proc.Executable := AExe;
@@ -132,19 +284,20 @@ begin
       if Found <> '' then Proc.Executable := Found;
     end;
     Proc.Options := [poUsePipes]; // stdout and stderr stay separate
-    if Assigned(AEnv) and (AEnv.Count > 0) then
-    begin
-      // inherit the daemon's environment, then let AEnv override by name
+
+    // Always set explicitly: an empty Environment would make the child inherit everything.
+    DaemonEnv := TStringList.Create;
+    ChildEnv := TStringList.Create;
+    try
       for i := 1 to GetEnvironmentVariableCount do
-        Proc.Environment.Add(GetEnvironmentString(i));
-      for i := 0 to AEnv.Count - 1 do
-      begin
-        if Pos('=', AEnv[i]) < 2 then Continue;
-        p := Proc.Environment.IndexOfName(Copy(AEnv[i], 1, Pos('=', AEnv[i]) - 1));
-        if p >= 0 then Proc.Environment.Delete(p);
-        Proc.Environment.Add(AEnv[i]);
-      end;
+        DaemonEnv.Add(GetEnvironmentString(i));
+      BuildChildEnvironment(DaemonEnv, AEnv, VDRX_ChildEnvInherit, VDRX_ChildEnvPassthrough, ChildEnv);
+      Proc.Environment.Assign(ChildEnv);
+    finally
+      ChildEnv.Free;
+      DaemonEnv.Free;
     end;
+
     try
       Proc.Execute;
     except
@@ -156,12 +309,13 @@ begin
       end;
     end;
 
-    try
-      if AStdin <> '' then Proc.Input.Write(AStdin[1], Length(AStdin));
-    except
-      // program closed stdin early - its exit code / stderr will explain
-    end;
-    try Proc.CloseInput; except end;
+    if AStdin <> '' then
+    begin
+      Writer := TStdinWriter.Create(Proc, AStdin);
+      Writer.Start;
+    end
+    else
+      try Proc.CloseInput; except end;
 
     Started := GetTickCount64;
     repeat
@@ -173,28 +327,35 @@ begin
       begin
         N := Proc.Output.Read(Buf[0], SizeOf(Buf));
         if N <= 0 then Break;
-        SetLength(AStdout, Length(AStdout) + N);
-        Move(Buf[0], AStdout[Length(AStdout) - N + 1], N);
+        AppendBytes(AStdout, OutUsed, OutCap, Buf[0], N);
         Inc(Got, N);
+        if (VDRX_MaxChildOutputBytes > 0) and (OutUsed > VDRX_MaxChildOutputBytes) then Break;
       end;
       while Proc.Stderr.NumBytesAvailable > 0 do
       begin
         N := Proc.Stderr.Read(Buf[0], SizeOf(Buf));
         if N <= 0 then Break;
-        SetLength(AStderr, Length(AStderr) + N);
-        Move(Buf[0], AStderr[Length(AStderr) - N + 1], N);
+        AppendBytes(AStderr, ErrUsed, ErrCap, Buf[0], N);
         Inc(Got, N);
+        if (VDRX_MaxChildOutputBytes > 0) and (ErrUsed > VDRX_MaxChildOutputBytes) then Break;
       end;
-      if (Got = 0) and WasRunning then
+      if (VDRX_MaxChildOutputBytes > 0) and
+         ((OutUsed > VDRX_MaxChildOutputBytes) or (ErrUsed > VDRX_MaxChildOutputBytes)) then
       begin
-        if (ATimeoutMs > 0) and (GetTickCount64 - Started > QWord(ATimeoutMs)) then
-        begin
-          ForceKillProcess(Proc);
-          Result := rrTimedOut;
-          Exit;
-        end;
-        Sleep(2);
+        ForceKillProcess(Proc);
+        AStdout := '';
+        AStderr := '';
+        Result := rrOutputTooLarge;
+        Exit;
       end;
+      // Checked on EVERY pass: a program that never stops writing must not be able to starve it.
+      if WasRunning and (ATimeoutMs > 0) and (GetTickCount64 - Started > QWord(ATimeoutMs)) then
+      begin
+        ForceKillProcess(Proc);
+        Result := rrTimedOut;
+        Exit;
+      end;
+      if (Got = 0) and WasRunning then Sleep(2);
     until (not WasRunning) and (Got = 0);
 
     AExitCode := Proc.ExitStatus;
@@ -204,7 +365,24 @@ begin
     if (AExitCode >= 256) and ((AExitCode and $FF) = 0) then AExitCode := AExitCode shr 8;
     {$ENDIF}
   finally
-    Proc.Free;
+    SetLength(AStdout, OutUsed);
+    SetLength(AStderr, ErrUsed);
+    if Assigned(Writer) then
+    begin
+      // The child is gone (or killed), so a blocked write fails and the thread ends at once.
+      Writer.Terminate;
+      if WaitThreadOrTimeout(Writer, 2000) then
+        Writer.Free
+      else
+      begin
+        // Something else still holds the pipe open (a grandchild). Do not free what the thread
+        // is using: it frees the process itself when its write finally returns.
+        Writer.OwnsProc := True;
+        Writer.FreeOnTerminate := True;
+        KeepProc := True;
+      end;
+    end;
+    if not KeepProc then Proc.Free;
   end;
 end;
 
@@ -257,6 +435,9 @@ begin
   Result := need + 1;
 end;
 
+// A NUL byte is well-formed UTF-8 but cannot ride in a JSON string intact (the string handling
+// downstream treats it as a terminator: a body of NULs arrived as 0 bytes, and a long run of
+// them never got an answer at all), so it counts as "not text" and the caller base64-encodes.
 function IsValidUTF8(const S: string): Boolean;
 var
   i, n: Integer;
@@ -265,6 +446,7 @@ begin
   i := 1;
   while i <= Length(S) do
   begin
+    if S[i] = #0 then Exit(False);
     n := UTF8SeqLen(S, i);
     if n = 0 then Exit(False);
     Inc(i, n);
@@ -280,7 +462,7 @@ begin
   i := 1;
   while i <= Length(S) do
   begin
-    n := UTF8SeqLen(S, i);
+    if S[i] = #0 then n := 0 else n := UTF8SeqLen(S, i);
     if n = 0 then
     begin
       Result := Result + '?';

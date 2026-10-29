@@ -6,7 +6,7 @@
 #   tests/integration/run.sh php-cgi ws   run only the named sections
 #
 # Sections: static-site php-cgi python-cgi cli-api templates websocket-only
-#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction limits ws-shared jobs
+#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction limits ws-shared spawn jobs
 # Needs: bin/vdrx (./build.sh), curl, python3. php-cgi / php / sort,tr,wc,head,grep
 # are only needed by the sections that use them; those sections skip if missing.
 # Uses ports 8080, 8082, 18080, 18082 - it refuses to run if one is already taken,
@@ -243,6 +243,19 @@ if want ws-shared "$@"; then section "ws-shared (WebSocket on the HTTP port, Ori
     out=$(cd $d && python3 ws_shared_test.py 2>&1); echo "$out" | sed 's/^/  /'
     case "$out" in *"all passed"*) ok "ws-shared suite";; *) bad "ws-shared suite" "see output above";; esac
   fi
+fi
+
+if want spawn "$@"; then section "spawn (clean child environment, output cap, stdin, static file policy)"
+  export VDRX_TEST_SECRET=zz-secret-1 VDRX_TEST_OTHER=zz-secret-2
+  if need python3 && start tests/integration/spawn 18080; then
+    out=$(cd tests/integration/spawn && python3 spawn_test.py default 2>&1); echo "$out" | sed 's/^/  /'
+    case "$out" in *"all passed"*) ok "spawn suite";; *) bad "spawn suite" "see output above";; esac
+  fi
+  if need python3 && start tests/integration/spawn-open 18080; then
+    out=$(cd tests/integration/spawn && python3 spawn_test.py open 2>&1); echo "$out" | sed 's/^/  /'
+    case "$out" in *"all passed"*) ok "spawn opt-outs work";; *) bad "spawn opt-outs" "see output above";; esac
+  fi
+  unset VDRX_TEST_SECRET VDRX_TEST_OTHER
 fi
 
 if want jobs "$@"; then section "tests/integration/jobs (scheduler + job runner)"

@@ -514,11 +514,116 @@ procedure ApplyOpenSSLDLLOverrides(AConfig: TVDRX_Config);
 // the whole request (headers + body). 0 turns that limit off.
 procedure VDRX_ConfigureHTTPTimeouts(AReadMs, ARequestMs: Integer);
 
+// What the static file server will NOT hand out, whatever is lying in the directory:
+//  * files with these extensions: configuration, logs, keys, backups, databases, and script
+//    source (a .php that no CGI route runs would otherwise be sent as text). Matches are answered
+//    with the same 404 as a missing file. The default list is DefaultStaticDenyExtensions;
+//    AExtraDeny adds to it and AAllow takes entries out of it.
+//  * anything reached through a symbolic link (AFollowSymlinks = False), so a link inside the
+//    directory cannot lead out of it.
+procedure VDRX_ConfigureStaticPolicy(const AExtraDeny, AAllow: array of string; AFollowSymlinks: Boolean);
+
+// True when the static server would refuse a file with this name (by extension).
+function VDRX_StaticDenied(const AFileName: string): Boolean;
+
+const
+  DefaultStaticDenyExtensions: array[0..19] of string = ('conf', 'log', 'pem', 'key', 'env', 'bak',
+    'sql', 'sqlite', 'sqlite3', 'db', 'inc', 'php', 'phtml', 'py', 'pl', 'cgi', 'sh', 'bat', 'cmd', 'ps1');
+
 implementation
 
 var
   HTTPReadTimeoutMs: Integer = 10000;
   HTTPRequestTimeoutMs: Integer = 30000;
+  StaticDeny: TStringList = nil;            // lower-case extensions without the dot
+  StaticFollowSymlinks: Boolean = False;
+
+procedure VDRX_ConfigureStaticPolicy(const AExtraDeny, AAllow: array of string; AFollowSymlinks: Boolean);
+var
+  i, k: Integer;
+  E: string;
+begin
+  if StaticDeny = nil then StaticDeny := TStringList.Create;
+  StaticDeny.Clear;
+  StaticDeny.Sorted := False;
+  for i := Low(DefaultStaticDenyExtensions) to High(DefaultStaticDenyExtensions) do
+    StaticDeny.Add(DefaultStaticDenyExtensions[i]);
+  for i := Low(AExtraDeny) to High(AExtraDeny) do
+  begin
+    E := LowerCase(Trim(AExtraDeny[i]));
+    if (E <> '') and (E[1] = '.') then Delete(E, 1, 1);
+    if (E <> '') and (StaticDeny.IndexOf(E) < 0) then StaticDeny.Add(E);
+  end;
+  for i := Low(AAllow) to High(AAllow) do
+  begin
+    E := LowerCase(Trim(AAllow[i]));
+    if (E <> '') and (E[1] = '.') then Delete(E, 1, 1);
+    k := StaticDeny.IndexOf(E);
+    if k >= 0 then StaticDeny.Delete(k);
+  end;
+  StaticFollowSymlinks := AFollowSymlinks;
+end;
+
+function VDRX_StaticDenied(const AFileName: string): Boolean;
+var
+  Ext: string;
+  i: Integer;
+begin
+  Ext := LowerCase(ExtractFileExt(AFileName));
+  if (Ext <> '') and (Ext[1] = '.') then Delete(Ext, 1, 1);
+  if Ext = '' then Exit(False);
+  if StaticDeny = nil then
+  begin
+    for i := Low(DefaultStaticDenyExtensions) to High(DefaultStaticDenyExtensions) do
+      if Ext = DefaultStaticDenyExtensions[i] then Exit(True);
+    Exit(False);
+  end;
+  Result := StaticDeny.IndexOf(Ext) >= 0;
+end;
+
+const
+  SYMLINK_ATTR = $00000400;   // = faSymLink on Unix and FILE_ATTRIBUTE_REPARSE_POINT on Windows (the name itself is flagged non-portable)
+
+// True when APath is itself a symbolic link (lstat on Unix; on Windows a reparse point). FindFirst
+// is not used on Unix: it reports what the link points at, not the link.
+function IsSymlinkPath(const APath: string): Boolean;
+{$IFDEF UNIX}
+var
+  St: Stat;
+begin
+  Result := (fpLstat(PChar(APath), St) = 0) and fpS_ISLNK(St.st_mode);
+end;
+{$ELSE}
+var
+  SR: TSearchRec;
+begin
+  Result := False;
+  if FindFirst(APath, faAnyFile, SR) = 0 then
+  begin
+    try
+      Result := (SR.Attr and SYMLINK_ATTR) <> 0;
+    finally
+      FindClose(SR);
+    end;
+  end;
+end;
+{$ENDIF}
+
+// True when any path component below ARoot (not ARoot itself: pointing the site at a link is the
+// administrator's choice) is a symbolic link / reparse point.
+function PathHasSymlink(const ARoot: string; ASegs: TStrings): Boolean;
+var
+  Cur: string;
+  i: Integer;
+begin
+  Result := False;
+  Cur := ExcludeTrailingPathDelimiter(ARoot);
+  for i := 0 to ASegs.Count - 1 do
+  begin
+    Cur := Cur + PathDelim + ASegs[i];
+    if IsSymlinkPath(Cur) then Exit(True);
+  end;
+end;
 
 procedure VDRX_ConfigureHTTPTimeouts(AReadMs, ARequestMs: Integer);
 begin
@@ -1651,10 +1756,11 @@ var
   FS: TFileStream;
   Segs: TStringList;
   i: Integer;
-  Ok: Boolean;
+  Ok, Linked: Boolean;
   Redir: TStringList;
 begin
   ABus.Publish('log.info', 'http: static path: "' + APath + '"', ASourceID);
+  Linked := False;
   Ok := (AStaticDir <> '') and (APath <> '') and (APath[1] = '/');
   FilePath := '';
   if Ok then
@@ -1666,6 +1772,7 @@ begin
       begin
         FilePath := ExcludeTrailingPathDelimiter(ExpandFileName(AStaticDir));
         for i := 0 to Segs.Count - 1 do FilePath := FilePath + PathDelim + Segs[i];
+        if (not StaticFollowSymlinks) and PathHasSymlink(ExpandFileName(AStaticDir), Segs) then Linked := True;
       end;
     finally
       Segs.Free;
@@ -1674,6 +1781,16 @@ begin
   if not Ok then
   begin
     ABus.Publish('log.warn', 'http: rejected static path "' + APath + '"', ASourceID);
+    Exit(PlainResponse('404 Not Found', 'text/plain', 'Not found', ACustomHeaders));
+  end;
+  if Linked then
+  begin
+    ABus.Publish('log.warn', 'http: refused static path "' + APath + '" - it goes through a symbolic link (static_follow_symlinks is off)', ASourceID);
+    Exit(PlainResponse('404 Not Found', 'text/plain', 'Not found', ACustomHeaders));
+  end;
+  if VDRX_StaticDenied(FilePath) then
+  begin
+    ABus.Publish('log.warn', 'http: refused static file "' + APath + '" - its extension is on the deny list (static_deny_extensions)', ASourceID);
     Exit(PlainResponse('404 Not Found', 'text/plain', 'Not found', ACustomHeaders));
   end;
   if DirectoryExists(FilePath) then
