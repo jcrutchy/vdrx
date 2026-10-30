@@ -108,6 +108,9 @@ type
 
   TVDRX_SubList = specialize TObjectList<TVDRX_Subscription>; // owns its Subscriptions
   TVDRX_SubListDictionary = specialize TObjectDictionary<string, TVDRX_SubList>;
+  // Which literal filters each executive is subscribed under (so removing an executive touches only
+  // its own filters, and can drop a filter's table entry once nobody uses it any more).
+  TVDRX_ExecFilterMap = specialize TObjectDictionary<TVDRX_Executive, TStringList>;
   // Per-group round-robin cursor, keyed by group name - next index (mod
   // however many members currently match a given message) to hand the next
   // message to. Deliberately a single counter per group name rather than
@@ -125,6 +128,7 @@ type
   private
     FMasterMap: TVDRX_ExecMasterMap;
     FLiteralSubs: TVDRX_SubListDictionary;
+    FExecFilters: TVDRX_ExecFilterMap;
     FWildcardSubs: TVDRX_SubList;
     FGroupCounters: TVDRX_GroupCounterMap;
     // True once any Register() call has ever passed a non-empty AGroup.
@@ -136,6 +140,7 @@ type
     // with no queue-group subscriptions at all.
     FHasGroups: Boolean;
     FLock: TCriticalSection;
+    procedure DropLiteralSub(const AFilter: string; AExec: TVDRX_Executive);
     procedure RemoveSubscriptionsUnlocked(AExec: TVDRX_Executive);
   public
     constructor Create;
@@ -149,6 +154,9 @@ type
     // given message, only one (picked round-robin) receives it - see
     // GetSubscribers. Leave AGroup as '' for the historical fan-out-to-everyone
     // behaviour.
+    // Number of distinct literal filters currently in the routing table (for tests and diagnostics:
+    // it must return to its starting value when everything that subscribed has gone).
+    function LiteralFilterCount: Integer;
     procedure Register(AExec: TVDRX_Executive; const AID, AFilter: string; const AGroup: string = '');
     // Drops every filter subscription for AID WITHOUT destroying the executive -
     // use this (then Register again) to replace an executive's subscriptions in
@@ -403,6 +411,7 @@ begin
   FLock := TCriticalSection.Create;
   FMasterMap := TVDRX_ExecMasterMap.Create([doOwnsValues]);
   FLiteralSubs := TVDRX_SubListDictionary.Create([doOwnsValues]);
+  FExecFilters := TVDRX_ExecFilterMap.Create([doOwnsValues]);
   FWildcardSubs := TVDRX_SubList.Create; // owns its Subscriptions
   FGroupCounters := TVDRX_GroupCounterMap.Create;
 end;
@@ -411,6 +420,7 @@ destructor TVDRX_Registry.Destroy;
 begin
   FGroupCounters.Free;
   FWildcardSubs.Free;
+  FExecFilters.Free;
   FLiteralSubs.Free;
   FMasterMap.Free; // owns and frees every registered executive
   FLock.Free;
@@ -423,10 +433,21 @@ end;
 // executive - this is what lets one executive be registered under any number of
 // filters, e.g. Register(Logger, 'logger', 'log.>') then
 // Register(Logger, 'logger', 'irc.>').
+function TVDRX_Registry.LiteralFilterCount: Integer;
+begin
+  FLock.Enter;
+  try
+    Result := FLiteralSubs.Count;
+  finally
+    FLock.Leave;
+  end;
+end;
+
 procedure TVDRX_Registry.Register(AExec: TVDRX_Executive; const AID, AFilter: string; const AGroup: string);
 var
   List: TVDRX_SubList;
   Sub: TVDRX_Subscription;
+  Filters: TStringList;
 begin
   FLock.Enter;
   try
@@ -447,6 +468,12 @@ begin
         FLiteralSubs.Add(AFilter, List);
       end;
       List.Add(Sub);
+      if not FExecFilters.TryGetValue(AExec, Filters) then
+      begin
+        Filters := TStringList.Create;
+        FExecFilters.Add(AExec, Filters);
+      end;
+      if Filters.IndexOf(AFilter) < 0 then Filters.Add(AFilter);
     end;
   finally
     FLock.Leave;
@@ -455,19 +482,37 @@ end;
 
 // Removes every Subscription that points at AExec, from both the wildcard list and
 // every literal-filter bucket, without touching the MasterMap. Caller holds FLock.
-procedure TVDRX_Registry.RemoveSubscriptionsUnlocked(AExec: TVDRX_Executive);
+// Takes AExec out of the bucket for one literal filter, and removes the bucket itself once it is empty.
+// (A bucket used to stay behind forever: every bus request subscribes under its own reply topic, so
+// the table grew by one entry per request, and every unregister walked all of them.)
+procedure TVDRX_Registry.DropLiteralSub(const AFilter: string; AExec: TVDRX_Executive);
 var
   i: Integer;
   List: TVDRX_SubList;
+begin
+  if not FLiteralSubs.TryGetValue(AFilter, List) then Exit;
+  for i := List.Count - 1 downto 0 do
+    if List[i].Exec = AExec then
+      List.Delete(i);
+  if List.Count = 0 then
+    FLiteralSubs.Remove(AFilter);       // owns its values: frees the empty list
+end;
+
+procedure TVDRX_Registry.RemoveSubscriptionsUnlocked(AExec: TVDRX_Executive);
+var
+  i: Integer;
+  Filters: TStringList;
 begin
   for i := FWildcardSubs.Count - 1 downto 0 do
     if FWildcardSubs[i].Exec = AExec then
       FWildcardSubs.Delete(i); // owned list - frees the Subscription
 
-  for List in FLiteralSubs.Values do
-    for i := List.Count - 1 downto 0 do
-      if List[i].Exec = AExec then
-        List.Delete(i);
+  if FExecFilters.TryGetValue(AExec, Filters) then
+  begin
+    for i := 0 to Filters.Count - 1 do
+      DropLiteralSub(Filters[i], AExec);
+    FExecFilters.Remove(AExec);          // owns its values: frees the filter list
+  end;
 end;
 
 procedure TVDRX_Registry.ClearFilters(const AID: string);
@@ -487,7 +532,7 @@ procedure TVDRX_Registry.UnregisterFilter(const AID, AFilter: string);
 var
   Exec: TVDRX_Executive;
   i: Integer;
-  List: TVDRX_SubList;
+  Filters: TStringList;
 begin
   FLock.Enter;
   try
@@ -496,10 +541,13 @@ begin
     for i := FWildcardSubs.Count - 1 downto 0 do
       if (FWildcardSubs[i].Exec = Exec) and (FWildcardSubs[i].Filter = AFilter) then
         FWildcardSubs.Delete(i);
-    if FLiteralSubs.TryGetValue(AFilter, List) then
-      for i := List.Count - 1 downto 0 do
-        if List[i].Exec = Exec then
-          List.Delete(i);
+    DropLiteralSub(AFilter, Exec);
+    if FExecFilters.TryGetValue(Exec, Filters) then
+    begin
+      i := Filters.IndexOf(AFilter);
+      if i >= 0 then Filters.Delete(i);
+      if Filters.Count = 0 then FExecFilters.Remove(Exec);
+    end;
   finally
     FLock.Leave;
   end;

@@ -13,6 +13,8 @@ echo; echo "== unit: log redaction"
 out=$(bin/test_redact 2>/dev/null); rc=$?; echo "  $(echo "$out" | tail -1)"; [ $rc -eq 0 ] || { echo "$out" | grep -E "FAIL|leaked|changed|output" | sed "s/^/  /"; fail=1; }
 echo; echo "== unit: spawning, static policy"
 out=$(bin/test_spawn 2>/dev/null); rc=$?; echo "  $(echo "$out" | tail -1)"; [ $rc -eq 0 ] || { echo "$out" | grep -E "FAIL" | sed "s/^/  /"; fail=1; }
+echo; echo "== unit: subscription registry"
+out=$(bin/test_registry 2>/dev/null); rc=$?; echo "  $(echo "$out" | tail -1)"; [ $rc -eq 0 ] || { echo "$out" | grep -E "FAIL" | sed "s/^/  /"; fail=1; }
 echo; tests/integration/run.sh || fail=1
 echo; [ $fail -eq 0 ] && echo "ALL TESTS PASSED" || echo "SOME TESTS FAILED"
 exit $fail

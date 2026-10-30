@@ -19,4 +19,6 @@ __pycache__/
 *.pyc
 
 # generated at test time by tests/integration/run.sh (limits section)
+tests/*/*.pem
 tests/integration/*/*.pem
+tests/fuzz/fuzz_findings.jsonl

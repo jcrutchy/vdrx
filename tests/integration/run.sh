@@ -6,7 +6,7 @@
 #   tests/integration/run.sh php-cgi ws   run only the named sections
 #
 # Sections: static-site php-cgi python-cgi cli-api templates websocket-only
-#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction limits ws-shared spawn jobs
+#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction limits ws-shared spawn fuzz jobs
 # Needs: bin/vdrx (./build.sh), curl, python3. php-cgi / php / sort,tr,wc,head,grep
 # are only needed by the sections that use them; those sections skip if missing.
 # Uses ports 8080, 8082, 18080, 18082 - it refuses to run if one is already taken,
@@ -256,6 +256,19 @@ if want spawn "$@"; then section "spawn (clean child environment, output cap, st
     case "$out" in *"all passed"*) ok "spawn opt-outs work";; *) bad "spawn opt-outs" "see output above";; esac
   fi
   unset VDRX_TEST_SECRET VDRX_TEST_OTHER
+fi
+
+if want fuzz "$@"; then section "fuzz (memory leak check, then a short seeded fuzz of the HTTP and WebSocket front ends)"
+  d=tests/fuzz
+  if command -v openssl >/dev/null 2>&1 && [ ! -f $d/cert.pem ]; then
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout $d/key.pem -out $d/cert.pem -subj /CN=localhost -days 2 >/dev/null 2>&1
+  fi
+  if need python3 && start $d 18080 18082; then
+    out=$(cd $d && python3 leakcheck.py 2>&1); echo "$out" | sed 's/^/  /'
+    case "$out" in *"all passed"*) ok "no memory growth per request (CGI, runner)";; *) bad "memory growth" "see output above";; esac
+    out=$(cd $d && rm -f fuzz_findings.jsonl && python3 fuzz.py --seed 7 --seconds ${FUZZ_SECONDS:-20} --threads 6 2>&1); echo "$out" | sed 's/^/  /' | grep -vE '^  round'
+    case "$out" in *"done: 0 findings"*) ok "seeded fuzz: no findings";; *) bad "fuzz" "findings in tests/fuzz/fuzz_findings.jsonl";; esac
+  fi
 fi
 
 if want jobs "$@"; then section "tests/integration/jobs (scheduler + job runner)"
