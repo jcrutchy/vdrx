@@ -7,7 +7,7 @@ interface
 uses
   Classes, SysUtils, StrUtils, Sockets, SyncObjs, Process, vdrx_core,
   vdrx_config, vdrx_templates, vdrx_procutil, Generics.Collections,
-  openssl, resolve, {$IFDEF UNIX}BaseUnix,{$ENDIF} base64, sha1, fpjson, jsonparser, DateUtils, RegExpr, Types;
+  openssl, resolve, {$IFDEF UNIX}BaseUnix, dynlibs,{$ENDIF} base64, sha1, fpjson, jsonparser, DateUtils, RegExpr, Types;
 
 type
 
@@ -526,6 +526,12 @@ procedure VDRX_ConfigureStaticPolicy(const AExtraDeny, AAllow: array of string; 
 // True when the static server would refuse a file with this name (by extension).
 function VDRX_StaticDenied(const AFileName: string): Boolean;
 
+// Makes sure FPC's OpenSSL binding has found a library, looking for the versioned libssl.so.3 /
+// .1.1 when the plain libssl.so (a -dev package file) is missing. True = TLS can work.
+// VDRX_OpenSSLNote says what was done or why it failed (empty if nothing special).
+function VDRX_EnsureOpenSSL: Boolean;
+function VDRX_OpenSSLNote: string;
+
 const
   DefaultStaticDenyExtensions: array[0..19] of string = ('conf', 'log', 'pem', 'key', 'env', 'bak',
     'sql', 'sqlite', 'sqlite3', 'db', 'inc', 'php', 'phtml', 'py', 'pl', 'cgi', 'sh', 'bat', 'cmd', 'ps1');
@@ -758,18 +764,170 @@ begin
   end;
 end;
 
+// FPC's OpenSSL binding builds the library file name itself: it takes DLLSSLName ("libssl") and
+// appends ".so". Distributions install the runtime library only under its VERSIONED name
+// (libssl.so.3, libssl.so.1.1); the plain "libssl.so" comes with the -dev package. So on a normal
+// server the binding finds nothing and TLS silently never starts. VDRX_EnsureOpenSSL fixes that
+// without asking anyone to install -dev packages.
+var
+  OpenSSLChecked: Boolean = False;
+  OpenSSLReady: Boolean = False;
+  OpenSSLConfigured: Boolean = False;     // tls_ssl_dll / tls_crypto_dll given: use exactly that, never guess
+  OpenSSLNote: string = '';
+  OpenSSLLock: TRTLCriticalSection;
+
+function VDRX_OpenSSLNote: string;
+begin
+  Result := OpenSSLNote;
+end;
+
 procedure ApplyOpenSSLDLLOverrides(AConfig: TVDRX_Config);
-{$IFDEF WINDOWS}
 var
   SSLDll, CryptoDll: string;
-{$ENDIF}
 begin
-  {$IFDEF WINDOWS}
+  // tls_ssl_dll / tls_crypto_dll: the binding's library names (Windows: the DLL file names; Unix:
+  // a path WITHOUT the ".so", which the binding appends).
   SSLDll := AConfig.GetString('tls_ssl_dll', '');
   CryptoDll := AConfig.GetString('tls_crypto_dll', '');
   if SSLDll <> '' then DLLSSLName := SSLDll;
   if CryptoDll <> '' then DLLUtilName := CryptoDll;
+  OpenSSLConfigured := (SSLDll <> '') or (CryptoDll <> '');
+end;
+
+{$IFDEF UNIX}
+// Full path of a shared library that is already loaded in this process, found through
+// /proc/self/maps (Linux). ASoname is e.g. 'libssl.so.3'; the mapped file may carry a longer version.
+function LoadedLibraryPath(const ASoname: string): string;
+var
+  F: TextFile;
+  Line, Path: string;
+  p: Integer;
+begin
+  Result := '';
+  AssignFile(F, '/proc/self/maps');
+  {$I-} Reset(F); {$I+}
+  if IOResult <> 0 then Exit;
+  try
+    while not Eof(F) do
+    begin
+      ReadLn(F, Line);
+      p := Pos('/', Line);
+      if p = 0 then Continue;
+      Path := Copy(Line, p, MaxInt);
+      if Pos(ASoname, ExtractFileName(Path)) = 1 then Exit(Path);
+    end;
+  finally
+    CloseFile(F);
+  end;
+end;
+
+// A fresh directory that only this user can enter. CreateDir fails if the name is taken, so a
+// directory somebody else made in advance is never reused.
+function MakePrivateDir: string;
+var
+  Buf: array[0..7] of Byte;
+  F: file;
+  i: Integer;
+  Dir, Hex: string;
+  St: Stat;
+begin
+  Result := '';
+  FillChar(Buf, SizeOf(Buf), 0);
+  AssignFile(F, '/dev/urandom');
+  {$I-} Reset(F, 1); {$I+}
+  if IOResult = 0 then
+  begin
+    BlockRead(F, Buf, SizeOf(Buf));
+    CloseFile(F);
+  end
+  else
+    for i := 0 to 7 do Buf[i] := Random(256) xor Byte(GetTickCount64 shr i);
+  Hex := '';
+  for i := 0 to 7 do Hex := Hex + LowerCase(IntToHex(Buf[i], 2));
+  Dir := IncludeTrailingPathDelimiter(GetTempDir(False)) + 'vdrx-ssl-' + Hex;
+  if not CreateDir(Dir) then Exit;
+  fpChmod(PChar(Dir), &700);
+  if (fpLstat(PChar(Dir), St) <> 0) or (not fpS_ISDIR(St.st_mode)) or (St.st_uid <> fpGeteuid) or ((St.st_mode and &777) <> &700) then
+  begin
+    RemoveDir(Dir);
+    Exit;
+  end;
+  Result := Dir;
+end;
+
+function TryVersionedOpenSSL(const ASSLSoname, ACryptoSoname: string): Boolean;
+var
+  SSLPath, CryptoPath, Dir: string;
+  H1, H2: TLibHandle;
+begin
+  Result := False;
+  H1 := LoadLibrary(ASSLSoname);
+  H2 := LoadLibrary(ACryptoSoname);
+  if (H1 = NilHandle) or (H2 = NilHandle) then Exit;
+  SSLPath := LoadedLibraryPath(ASSLSoname);
+  CryptoPath := LoadedLibraryPath(ACryptoSoname);
+  if (SSLPath = '') or (CryptoPath = '') then Exit;
+  Dir := MakePrivateDir;
+  if Dir = '' then Exit;
+  try
+    if (fpSymlink(PChar(SSLPath), PChar(Dir + '/libssl.so')) = 0) and
+       (fpSymlink(PChar(CryptoPath), PChar(Dir + '/libcrypto.so')) = 0) then
+    begin
+      DLLSSLName := Dir + '/libssl';
+      DLLUtilName := Dir + '/libcrypto';
+      Result := InitSSLInterface;      // loads both; they stay loaded after the links are gone
+    end;
+  finally
+    fpUnlink(PChar(Dir + '/libssl.so'));
+    fpUnlink(PChar(Dir + '/libcrypto.so'));
+    RemoveDir(Dir);
+  end;
+end;
+{$ENDIF}
+
+// Makes sure the OpenSSL binding has found a library. Cheap after the first call. Only TLS needs
+// it, so it runs when the first TLS context is created, not at startup.
+function VDRX_EnsureOpenSSL: Boolean;
+{$IFDEF UNIX}
+const
+  Pairs: array[0..3, 0..1] of string = (('libssl.so.3', 'libcrypto.so.3'), ('libssl.so.1.1', 'libcrypto.so.1.1'),
+    ('libssl.so.1.0.2', 'libcrypto.so.1.0.2'), ('libssl.so.1.0.0', 'libcrypto.so.1.0.0'));
+var
+  i: Integer;
+  SavedSSL, SavedCrypto: string;
+{$ENDIF}
+begin
+  EnterCriticalSection(OpenSSLLock);
+  try
+  if OpenSSLChecked then Exit(OpenSSLReady);
+  OpenSSLChecked := True;
+  OpenSSLReady := InitSSLInterface;        // works as is: a configured name, or the -dev package's libssl.so
+  if (not OpenSSLReady) and OpenSSLConfigured then
+    OpenSSLNote := 'tls_ssl_dll / tls_crypto_dll are set but OpenSSL could not be loaded from them (on Unix give the path WITHOUT ".so")';
+  {$IFDEF UNIX}
+  if (not OpenSSLReady) and (not OpenSSLConfigured) then
+  begin
+    SavedSSL := DLLSSLName;
+    SavedCrypto := DLLUtilName;
+    for i := Low(Pairs) to High(Pairs) do
+      if TryVersionedOpenSSL(Pairs[i, 0], Pairs[i, 1]) then
+      begin
+        OpenSSLReady := True;
+        OpenSSLNote := 'libssl.so is not installed (it belongs to the libssl-dev package); using ' + Pairs[i, 0] + ' instead';
+        Break;
+      end;
+    if not OpenSSLReady then
+    begin
+      DLLSSLName := SavedSSL;
+      DLLUtilName := SavedCrypto;
+      OpenSSLNote := 'no usable OpenSSL library found (looked for libssl.so and libssl.so.3 / .1.1 / .1.0.2 / .1.0.0); install the OpenSSL runtime or set tls_ssl_dll / tls_crypto_dll';
+    end;
+  end;
   {$ENDIF}
+  Result := OpenSSLReady;
+  finally
+    LeaveCriticalSection(OpenSSLLock);
+  end;
 end;
 
 { TVDRX_PlainTransport }
@@ -953,6 +1111,7 @@ end;
 constructor TVDRX_TLSContext.Create(const ACertFile, AKeyFile: string);
 begin
   inherited Create;
+  VDRX_EnsureOpenSSL;
   FCtx := SslCtxNew(SslTLSMethod);
   FOK := Assigned(FCtx)
     and (SslCtxUseCertificateFile(FCtx, ACertFile, SSL_FILETYPE_PEM) = 1)
@@ -971,6 +1130,7 @@ end;
 constructor TVDRX_TLSClientContext.Create(const ACAFile: string; AVerifyPeer: Boolean);
 begin
   inherited Create;
+  VDRX_EnsureOpenSSL;
   FCtx := SslCtxNew(SslTLSMethod);
   FOK := Assigned(FCtx);
   if not FOK then Exit;
@@ -1337,10 +1497,12 @@ begin
       FTLSContext.Free;
       FTLSContext := nil;
       Bus.Publish('log.error', ID + ': TLS port ' + IntToStr(FTLSPort) + ' NOT started - could not load certificate "' +
-        FTLSCertFile + '" / key "' + FTLSKeyFile + '", or libssl is not loadable', ID);
+        FTLSCertFile + '" / key "' + FTLSKeyFile + '", or OpenSSL could not be loaded' +
+        IfThen(OpenSSLNote <> '', ' (' + OpenSSLNote + ')', ''), ID);
     end
     else
     begin
+      if OpenSSLNote <> '' then Bus.Publish('log.info', ID + ': ' + OpenSSLNote, ID);
       FTLSThread := TVDRX_WorkerThread.Create(@AcceptLoopTLS);
       FTLSThread.FreeOnTerminate := False;
       FTLSThread.Start;
@@ -4312,8 +4474,9 @@ end;
 
 initialization
   GReplyTopicLock := TCriticalSection.Create;
+  InitCriticalSection(OpenSSLLock);
 
 finalization
+  DoneCriticalSection(OpenSSLLock);
   GReplyTopicLock.Free;
-
 end.

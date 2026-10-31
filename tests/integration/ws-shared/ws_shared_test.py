@@ -27,6 +27,19 @@ def vdrx_threads():
                     if l.startswith("Threads"): return int(l.split()[1])
         except OSError: pass
 
+
+def tls_listener_up():
+    """True if the TLS port accepts connections. If not, say WHY (the daemon logs the reason) and let the caller skip."""
+    try: socket.create_connection(("127.0.0.1", TLS), timeout=3).close(); return True
+    except OSError:
+        why = ""
+        try:
+            why = [l for l in open("vdrx_daemon.log", errors="replace") if "NOT started" in l][-1].strip()[-260:]
+        except Exception: pass
+        print("skip  TLS tests: the TLS listener did not start. " + (why or "See vdrx_daemon.log.") +
+              "  (Needs the OpenSSL runtime: libssl.so.3 or libssl.so.1.1.)")
+        return False
+
 print("-- shared port: the upgrade is served on the HTTP port")
 v = connect(port=SHARED, path="/ws"); f = connect(port=SHARED, path="/ws")
 check("a WebSocket upgrade on the HTTP port at /ws gets 101 and a working socket", auth(v, "vt") and auth(f, "ft"))
@@ -94,7 +107,7 @@ c.s.sendall(bytes([0x81, 0x80 | 126]) + struct.pack(">H", len(body)) + m + bytes
 check("an 8 KB frame (limit 4096) closes the connection", closed_within(c.s, 3))
 
 print("-- wss: the same upgrade over TLS on the HTTP site")
-if os.path.exists("cert.pem"):
+if os.path.exists("cert.pem") and tls_listener_up():
     ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
     raw = socket.create_connection(("127.0.0.1", TLS), timeout=5)
     ts = ctx.wrap_socket(raw, server_hostname="localhost")

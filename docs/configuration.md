@@ -45,8 +45,8 @@ work, with a warning). The older `cli_bridges` protocols (`cgi`, `bus`,
 {
   "shutdown_grace_ms": 5000,
   "stdin_admin_enabled": true,
-  "tls_ssl_dll": "C:/dev/openssl/libssl-1_1-x64.dll",
-  "tls_crypto_dll": "C:/dev/openssl/libcrypto-1_1-x64.dll",
+  "tls_ssl_dll": "C:/dev/openssl/libssl-3-x64.dll",
+  "tls_crypto_dll": "C:/dev/openssl/libcrypto-3-x64.dll",
   "settings": { "site_title": "VDRX" }
 }
 ```
@@ -56,9 +56,13 @@ work, with a warning). The older `cli_bridges` protocols (`cgi`, `bus`,
 - `stdin_admin_enabled` - type `quit`/`restart`/`reload`/`kill <id>`/
   `killall [type]` at the console. `sys.reload` (or typing `reload`)
   re-reads `vdrx.conf` and re-applies it live, including rebinding ports.
-- `tls_ssl_dll`/`tls_crypto_dll` - Windows-only override pointing FPC's
-  `openssl` unit at specific DLLs, for when the system doesn't have an
-  unversioned OpenSSL install FPC can `dlopen` by default.
+- `tls_ssl_dll`/`tls_crypto_dll` - pin the OpenSSL libraries FPC's `openssl`
+  unit loads. Windows: the DLL files (use OpenSSL **3.x**; 1.1.1 reached end of
+  life in 2023). Linux/Unix: normally not needed - vdrx finds `libssl.so`,
+  `libssl.so.3`, `.1.1` on its own. If you do set them, give a path **without**
+  the `.so` (the binding appends it), and note that a pinned library is used
+  exactly as given: if it cannot be loaded, TLS is *not* started and the log
+  says so, rather than quietly picking a different library.
 - `settings.*` - anything here is available in templates as `$$name$$`.
 
 **Environment variable expansion** - any string value anywhere in

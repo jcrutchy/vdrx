@@ -22,6 +22,12 @@
 - The logger masks credentials by pattern (`log_redact`, on by default, bodies
   included). That is a safety net: a secret carried in a member the patterns do
   not know, or in a job's own output, is logged as-is. Buckets are never masked.
+- **TLS settings are OpenSSL's defaults.** vdrx does not set a minimum protocol version or a cipher
+  list. On current Linux distributions OpenSSL 3 already refuses anything below TLS 1.2, but an older
+  or custom OpenSSL build (the Windows DLLs you ship, for instance) may still offer TLS 1.0/1.1, which
+  a scanner will flag. Use OpenSSL 3.x, check the port with a scanner (`nmap --script ssl-enum-ciphers`,
+  `testssl.sh`), or terminate TLS at a reverse proxy configured to your policy. TLS on Windows is
+  untested here (the Linux path - TLS 1.3 handshakes, stalled-handshake and `wss://` tests - is).
 - **Programs are not sandboxed.** A CGI program, `cli_bridges` command, job or process runs with the
   daemon's own user, file access and network. The clean environment and output cap limit what a
   *request* can do to the daemon, not what a program the administrator configured can do on the

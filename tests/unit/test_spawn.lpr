@@ -10,7 +10,7 @@ program test_spawn;
 
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
-  Classes, SysUtils, vdrx_procutil, vdrx_runner, vdrx_network;
+  Classes, SysUtils, openssl, {$IFDEF UNIX}dynlibs,{$ENDIF} vdrx_procutil, vdrx_runner, vdrx_network;
 
 var
   Passed, Failed: Integer;
@@ -118,8 +118,47 @@ begin
   VDRX_ConfigureStaticPolicy([], [], False);
 end;
 
+{$IFDEF UNIX}
+function TempSslDirs: Integer;
+var SR: TSearchRec;
+begin
+  Result := 0;
+  if FindFirst(IncludeTrailingPathDelimiter(GetTempDir(False)) + 'vdrx-ssl-*', faAnyFile, SR) = 0 then
+  begin
+    repeat Inc(Result); until FindNext(SR) <> 0;
+    FindClose(SR);
+  end;
+end;
+
+// Runs on any machine that has an OpenSSL RUNTIME, with or without the -dev package: the binding is
+// first pointed at a library name that does not exist, as it would be on a server where only the
+// versioned libssl.so.3 is installed.
+procedure TestOpenSSL;
+var
+  Before: Integer;
+  Ctx: PSSL_CTX;
+  H: TLibHandle;
+begin
+  WriteLn('-- finding OpenSSL when only the versioned library exists');
+  H := LoadLibrary('libssl.so.3');
+  if H = NilHandle then H := LoadLibrary('libssl.so.1.1');
+  if H = NilHandle then begin WriteLn('  skip  no OpenSSL runtime library on this machine'); Exit; end;
+  Before := TempSslDirs;
+  DLLSSLName := 'libssl_vdrx_test_missing';
+  DLLUtilName := 'libcrypto_vdrx_test_missing';
+  Check(VDRX_EnsureOpenSSL, 'a missing default name is recovered from the versioned library');
+  Check(Pos('libssl.so', VDRX_OpenSSLNote) = 1, 'and it says so (' + VDRX_OpenSSLNote + ')');
+  Ctx := SslCtxNew(SslTLSMethod);
+  Check(Assigned(Ctx), 'a TLS context can be created afterwards');
+  if Assigned(Ctx) then SslCtxFree(Ctx);
+  Check(TempSslDirs = Before, 'no temporary directory is left behind');
+  Check(VDRX_EnsureOpenSSL, 'asking again is cheap and gives the same answer');
+end;
+{$ENDIF}
+
 begin
   Passed := 0; Failed := 0;
+  {$IFDEF UNIX}TestOpenSSL;{$ENDIF}
   TestEnvironment;
   TestUTF8;
   TestBatch;

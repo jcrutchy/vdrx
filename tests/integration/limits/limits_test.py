@@ -49,6 +49,19 @@ def ws_auth_ok(c):
     send(c, {"method": "sys.auth", "token": "vt"})
     return any(f.get("event") == "auth.ok" for f in frames(c, .6))
 
+
+def tls_listener_up():
+    """True if the TLS port accepts connections. If not, say WHY (the daemon logs the reason) and let the caller skip."""
+    try: socket.create_connection(("127.0.0.1", 18443), timeout=3).close(); return True
+    except OSError:
+        why = ""
+        try:
+            why = [l for l in open("vdrx_daemon.log", errors="replace") if "NOT started" in l][-1].strip()[-260:]
+        except Exception: pass
+        print("skip  TLS tests: the TLS listener did not start. " + (why or "See vdrx_daemon.log.") +
+              "  (Needs the OpenSSL runtime: libssl.so.3 or libssl.so.1.1.)")
+        return False
+
 print("-- HTTP: slow and idle clients")
 t = time.time(); s = raw(); ok, _ = closed_within(s, 5)
 check("an idle connection (sends nothing) is closed by the server (<5 s)", ok, f"still open after {time.time()-t:.1f} s")
@@ -123,7 +136,7 @@ check("a ping with a 200-byte payload (control frames are max 125) closes the co
 c = connect(); check("the daemon still accepts and authenticates new WebSocket clients afterwards", ws_auth_ok(c))
 
 print("-- TLS: handshake stalls")
-if os.path.exists("cert.pem"):
+if os.path.exists("cert.pem") and tls_listener_up():
     stalled = [socket.create_connection(("127.0.0.1", 18443)) for _ in range(6)]
     ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
     t = time.time(); got = None
