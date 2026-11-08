@@ -47,10 +47,18 @@ bytes, or a frame that stalls part-way: once a frame has started, each further r
 `frame_timeout_ms` (default `15000`). An idle connection between frames is fine - the ping/pong
 heartbeat watches whether it is still alive. Both options go under `executives.ws`.
 
+**Clients that stop reading.** A frame that cannot be written for `write_timeout_ms` (default `15000`) means the client is no longer reading: the server closes the connection (it shuts the socket down, which also wakes the thread reading from it) and frees its slot. A client that is merely slow, and keeps accepting data, is not affected.
+
 **Authentication is required, and closed by default.** A client must `sys.auth` before anything
 else. Without `ws_profiles` **every `sys.auth` is rejected** - define profiles (below). For a
 throwaway local setup only, `"allow_open_access": true` on `executives.ws` restores the old
 behaviour (any non-empty token passes; `sys.*` still can't be published).
+
+**Re-authenticating ends the old session.** A `sys.auth` on a connection that is already authenticated first drops that
+session and every subscription made under it; only then is the new token checked. So a client cannot downgrade to a weaker
+profile, or send a bad token, and keep the earlier profile's topics flowing: after any second `sys.auth` it holds only what the
+new profile grants (`default_subscribe`, then whatever it subscribes to). `unsubscribe_all` likewise leaves the connection's own
+reply channel intact.
 
 Eight failed `sys.auth` attempts from one client address within 60 seconds lock that address out
 of `sys.auth` for 60 seconds - even the correct token is refused until it expires. Failures and

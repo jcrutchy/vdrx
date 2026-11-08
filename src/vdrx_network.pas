@@ -266,6 +266,7 @@ type
       ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
       const ARoutes: TVDRX_RouteTable; const AConn: TVDRX_ConnInfo;
       ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string;
+      var AStreamFile: string; var AStreamSize: Int64;
       ACustomHeaders: TStringList = nil): string;
   end;
 
@@ -361,6 +362,7 @@ type
     FAllowedOrigins: TStringList;
     FMaxFrameBytes: Integer;
     FFrameTimeoutMs: Integer;
+    FWriteTimeoutMs: Integer;
     FAuthLock: TCriticalSection;
     FAuthTrack: specialize TDictionary<string, TVDRX_AuthTrack>;
     FConfig: TVDRX_Config;
@@ -393,6 +395,9 @@ type
     property MaxFrameBytes: Integer read FMaxFrameBytes write FMaxFrameBytes;
     // Once a frame has started, how long each further read may take (default 15 s).
     property FrameTimeoutMs: Integer read FFrameTimeoutMs write FFrameTimeoutMs;
+    // A frame that cannot be written for this long means the client stopped reading: the connection
+    // is dropped (default 15 s, 0 = no limit).
+    property WriteTimeoutMs: Integer read FWriteTimeoutMs write FWriteTimeoutMs;
     // Failed-login lockout, per client address: AUTH_MAX_FAILURES failures
     // inside AUTH_WINDOW_MS locks that address out of sys.auth for AUTH_LOCKOUT_MS.
     function AuthLocked(const AIP: string): Boolean;
@@ -514,6 +519,11 @@ procedure ApplyOpenSSLDLLOverrides(AConfig: TVDRX_Config);
 // the whole request (headers + body). 0 turns that limit off.
 procedure VDRX_ConfigureHTTPTimeouts(AReadMs, ARequestMs: Integer);
 
+// How long the daemon waits for a client to take the response: AWriteMs is the longest a single
+// write may stall (a client that stopped reading), AResponseMs the most the whole response may take.
+// A client that exceeds either is dropped. 0 turns a limit off.
+procedure VDRX_ConfigureHTTPWriteLimits(AWriteMs, AResponseMs: Integer);
+
 // What the static file server will NOT hand out, whatever is lying in the directory:
 //  * files with these extensions: configuration, logs, keys, backups, databases, and script
 //    source (a .php that no CGI route runs would otherwise be sent as text). Matches are answered
@@ -541,6 +551,8 @@ implementation
 var
   HTTPReadTimeoutMs: Integer = 10000;
   HTTPRequestTimeoutMs: Integer = 30000;
+  HTTPWriteTimeoutMs: Integer = 30000;
+  HTTPResponseTimeoutMs: Integer = 600000;
   StaticDeny: TStringList = nil;            // lower-case extensions without the dot
   StaticFollowSymlinks: Boolean = False;
 
@@ -629,6 +641,12 @@ begin
     Cur := Cur + PathDelim + ASegs[i];
     if IsSymlinkPath(Cur) then Exit(True);
   end;
+end;
+
+procedure VDRX_ConfigureHTTPWriteLimits(AWriteMs, AResponseMs: Integer);
+begin
+  if AWriteMs >= 0 then HTTPWriteTimeoutMs := AWriteMs;
+  if AResponseMs >= 0 then HTTPResponseTimeoutMs := AResponseMs;
 end;
 
 procedure VDRX_ConfigureHTTPTimeouts(AReadMs, ARequestMs: Integer);
@@ -950,6 +968,10 @@ end;
 
 procedure TVDRX_PlainTransport.Close;
 begin
+  // close() alone does not wake another thread that is blocked in recv()/send() on this socket (on
+  // Linux it stays blocked), so a connection whose peer stopped reading could never be evicted.
+  // shutdown() does wake it.
+  {$IFDEF UNIX}fpShutdown(FSocket, 2);{$ENDIF}
   CloseSocket(FSocket);
 end;
 
@@ -1073,6 +1095,7 @@ begin
   if Assigned(FSSL) then
     SslShutdown(FSSL);
   FOK := False;
+  {$IFDEF UNIX}fpShutdown(FSocket, 2);{$ENDIF}
   CloseSocket(FSocket);
 end;
 
@@ -1601,7 +1624,9 @@ begin
   FTLSContext := nil;
 end;
 
-function PlainResponse(const AStatus, AContentType, ABody: string; ACustomHeaders: TStringList = nil): string;
+// The status line and headers of a response whose body is AContentLength bytes long and is sent
+// separately (streamed from a file) rather than built in memory.
+function PlainResponseHead(const AStatus, AContentType: string; AContentLength: Int64; ACustomHeaders: TStringList = nil): string;
 var
   i: Integer;
   ExtraHeaders: string;
@@ -1620,8 +1645,13 @@ begin
 
   Result := 'HTTP/1.1 ' + AStatus + #13#10 +
             'Content-Type: ' + AContentType + #13#10 +
-            'Content-Length: ' + IntToStr(Length(ABody)) + #13#10 +
-            ExtraHeaders + #13#10 + ABody;
+            'Content-Length: ' + IntToStr(AContentLength) + #13#10 +
+            ExtraHeaders + #13#10;
+end;
+
+function PlainResponse(const AStatus, AContentType, ABody: string; ACustomHeaders: TStringList = nil): string;
+begin
+  Result := PlainResponseHead(AStatus, AContentType, Length(ABody), ACustomHeaders) + ABody;
 end;
 
 function StatusOf(const AResponse: string): string;
@@ -1911,8 +1941,15 @@ begin
   else Result := 'application/octet-stream';
 end;
 
+const
+  // Files up to this size are read into memory and sent in one piece; bigger ones are streamed from
+  // disk in chunks. (Reading every file whole meant a client that asked for a large file and then
+  // never read it cost the daemon the file's full size, for as long as it stayed connected.)
+  STATIC_STREAM_THRESHOLD = 1024 * 1024;
+
 function ServeStaticFile(const APath, AStaticDir: string; ABus: TVDRX_MessageQueue;
-  const ASourceID: string; ACustomHeaders: TStringList = nil): string;
+  const ASourceID: string; var AStreamFile: string; var AStreamSize: Int64;
+  ACustomHeaders: TStringList = nil): string;
 var
   FilePath, Body: string;
   FS: TFileStream;
@@ -1976,16 +2013,72 @@ begin
     ABus.Publish('log.warn', 'http: static file not found: ' + FilePath, ASourceID);
     Exit(PlainResponse('404 Not Found', 'text/plain', 'Not found', ACustomHeaders));
   end;
+  AStreamFile := '';
+  AStreamSize := 0;
   FS := TFileStream.Create(FilePath, fmOpenRead or fmShareDenyNone);
   try
-    SetLength(Body, FS.Size);
-    if FS.Size > 0 then
-      FS.ReadBuffer(Body[1], FS.Size);
+    if FS.Size > STATIC_STREAM_THRESHOLD then
+    begin
+      AStreamFile := FilePath;
+      AStreamSize := FS.Size;
+    end
+    else
+    begin
+      SetLength(Body, FS.Size);
+      if FS.Size > 0 then
+        FS.ReadBuffer(Body[1], FS.Size);
+    end;
   finally
     FS.Free;
   end;
+  if AStreamFile <> '' then
+  begin
+    ABus.Publish('log.info', Format('http: serving static %s (%d bytes, streamed)', [FilePath, AStreamSize]), ASourceID);
+    Result := PlainResponseHead('200 OK', GuessContentType(FilePath), AStreamSize, ACustomHeaders);
+    Exit;
+  end;
   ABus.Publish('log.info', Format('http: served static %s (%d bytes)', [FilePath, Length(Body)]), ASourceID);
   Result := PlainResponse('200 OK', GuessContentType(FilePath), Body, ACustomHeaders);
+end;
+
+// Sends AFilePath's first ASize bytes in chunks. Stops at the first failed or timed-out write (each
+// write is bounded by the socket's send timeout) or when ADeadline (a GetTickCount64 value, 0 = none)
+// passes. Returns the number of bytes sent.
+function StreamFileBody(ATransport: TVDRX_Transport; const AFilePath: string; ASize: Int64; ADeadline: QWord): Int64;
+var
+  FS: TFileStream;
+  Buf: array[0..65535] of Byte;
+  Left: Int64;
+  N, Off, W, Want: Integer;
+begin
+  Result := 0;
+  try
+    FS := TFileStream.Create(AFilePath, fmOpenRead or fmShareDenyNone);
+  except
+    Exit;
+  end;
+  try
+    Left := ASize;
+    while Left > 0 do
+    begin
+      Want := SizeOf(Buf);
+      if Want > Left then Want := Integer(Left);
+      N := FS.Read(Buf[0], Want);
+      if N <= 0 then Exit;                       // the file got shorter than it was
+      Off := 0;
+      while Off < N do
+      begin
+        if (ADeadline > 0) and (GetTickCount64 > ADeadline) then Exit;
+        W := ATransport.Write(Buf[Off], N - Off);
+        if W <= 0 then Exit;
+        Inc(Off, W);
+        Inc(Result, W);
+      end;
+      Dec(Left, N);
+    end;
+  finally
+    FS.Free;
+  end;
 end;
 
 function MatchProxyRoute(const APath: string; const ARoutes: TVDRX_ProxyRoutes; out AMatch: TVDRX_ProxyRoute): Boolean;
@@ -2818,6 +2911,7 @@ class function TVDRX_HTTPExecutive.BuildResponse(const ARequest: string;
   ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
   const ARoutes: TVDRX_RouteTable; const AConn: TVDRX_ConnInfo;
   ABus: TVDRX_MessageQueue; ARegistry: TVDRX_Registry; const ASourceID: string;
+  var AStreamFile: string; var AStreamSize: Int64;
   ACustomHeaders: TStringList): string;
 var
   Method, Path, OrigTarget, Request, Location: string;
@@ -2875,7 +2969,7 @@ begin
           begin
             if (Method <> 'GET') and (Method <> 'HEAD') then
               Exit(PlainResponse('405 Method Not Allowed', 'text/plain', 'Method not allowed', ACustomHeaders));
-            Exit(ServeStaticFile(StaticPath, BusRoute.DocRoot, ABus, ASourceID, ACustomHeaders));
+            Exit(ServeStaticFile(StaticPath, BusRoute.DocRoot, ABus, ASourceID, AStreamFile, AStreamSize, ACustomHeaders));
           end;
         crRedirectSlash:
           begin
@@ -2899,7 +2993,7 @@ begin
 
   // 4. the site's own static_dir
   if (Method = 'GET') or (Method = 'HEAD') then
-    Result := ServeStaticFile(Path, AStaticDir, ABus, ASourceID, ACustomHeaders)
+    Result := ServeStaticFile(Path, AStaticDir, ABus, ASourceID, AStreamFile, AStreamSize, ACustomHeaders)
   else
   begin
     ABus.Publish('log.warn', 'http: unhandled method "' + Method + '" for ' + Path, ASourceID);
@@ -2934,7 +3028,9 @@ procedure TVDRX_HTTPConnection.Run(const ARequest: string);
 var
   Request, Response, Method, Path: string;
   HeadEnd, Sent, N, p: Integer;
-  Head, PathOnly: string;
+  Head, PathOnly, StreamFile: string;
+  StreamSize: Int64;
+  Deadline: QWord;
   TooLarge, TimedOut: Boolean;
 begin
   TooLarge := False;
@@ -2999,26 +3095,42 @@ begin
         Exit;
       end;
     end;
+    StreamFile := '';
+    StreamSize := 0;
     Response := TVDRX_HTTPExecutive.BuildResponse(Request, FTemplates, FConfig, FStaticDir,
-      FRoutes, FConn, Bus, FRegistry, FSourceID, FCustomHeaders);
+      FRoutes, FConn, Bus, FRegistry, FSourceID, StreamFile, StreamSize, FCustomHeaders);
     Bus.Publish('log.info', Format('http: %s %s -> %s', [Method, Path, StatusOf(Response)]), FSourceID);
     if Method = 'HEAD' then
     begin
       // headers only (Content-Length still describes the body a GET would return)
       HeadEnd := Pos(#13#10#13#10, Response);
       if HeadEnd > 0 then SetLength(Response, HeadEnd + 3);
+      StreamFile := '';                      // HEAD: never the body
     end;
+    // A client that stops reading must not hold this thread (and a connection slot) for ever: each
+    // write may stall for at most http_write_timeout_ms, the whole response takes at most
+    // http_response_timeout_ms.
+    if HTTPWriteTimeoutMs > 0 then FTransport.SetWriteTimeout(HTTPWriteTimeoutMs);
+    if HTTPResponseTimeoutMs > 0 then Deadline := GetTickCount64 + QWord(HTTPResponseTimeoutMs) else Deadline := 0;
     // send() may accept fewer bytes than offered (big bodies, send timeout)
     Sent := 0;
     while Sent < Length(Response) do
     begin
-      N := FTransport.Write(Response[Sent + 1], Length(Response) - Sent);
+      if (Deadline > 0) and (GetTickCount64 > Deadline) then N := 0
+      else N := FTransport.Write(Response[Sent + 1], Length(Response) - Sent);
       if N <= 0 then
       begin
-        Bus.Publish('log.warn', Format('http: %s %s - client went away after %d of %d bytes', [Method, Path, Sent, Length(Response)]), FSourceID);
+        Bus.Publish('log.warn', Format('http: %s %s - client went away or stopped reading after %d of %d bytes', [Method, Path, Sent, Length(Response)]), FSourceID);
+        StreamFile := '';
         Break;
       end;
       Inc(Sent, N);
+    end;
+    if StreamFile <> '' then
+    begin
+      N := Integer(StreamFileBody(FTransport, StreamFile, StreamSize, Deadline) = StreamSize);
+      if N = 0 then
+        Bus.Publish('log.warn', Format('http: %s %s - the %d-byte file was not fully sent (client stopped reading, went away, or the file changed)', [Method, Path, StreamSize]), FSourceID);
     end;
   end
   else
@@ -3311,6 +3423,7 @@ begin
   // after ~5 seconds. The ping thread is responsible for liveness after
   // upgrade and closes the socket itself when the pong deadline expires.
   FTransport.SetReadTimeout(0);
+  if FListener.WriteTimeoutMs > 0 then FTransport.SetWriteTimeout(FListener.WriteTimeoutMs);
   Bus.Publish('log.info', 'ws ' + ID + ': handshake OK', ID);
   Result := True;
 end;
@@ -3520,7 +3633,10 @@ begin
       begin
         if not WriteAll(Buf) then
         begin
+          // The client stopped reading (or went away). Closing the socket wakes the thread that is
+          // blocked reading it, so the whole connection is torn down instead of lingering.
           FStopping := True;
+          try FTransport.Close; except end;
           Break;
         end;
       end;
@@ -3639,6 +3755,17 @@ begin
       ProfName := Obj.Get('profile', '');
       Src := Obj.Get('source', FConn.ID);
       PeerIP := FConn.FTransport.PeerAddr;
+      // Fail closed. A sys.auth on a connection that already has a session ends that session FIRST:
+      // authentication is dropped and every subscription made under the old profile is removed, so
+      // neither a downgrade to a weaker profile nor a failed attempt can keep the old profile's
+      // topics flowing. The outcome of this sys.auth then starts from nothing.
+      if FAuthenticated then
+      begin
+        FAuthenticated := False;
+        FListener.Registry.ClearFilters(FConn.ID);
+        FListener.Registry.Register(FConn, FConn.ID, FConn.ID + '.rpc.out');   // the connection's own reply channel
+        Bus.Publish('log.info', 'ws ' + FConn.ID + ': re-authentication - previous session and subscriptions dropped', ID);
+      end;
       if FListener.AuthLocked(PeerIP) then
       begin
         // too many recent failures from this address: refuse without even checking the token
@@ -3718,6 +3845,7 @@ begin
     begin
       Bus.Publish('log.info', 'ws ' + FConn.ID + ': unsubscribe_all', ID);
       FListener.Registry.ClearFilters(FConn.ID);
+      FListener.Registry.Register(FConn, FConn.ID, FConn.ID + '.rpc.out');   // keep the connection's own reply channel
     end
     else if Method = 'publish' then
     begin
@@ -3895,6 +4023,7 @@ begin
   FAllowedOrigins.CaseSensitive := False;
   FMaxFrameBytes := 1024 * 1024;
   FFrameTimeoutMs := 15000;
+  FWriteTimeoutMs := 15000;
   FAuthLock := TCriticalSection.Create;
   FAuthTrack := specialize TDictionary<string, TVDRX_AuthTrack>.Create;
 end;

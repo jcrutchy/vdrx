@@ -69,6 +69,7 @@ type
   private
     FID: string;
     FBus: TVDRX_MessageQueue;
+    FRefs: LongInt;                 // see AddRef / Release
   public
     constructor Create(ABus: TVDRX_MessageQueue); virtual;
     property ID: string read FID write FID;
@@ -87,6 +88,18 @@ type
     // TVDRX_Kernel.Execute times every call and logs a log.warn past
     // HANDLEPACKET_WARN_MS as a tripwire for a future violation of this.
     procedure HandlePacket(const AMsg: TVDRX_Message); virtual; abstract;
+    // Lifetime. The registry owns an executive, and the dispatcher thread uses it OUTSIDE the registry
+    // lock (it takes a snapshot of subscribers, then calls HandlePacket on each). Without a count, an
+    // executive whose own thread unregisters it (a WebSocket connection ending) could be freed
+    // between the snapshot and the call, and the dispatch thread - the only one - would use freed
+    // memory and take the daemon down. So: the registry holds one reference, the dispatcher takes one
+    // per executive it is about to call (AddRef, under the registry lock) and gives it back after
+    // (Release); whoever drops the last reference frees the object.
+    procedure AddRef;
+    procedure Release;
+    // The registry letting go of its own reference (Unregister). True = nobody else is using the
+    // executive, the caller frees it now; False = the dispatcher still holds it and will free it.
+    function RetireRegistryRef: Boolean;
     procedure ApplyConfig; virtual;
   end;
 
@@ -227,6 +240,10 @@ type
 // Previously split both strings on '.' into dynamic arrays on every call,
 // which meant two heap allocations (plus one per segment) per match check;
 // this version walks both strings with plain index scanning instead.
+// True for topics a request must never be able to make an executive publish to: the operator-control
+// namespace (sys.>, handled by the admin executive whatever the source) and the kernel's own (kernel.>).
+// Executives that answer to a caller-supplied "reply_to" refuse these.
+function IsReservedReplyTopic(const ATopic: string): Boolean;
 function TopicMatches(const Filter, Topic: string): Boolean;
 
 // Escapes a string into a complete, quoted JSON string literal - not just the
@@ -243,6 +260,14 @@ begin
   Result := StringReplace(S, '\', '\\', [rfReplaceAll]);
   Result := StringReplace(Result, '"', '\"', [rfReplaceAll]);
   Result := '"' + Result + '"';
+end;
+
+function IsReservedReplyTopic(const ATopic: string): Boolean;
+var
+  T: string;
+begin
+  T := LowerCase(Trim(ATopic));
+  Result := (T = 'sys') or (T = 'kernel') or (Pos('sys.', T) = 1) or (Pos('kernel.', T) = 1);
 end;
 
 function TopicMatches(const Filter, Topic: string): Boolean;
@@ -380,6 +405,22 @@ constructor TVDRX_Executive.Create(ABus: TVDRX_MessageQueue);
 begin
   inherited Create;
   FBus := ABus;
+  FRefs := 1;                      // the registry's reference
+end;
+
+procedure TVDRX_Executive.AddRef;
+begin
+  InterlockedIncrement(FRefs);
+end;
+
+procedure TVDRX_Executive.Release;
+begin
+  if InterlockedDecrement(FRefs) = 0 then Free;
+end;
+
+function TVDRX_Executive.RetireRegistryRef: Boolean;
+begin
+  Result := InterlockedDecrement(FRefs) = 0;
 end;
 
 procedure TVDRX_Executive.Initialize;
@@ -589,7 +630,9 @@ begin
   // which would then be silently dropped - acceptable for now (nothing here is
   // authenticated or under heavy concurrency yet, see vdrx_admincmd.pas).
   Exec.Shutdown;
-  Exec.Free; // we exclusively own Exec now (see ExtractPair above), so free it ourselves
+  // We took Exec out of the tables (see ExtractPair above), so nobody new can find it. The dispatcher
+  // may still hold a reference from a snapshot it took earlier: then IT frees Exec when it lets go.
+  if Exec.RetireRegistryRef then Exec.Free;
 end;
 
 function TVDRX_Registry.Find(const AID: string): TVDRX_Executive;
@@ -680,6 +723,11 @@ begin
     finally
       GroupMembers.Free;
     end;
+    // Still under the lock: Unregister takes an executive out of the tables under this same lock, so
+    // nothing in Result can have been retired yet - and from here it cannot be freed under the
+    // caller's feet. The caller must Release each one.
+    for Chosen in Result do
+      Chosen.AddRef;
   finally
     FLock.Leave;
   end;
@@ -744,16 +792,24 @@ end;
 procedure TVDRX_Registry.UnregisterSelf(const AID: string);
 var
   Exec: TVDRX_Executive;
+  Pair: specialize TPair<string, TVDRX_Executive>;
 begin
   FLock.Enter;
   try
     if not FMasterMap.TryGetValue(AID, Exec) then
       Exit;
     RemoveSubscriptionsUnlocked(Exec);
-    FMasterMap.Remove(AID); // owning map - frees Exec via its plain destructor, no Shutdown call
+    // ExtractPair, not Remove: the owning map's Remove frees Exec on the spot, which is a
+    // use-after-free when the dispatcher thread still holds a reference from a subscriber
+    // snapshot it took earlier (it will call HandlePacket / Release on it). Same protocol as
+    // Unregister: take it out of the tables here, then let whoever drops the LAST reference
+    // free it. No Shutdown call - the caller is the executive's own thread, already finishing.
+    Pair := FMasterMap.ExtractPair(AID);
+    Exec := Pair.Value;
   finally
     FLock.Leave;
   end;
+  if Exec.RetireRegistryRef then Exec.Free;
 end;
 
 { TVDRX_Kernel }
@@ -827,6 +883,8 @@ begin
               [Exec.ID, Msg.Topic, ElapsedMs]), 'kernel');
         end;
       finally
+        for Exec in Subscribers do
+          Exec.Release;               // may free an executive that was unregistered meanwhile
         Subscribers.Free;
       end;
     end;

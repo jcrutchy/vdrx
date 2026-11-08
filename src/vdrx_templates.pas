@@ -232,12 +232,29 @@ begin
   Result := FConstants.Values[AName];
 end;
 
+// A template name is a plain file stem: letters, digits, '_', '-' and '.', never starting with '.'
+// and never containing '..'. Names arrive from the bus (a request's "template"), from scripts
+// (cli_bridges replies) and from @@include@@ tags, so anything that could leave the template
+// directory (path separators, drive letters, '..', NUL) must be refused here, before a path is built.
+function IsSafeTemplateName(const AName: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  if (AName = '') or (Length(AName) > 128) or (AName[1] = '.') then Exit;
+  if Pos('..', AName) > 0 then Exit;
+  for i := 1 to Length(AName) do
+    if not (AName[i] in ['A'..'Z', 'a'..'z', '0'..'9', '_', '-', '.']) then Exit;
+  Result := True;
+end;
+
 function TVDRX_TemplateStore.LoadTemplateCached(const AName: string): string;
 var
   SL: TStringList;
   Path: string;
   Idx: Integer;
 begin
+  if not IsSafeTemplateName(AName) then Exit('');
   FLock.Enter;
   try
     Idx := FTemplates.IndexOfName(AName);
@@ -510,6 +527,11 @@ begin
     end;
     Obj := TJSONObject(J);
     ReplyTo := Obj.Get('reply_to', '');
+    if IsReservedReplyTopic(ReplyTo) then
+    begin
+      Bus.Publish('log.warn', 'template ' + ID + ': refused reply_to "' + Copy(ReplyTo, 1, 64) + '" (reserved topic namespace) from ' + AMsg.SourceID, ID);
+      Exit;
+    end;
     if ReplyTo = '' then
     begin
       Bus.Publish('log.warn', 'template ' + ID + ': render request had no "reply_to" - dropped: ' + AMsg.Payload, ID);

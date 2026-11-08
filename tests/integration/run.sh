@@ -6,7 +6,7 @@
 #   tests/integration/run.sh php-cgi ws   run only the named sections
 #
 # Sections: static-site php-cgi python-cgi cli-api templates websocket-only
-#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction limits ws-shared spawn fuzz jobs
+#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction limits regress ws-shared spawn fuzz jobs
 # Needs: bin/vdrx (./build.sh), curl, python3. php-cgi / php / sort,tr,wc,head,grep
 # are only needed by the sections that use them; those sections skip if missing.
 # Uses ports 8080, 8082, 18080, 18082 - it refuses to run if one is already taken,
@@ -231,6 +231,13 @@ if want limits "$@"; then section "limits (slow clients, oversize frames, TLS ha
   if need python3 && start $d 18080 18082; then
     out=$(cd $d && python3 limits_test.py 2>&1); echo "$out" | sed 's/^/  /'
     case "$out" in *"all passed"*) ok "limits suite";; *) bad "limits suite" "see output above";; esac
+  fi
+fi
+
+if want regress "$@"; then section "regress (template path traversal, reply_to into sys.>, re-authentication)"
+  if need python3 && start tests/integration/regress 18082; then
+    out=$(cd tests/integration/regress && python3 regress_test.py 2>&1); echo "$out" | sed 's/^/  /'
+    case "$out" in *"all passed"*) ok "regression suite";; *) bad "regression suite" "see output above";; esac
   fi
 fi
 

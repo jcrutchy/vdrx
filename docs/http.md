@@ -147,6 +147,11 @@ HTTP site (if any) is involved in the request at all:
 {"body":"<rendered html>"}
 ```
 
+A template name is a plain file name (letters, digits, `_`, `-`, `.`; no leading `.`, no `..`, no path separators, at most 128
+characters); anything else renders nothing, so a request cannot read a `.tpl` file outside the template directory. A `reply_to`
+in the `sys.` or `kernel.` namespaces is refused (and logged), so a render request cannot be used to publish into the
+operator-control topics - the same applies to the runner executive's `reply_to`.
+
 This is what §4b's `template_topic` field actually talks to - see that
 section for why you'd choose it over an HTTP site's own implicit
 `template_dir`: mainly, when the same `cli_bridges` route is reachable on

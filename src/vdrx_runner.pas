@@ -274,7 +274,8 @@ begin
     J := GetJSON(APayload);
     try
       if J is TJSONObject then
-        if TJSONObject(J).Get('reply_to', '') <> '' then
+        if (TJSONObject(J).Get('reply_to', '') <> '') and
+           not IsReservedReplyTopic(TJSONObject(J).Get('reply_to', '')) then
           Result := TJSONObject(J).Get('reply_to', '');
     finally
       J.Free;
@@ -497,7 +498,8 @@ begin
         EdgeOK := EdgeTokenOK(Req);
         Body := Req.Get('body', '');
         Query := Req.Get('query', '');
-        if Req.Get('reply_to', '') <> '' then ReplyTo := Req.Get('reply_to', '');
+        if (Req.Get('reply_to', '') <> '') and not IsReservedReplyTopic(Req.Get('reply_to', '')) then
+          ReplyTo := Req.Get('reply_to', '');
         ParseQuery(Query, Params);
         if Req.Find('params') is TJSONObject then
         begin

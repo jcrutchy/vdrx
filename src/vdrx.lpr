@@ -1225,6 +1225,8 @@ begin
     if fpGeteuid = 0 then
       WriteLn('  WARNING: running as root. Run vdrx as an unprivileged account that can read only what it serves; a bug in vdrx, a CGI script or a job would otherwise have the whole machine.');
     {$ENDIF}
+    VDRX_ConfigureHTTPWriteLimits(Config.GetInteger('http_write_timeout_ms', 30000),
+      Config.GetInteger('http_response_timeout_ms', 600000));
     VDRX_ConfigureHTTPTimeouts(Config.GetInteger('http_read_timeout_ms', 10000),
       Config.GetInteger('http_request_timeout_ms', 30000));
     Logger.ConfigureRedaction(Config.GetBoolean('log_redact', True),
@@ -1259,6 +1261,7 @@ begin
       WS.AllowOpenAccess := Config.GetBoolean('executives.ws.allow_open_access', False);
       WS.MaxFrameBytes := Config.GetInteger('executives.ws.max_frame_bytes', WS.MaxFrameBytes);
       WS.FrameTimeoutMs := Config.GetInteger('executives.ws.frame_timeout_ms', WS.FrameTimeoutMs);
+      WS.WriteTimeoutMs := Config.GetInteger('executives.ws.write_timeout_ms', WS.WriteTimeoutMs);
       WS.DefaultSubscribe := Config.GetString('executives.ws.default_subscribe', '');
       for Filter in Config.GetStringArray('executives.ws.allowed_origins') do
         WS.AllowedOrigins.Add(Trim(Filter));

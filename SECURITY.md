@@ -21,6 +21,11 @@ bodies, and the absence of per-topic access control beyond `ws_profiles`.
 
 - Define `ws_profiles` with long random tokens, and give every profile a token. With no profiles the
   WebSocket rejects all logins (`allow_open_access` exists for throwaway dev setups only).
+- Template names are plain file names and `reply_to` values in `sys.>` / `kernel.>` are refused, so a client that may publish
+  to a template or runner topic cannot read files outside the template directory or reach `sys.quit` / `sys.kill*` through them.
+  A WebSocket client that re-sends `sys.auth` loses its previous session and subscriptions before the new token is judged.
+- Clients that stop *reading* are cut off too (`http_write_timeout_ms`, WebSocket `write_timeout_ms`), and
+  large static files are streamed rather than loaded into memory.
 - Slow clients are cut off (`http_read_timeout_ms`, `http_request_timeout_ms`, WebSocket `frame_timeout_ms`) and
   WebSocket frames are capped (`max_frame_bytes`, 1 MiB). Keep `max_connections` at what you actually expect.
 - WebSocket handshakes from a browser must come from the same host as the request (or an entry in
