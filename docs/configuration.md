@@ -17,9 +17,14 @@ the same wherever you look:
 | `processes` | default `<id>.in` | stdout lines to `<id>.out`, or to any topic in `publish_allow` |
 | `socket_clients` | default `<id>.in` | received data to `publish` (default `<id>.out`) |
 | `runners` | default `<id>.in` | replies to `reply_to`, else `publish` (default `<id>.out`) |
-| `templates` | default `<id>.in` | the render reply, to the request's `reply_to` |
+| `templates` | default `<id>.in` | the render reply, to the request's `reply_to` (see below: `reply_to` is checked) |
 | `buckets` | required (formerly `topics`) | nothing - records to a file |
 | `http_routes` | - (the HTTP side waits for one reply) | the request to `in_topic` |
+
+**`reply_to` is checked.** A request's `reply_to` makes the template and runner executives publish on the requester's behalf, so
+it is refused when it names a `sys.` or `kernel.` topic, and, when the request came from a WebSocket client in profile mode,
+when the client's profile `publish_allow` doesn't match it. Such a profile needs `publish_allow` (not just `subscribe_allow`)
+on the topics it wants replies on. Template names must be plain file names - no path separators, no `..`, no leading `.`.
 
 `buckets` entries are now `id` + `subscribe` (the old `name` / `topics` still
 work, with a warning). The older `cli_bridges` protocols (`cgi`, `bus`,

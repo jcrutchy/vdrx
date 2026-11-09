@@ -86,8 +86,11 @@ an existing script (`/app/index.php/more/path` -> script plus
 directory's `index` file (`/sub` without the slash gets a 301 to `/sub/`)
 -> the `fallback` front controller (frameworks, pretty URLs; `REQUEST_URI`
 still holds what the client asked for) -> 404. Paths containing `..`, `:`,
-backslashes, dot-files (`.git`, `.env`; `.well-known` is allowed) or segments
-ending in `.`/space are refused with 403.
+backslashes, dot-files (`.git`, `.env`; `.well-known` is allowed), Windows 8.3
+short-name aliases (`GIT~1`, `PROGRA~1.TXT` - NTFS's names for `.git` and
+`Program Files`), Windows device names (`con`, `nul`, `aux`, `com1`..`lpt9`, with
+any extension, on every platform) or segments ending in `.`/space are refused
+with 403.
 
 The program is started from an argument vector (never a shell):
 `command` + `args`, with `%%script%%` replaced by the absolute script path -
@@ -149,8 +152,11 @@ HTTP site (if any) is involved in the request at all:
 
 A template name is a plain file name (letters, digits, `_`, `-`, `.`; no leading `.`, no `..`, no path separators, at most 128
 characters); anything else renders nothing, so a request cannot read a `.tpl` file outside the template directory. A `reply_to`
-in the `sys.` or `kernel.` namespaces is refused (and logged), so a render request cannot be used to publish into the
-operator-control topics - the same applies to the runner executive's `reply_to`.
+is honoured only if the requester could publish there itself: the `sys.` and `kernel.` namespaces are always refused (and
+logged), and a WebSocket client in profile mode may only name topics its profile's `publish_allow` matches. So a render
+request cannot be used to publish into operator-control topics, or onto any topic the client is not allowed to write to - the
+same applies to the runner executive's `reply_to`. A profile that asks for replies on `reply.>` therefore needs `reply.>` in
+its `publish_allow` as well as in `subscribe_allow`.
 
 This is what §4b's `template_topic` field actually talks to - see that
 section for why you'd choose it over an HTTP site's own implicit

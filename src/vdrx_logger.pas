@@ -297,14 +297,14 @@ begin
     Exit;
 
   Stamp := DateTimeToStr(Now);
-  Payload := ClipPayload(AMsg.Payload);
+  Payload := VDRX_EscapeLogText(ClipPayload(AMsg.Payload));   // after redaction; a client must not be able to forge lines or drive the console
 
   // Plain file line - no ANSI escapes.
   FileLine := Format('[%s] [%s] [%s] %s%s',
-    [Stamp, LevelName(Level), AMsg.Topic, Payload, LineEnding]);
+    [Stamp, LevelName(Level), VDRX_EscapeLogText(AMsg.Topic), Payload, LineEnding]);
   // Colored console line.
   ConsoleLine := Format('%s[%s] [%s] [%s] %s%s%s',
-    [LevelColor(Level), Stamp, LevelName(Level), AMsg.Topic, Payload,
+    [LevelColor(Level), Stamp, LevelName(Level), VDRX_EscapeLogText(AMsg.Topic), Payload,
      CLR_RESET, LineEnding]);
 
   FLock.Enter;

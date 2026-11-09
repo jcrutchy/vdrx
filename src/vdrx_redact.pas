@@ -26,6 +26,12 @@ uses
 const
   REDACTED_MARK = '[REDACTED]';
 
+// Makes text safe to write into a log line. A client can put anything into a message that ends up in the
+// log (a job name, a header, a body): a line break would forge a new log entry, and an ESC byte would inject
+// terminal control sequences into the operator's console. CR, LF, ESC and the other control characters
+// (except tab) become visible escapes (\r \n \xNN); bytes 128 and up (UTF-8) are left alone.
+function VDRX_EscapeLogText(const AText: string): string;
+
 type
   TVDRX_Redactor = class
   private
@@ -43,6 +49,36 @@ type
   end;
 
 implementation
+
+function VDRX_EscapeLogText(const AText: string): string;
+const
+  HEX = '0123456789abcdef';
+var
+  i, n: Integer;
+  c: Char;
+  Clean: Boolean;
+begin
+  Clean := True;
+  for i := 1 to Length(AText) do
+    if (AText[i] < #32) and (AText[i] <> #9) or (AText[i] = #127) then begin Clean := False; Break; end;
+  if Clean then Exit(AText);
+  SetLength(Result, Length(AText) * 4);   // worst case: every character becomes \xNN
+  n := 0;
+  for i := 1 to Length(AText) do
+  begin
+    c := AText[i];
+    if c = #10 then begin Result[n + 1] := '\'; Result[n + 2] := 'n'; Inc(n, 2); end
+    else if c = #13 then begin Result[n + 1] := '\'; Result[n + 2] := 'r'; Inc(n, 2); end
+    else if ((c < #32) and (c <> #9)) or (c = #127) then
+    begin
+      Result[n + 1] := '\'; Result[n + 2] := 'x';
+      Result[n + 3] := HEX[(Ord(c) shr 4) + 1]; Result[n + 4] := HEX[(Ord(c) and 15) + 1];
+      Inc(n, 4);
+    end
+    else begin Inc(n); Result[n] := c; end;
+  end;
+  SetLength(Result, n);
+end;
 
 const
   // "<name>" : "<value>"  - the value may contain \" escapes and may be cut

@@ -109,7 +109,7 @@ function build(c){
 //#view
 const $=s=>document.querySelector(s),NS='http://www.w3.org/2000/svg';
 let files=[],M=null,live={},incOK=false,authed=false;
-const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const cut=(s,k)=>s.length>k?s.slice(0,k-1)+'…':s;
 function draw(){
  const show=$('#un').checked,{N,lanes,links,I,edge}=M;
@@ -159,7 +159,7 @@ function side(extra){
  $('#sd').innerHTML=h+(extra||'');
  $('#side').onclick=e=>{const d=e.target.closest('[data-i]');if(d){const i=I[+d.dataset.i];window._pin(i.nodes||[],i.topics)}};
 }
-const detail=x=>side(`<h2>${esc(x.id)} <span class="dim">${x.kind}${x.off?' (disabled)':''}</span></h2><div class="m">subscribes: ${esc(x.sub.join(', ')||'-')}<br>publishes: ${esc(x.pub.join(', ')||'-')}</div><pre>${esc(JSON.stringify(x.cfg,null,1))}</pre>`);
+const detail=x=>side(`<h2>${esc(x.id)} <span class="dim">${esc(x.kind)}${x.off?' (disabled)':''}</span></h2><div class="m">subscribes: ${esc(x.sub.join(', ')||'-')}<br>publishes: ${esc(x.pub.join(', ')||'-')}</div><pre>${esc(JSON.stringify(x.cfg,null,1))}</pre>`);
 const laneDetail=l=>{const{N}=M,L=live[M.lanes.indexOf(l)];side(`<h2>${esc(l.t)} <span class="dim">topic${L?' · ×'+L.n:''}</span></h2><div class="m">publishers: ${esc([...new Set(l.pubs)].map(i=>N[i].id).join(', ')||'none in this conf')}<br>subscribers: ${esc([...new Set(l.subs)].map(i=>N[i].id).join(', ')||'none')}</div>${L?`<h2>last message <span class="dim">${esc(L.last.topic)} ← ${esc(L.last.source)}</span></h2><pre>${esc(JSON.stringify(L.last.payload,null,1).slice(0,1500))}</pre>`:''}`)};
 function show(){if(!files.length)return;let c;try{c=merge(files);c._inc=incOK;M=build(c)}catch(e){$('#sd').innerHTML='<div class="is err">'+esc(e.message)+'</div>';return}
  live={};if(ws&&authed)subAll();const wp=((c.executives||{}).ws||{}).port;if(wp&&!$('#wu').dataset.t)$('#wu').value='ws://127.0.0.1:'+wp;

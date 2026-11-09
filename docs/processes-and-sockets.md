@@ -90,6 +90,14 @@ the socket_clients entry (and adjust the `processes` entry's `subscribe`)
 rather than changing any protocol code - that's the actual difference
 between the `soylent`/`freenode` entries already in `vdrx.conf`.
 
+**Certificate checks.** With `tls_verify` on (the default) vdrx checks two things: that the server's certificate chains to
+a trusted CA (`tls_ca_file`, or the system bundle), **and** that it is valid for the host name it dialled - `host`, or
+`tls_peer_name` if you set one (use that when the server's certificate is for a different name than the address you
+connect to). A certificate that chains to your CA but was issued for some other host is refused, with a log line saying so;
+without this check anyone holding any certificate from the same CA could impersonate the server. IP addresses are matched
+against the certificate's IP entries. If libcrypto is too old to check names (before OpenSSL 1.0.2) the connection is refused
+rather than trusted. `tls_verify: "false"` turns every check off.
+
 **Gotcha**: some IRC networks are picky about TLS
 verification, cert chains, or just flaky from a given host - if a
 connection silently won't come up, try `tls_verify: "false"` temporarily

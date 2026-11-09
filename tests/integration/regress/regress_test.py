@@ -16,6 +16,7 @@ def bodies(c, secs=1.0):
 def render(c, template, reply):
     send(c, {"method": "publish", "topic": "tpl.in", "payload": {"template": template, "params": {"name": "x"}, "reply_to": reply}})
     return bodies(c)
+def received(c): return [x["payload"] for x in frames(c, .6) if "topic" in x and "event" not in x]
 def alive():
     try: socket.create_connection(("127.0.0.1", 18082), timeout=1).close(); return True
     except OSError: return False
@@ -34,25 +35,41 @@ for target in ("sys.quit", "SYS.QUIT", "sys.killall", "kernel.shutdown"):
     render(c, "greeting", target); time.sleep(.4)
     check("reply_to %r is refused and the daemon keeps running" % target, alive())
 check("normal replies still work afterwards", render(c, "greeting", "reply.3") == ["<h1>Hello x</h1>\n"])
-c.s.close()
+
+print("-- 001: a reply_to is bounded by what the requesting profile could publish itself")
+a = login("at"); send(a, {"method": "subscribe", "filter": "secret.>"}); frames(a, .2)
+render(c, "greeting", "secret.a"); r = received(a)
+check("dash (publish_allow tpl.in, reply.>) cannot make the renderer publish to secret.a", r == [], r)
+t = login("tt"); send(t, {"method": "subscribe", "filter": "reply.>"}); frames(t, .2)
+r = render(t, "greeting", "reply.1")
+check("a profile that may publish only tpl.in gets no reply, even on a topic it can read", r == [], r)
+a.s.close(); t.s.close(); c.s.close()
 
 print("-- 004: a second sys.auth never leaves the old profile's subscriptions active")
 def feeder_publish(topic, text):
     f = login("ft"); send(f, {"method": "publish", "topic": topic, "payload": text}); frames(f, .2); f.s.close()
-def got(c): return [x["payload"] for x in frames(c, .6) if "topic" in x and "event" not in x]
 for scenario, second, want_event in (("re-auth as the weaker viewer profile", {"method": "sys.auth", "token": "vt"}, "auth.ok"),
                                      ("a failing sys.auth", {"method": "sys.auth", "token": "wrong"}, "auth.fail")):
     c = login("at"); send(c, {"method": "subscribe", "filter": "secret.>"}); frames(c, .2)
-    feeder_publish("secret.a", "one"); check("[%s] admin receives secret.a first" % scenario, got(c) == ["one"])
+    feeder_publish("secret.a", "one"); check("[%s] admin receives secret.a first" % scenario, received(c) == ["one"])
     send(c, second); ev = [f.get("event") for f in frames(c, .4)]
     check("[%s] the second sys.auth is answered (%s)" % (scenario, want_event), want_event in ev, ev)
-    feeder_publish("secret.b", "two"); r = got(c)
+    feeder_publish("secret.b", "two"); r = received(c)
     check("[%s] secret.b is NOT delivered afterwards" % scenario, r == [], r)
     c.s.close()
 c = login("vt"); send(c, {"method": "subscribe", "filter": "demo.>"}); frames(c, .2)
 send(c, {"method": "unsubscribe_all"}); frames(c, .3)
 send(c, {"method": "sys.auth", "token": "vt"}); ev = [f.get("event") for f in frames(c, .4)]
 check("unsubscribe_all does not cut the connection's own reply channel", "auth.ok" in ev, ev)
+
+print("-- log forging: a client's message cannot start a log line or drive the console")
+f = login("ft")
+send(f, {"method": "publish", "topic": "demo.logtest", "payload": "first\n[2026-01-01 00:00:00] [ERROR] [sys.admin] FORGED ENTRY\u001b[2J\u001b]0;owned\u0007"})
+frames(f, .3); f.s.close(); time.sleep(2.0)                   # let the log writer flush
+log = open("vdrx_daemon.log", "rb").read()
+check("the message was logged", b"FORGED ENTRY" in log)
+check("...on the same line as its topic, not as a line of its own", not any(l.startswith(b"[2026-01-01") for l in log.split(b"\n")))
+check("...with no ESC or BEL byte reaching the file", b"\x1b" not in log and b"\x07" not in log)
 
 print("all passed" if not fails else "%d FAILED" % fails)
 sys.exit(1 if fails else 0)

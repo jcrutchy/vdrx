@@ -244,6 +244,15 @@ type
 // namespace (sys.>, handled by the admin executive whatever the source) and the kernel's own (kernel.>).
 // Executives that answer to a caller-supplied "reply_to" refuse these.
 function IsReservedReplyTopic(const ATopic: string): Boolean;
+
+// Per-source publish policy for "reply_to". A request's reply_to makes an executive publish on the
+// requester's behalf, so it must not reach topics the requester could not publish to itself. A source
+// that has a policy (a WebSocket connection in profile mode records its profile's publish_allow here
+// under its connection id) may only have replies sent to topics that policy matches; a source with
+// none (internal executives, HTTP, stdin) is unrestricted apart from the reserved namespaces.
+procedure VDRX_SetSourcePublishPolicy(const ASourceID, AAllow: string);
+procedure VDRX_ClearSourcePublishPolicy(const ASourceID: string);
+function VDRX_ReplyAllowed(const ASourceID, ATopic: string): Boolean;
 function TopicMatches(const Filter, Topic: string): Boolean;
 
 // Escapes a string into a complete, quoted JSON string literal - not just the
@@ -254,6 +263,9 @@ function TopicMatches(const Filter, Topic: string): Boolean;
 function JSONString(const S: string): string;
 
 implementation
+
+uses
+  StrUtils;
 
 function JSONString(const S: string): string;
 begin
@@ -268,6 +280,56 @@ var
 begin
   T := LowerCase(Trim(ATopic));
   Result := (T = 'sys') or (T = 'kernel') or (Pos('sys.', T) = 1) or (Pos('kernel.', T) = 1);
+end;
+
+var
+  GPolicyLock: TCriticalSection;
+  GPolicy: TStringList;   // SourceID=comma-separated publish patterns
+
+procedure VDRX_SetSourcePublishPolicy(const ASourceID, AAllow: string);
+var
+  i: Integer;
+begin
+  GPolicyLock.Enter;
+  try
+    i := GPolicy.IndexOfName(ASourceID);
+    if i >= 0 then GPolicy.Delete(i);
+    GPolicy.Add(ASourceID + '=' + AAllow);   // an empty allow-list is a policy too: it denies everything
+  finally
+    GPolicyLock.Leave;
+  end;
+end;
+
+procedure VDRX_ClearSourcePublishPolicy(const ASourceID: string);
+var
+  i: Integer;
+begin
+  GPolicyLock.Enter;
+  try
+    i := GPolicy.IndexOfName(ASourceID);
+    if i >= 0 then GPolicy.Delete(i);
+  finally
+    GPolicyLock.Leave;
+  end;
+end;
+
+function VDRX_ReplyAllowed(const ASourceID, ATopic: string): Boolean;
+var
+  i: Integer;
+  Allow, P: string;
+begin
+  if IsReservedReplyTopic(ATopic) then Exit(False);
+  GPolicyLock.Enter;
+  try
+    i := GPolicy.IndexOfName(ASourceID);
+    if i < 0 then Exit(True);
+    Allow := GPolicy.ValueFromIndex[i];
+  finally
+    GPolicyLock.Leave;
+  end;
+  Result := False;
+  for P in SplitString(Allow, ',') do
+    if (Trim(P) <> '') and TopicMatches(Trim(P), ATopic) then Exit(True);
 end;
 
 function TopicMatches(const Filter, Topic: string): Boolean;
@@ -899,4 +961,12 @@ begin
   FQueue.Publish('kernel.shutdown', '', '');
 end;
 
+initialization
+  GPolicyLock := TCriticalSection.Create;
+  GPolicy := TStringList.Create;
+  GPolicy.CaseSensitive := True;
+
+finalization
+  GPolicy.Free;
+  GPolicyLock.Free;
 end.

@@ -10,7 +10,7 @@ program test_spawn;
 
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
-  Classes, SysUtils, openssl, {$IFDEF UNIX}dynlibs,{$ENDIF} vdrx_procutil, vdrx_runner, vdrx_network;
+  Classes, SysUtils, fpjson, jsonparser, vdrx_cgi, openssl, {$IFDEF UNIX}dynlibs,{$ENDIF} vdrx_procutil, vdrx_runner, vdrx_network;
 
 var
   Passed, Failed: Integer;
@@ -103,6 +103,59 @@ begin
   Check(not HasBatchMetaChars('report-2024_final.pdf') and not HasBatchMetaChars('a b c') and not HasBatchMetaChars('42'), 'ordinary values pass');
 end;
 
+procedure TestCGIEnv;
+var
+  Req: TJSONObject;
+  Env: TStringList;
+  i, Bad: Integer;
+begin
+  WriteLn('-- CGI environment built from a hostile request');
+  Req := TJSONObject(GetJSON('{"method":"GET","server_port":"80' + '\u0000EVIL=1","remote_port":"1\r\nX=2","query":"a=1\u0000B=2",' +
+    '"path_info":"/x\ny","headers":{"Proxy":"http://evil/","X.Foo":"1","X-Ok":"fine\r\nInjected: 1","Content-Type":"t\u0000x","Bad Name":"v","":"v"}}'));
+  Env := TStringList.Create;
+  try
+    BuildCGIEnv(Req, '', Env);
+    Bad := 0;
+    for i := 0 to Env.Count - 1 do
+      if (Pos(#0, Env[i]) > 0) or (Pos(#10, Env[i]) > 0) or (Pos(#13, Env[i]) > 0) then Inc(Bad);
+    Check(Bad = 0, 'no variable contains NUL, CR or LF (every one could otherwise inject another)');
+    Check((Env.IndexOfName('EVIL') < 0) and (Env.IndexOfName('X') < 0) and (Env.IndexOfName('B') < 0), 'no extra variable can be smuggled in through a value');
+    Check(Env.IndexOfName('HTTP_PROXY') < 0, 'a Proxy request header never becomes HTTP_PROXY (httpoxy)');
+    Check(Env.Values['HTTP_X_OK'] = 'fine  Injected: 1', 'a header value with CR/LF is flattened, and its name maps to HTTP_X_OK');
+    Check((Pos(#0, Env.Values['SERVER_PORT']) = 0) and (Env.Values['REMOTE_PORT'] = '1  X=2'), 'ports are sanitised like every other value');
+    Check(Env.Values['REDIRECT_STATUS'] = '200', 'REDIRECT_STATUS is still set for php-cgi');
+  finally
+    Env.Free;
+    Req.Free;
+  end;
+end;
+
+procedure TestURLPaths;
+var
+  S: TStringList;
+  function Ok(const P: string): Boolean;
+  begin
+    Result := SplitURLPath(P, S);
+  end;
+begin
+  WriteLn('-- URL path splitting (what may reach the file system)');
+  S := TStringList.Create;
+  try
+    Check(Ok('/app/index.php') and (S.Count = 2) and (S[1] = 'index.php'), 'an ordinary path splits into its segments');
+    Check(Ok('/.well-known/acme') and Ok('/a//b/./c') and (S.Count = 3), '.well-known is allowed; empty and "." segments are dropped');
+    Check(not Ok('/a/../b') and not Ok('/%2e%2e/b') and not Ok('/a/%2E%2E/b'), '".." is refused, also percent-encoded');
+    Check(not Ok('/.git/config') and not Ok('/a/.env') and not Ok('/%2egit/x'), 'dot-files are refused');
+    Check(not Ok('/a\b') and not Ok('/a%5cb') and not Ok('/a%00b') and not Ok('/f.txt:stream') and not Ok('/C:/x'), 'backslash, NUL and ":" are refused');
+    Check(not Ok('/x.php.') and not Ok('/x.php%20') and not Ok('/x.php '), 'trailing dot or space is refused (Windows ignores them)');
+    Check(not Ok('/GIT~1/config') and not Ok('/PROGRA~1/x') and not Ok('/a/DOCUME~2.TXT') and not Ok('/git~1'), '8.3 short-name aliases (GIT~1 is how NTFS names .git) are refused');
+    Check(Ok('/report~final.pdf') and Ok('/a~b/c') and Ok('/notes~.txt') and Ok('/verylongname~1/x'), 'ordinary names containing "~" still work');
+    Check(not Ok('/con') and not Ok('/NUL.txt') and not Ok('/a/Aux.log') and not Ok('/com1') and not Ok('/LPT9.x') and not Ok('/conin$'), 'Windows device names are refused, any case, any extension');
+    Check(Ok('/console') and Ok('/com10') and Ok('/auxiliary.txt') and Ok('/lpt') and Ok('/nullable'), 'names that merely start like a device name still work');
+  finally
+    S.Free;
+  end;
+end;
+
 procedure TestStatic;
 begin
   WriteLn('-- static file deny list');
@@ -163,6 +216,8 @@ begin
   TestUTF8;
   TestBatch;
   TestStatic;
+  TestURLPaths;
+  TestCGIEnv;
   WriteLn;
   WriteLn(Passed, ' passed, ', Failed, ' failed');
   if Failed > 0 then Halt(1);

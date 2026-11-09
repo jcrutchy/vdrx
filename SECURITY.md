@@ -13,7 +13,8 @@ Include the version/commit, your configuration (with secrets removed) and steps 
 
 ## Known limitations
 
-See [docs/known-gaps.md](docs/known-gaps.md). Security-relevant items there include
+The assets, actors, controls and review status are laid out in [docs/threat-model.md](docs/threat-model.md); the list of
+known weaknesses is [docs/known-gaps.md](docs/known-gaps.md). Security-relevant items there include
 WebSocket authentication defaults, plain-text token comparison, logging of request
 bodies, and the absence of per-topic access control beyond `ws_profiles`.
 
@@ -22,7 +23,11 @@ bodies, and the absence of per-topic access control beyond `ws_profiles`.
 - Define `ws_profiles` with long random tokens, and give every profile a token. With no profiles the
   WebSocket rejects all logins (`allow_open_access` exists for throwaway dev setups only).
 - Template names are plain file names and `reply_to` values in `sys.>` / `kernel.>` are refused, so a client that may publish
-  to a template or runner topic cannot read files outside the template directory or reach `sys.quit` / `sys.kill*` through them.
+  to a template or runner topic cannot read files outside the template directory or reach `sys.quit` / `sys.kill*` through them,
+  and a profile's `reply_to` is limited to topics its own `publish_allow` matches.
+- URL paths are split segment by segment and refused if they contain `..`, NUL, `\`, `:`, dot-files, their Windows 8.3 aliases
+  (`GIT~1`), device names (`con`, `nul`, `com1`...) or a trailing dot/space; every CGI environment value has CR, LF and NUL
+  stripped, and a `Proxy` header never becomes `HTTP_PROXY`.
   A WebSocket client that re-sends `sys.auth` loses its previous session and subscriptions before the new token is judged.
 - Clients that stop *reading* are cut off too (`http_write_timeout_ms`, WebSocket `write_timeout_ms`), and
   large static files are streamed rather than loaded into memory.
@@ -31,6 +36,9 @@ bodies, and the absence of per-topic access control beyond `ws_profiles`.
 - WebSocket handshakes from a browser must come from the same host as the request (or an entry in
   `executives.ws.allowed_origins`); `max_connections` caps live WebSocket connections. Pages and WebSocket can
   share one port with an HTTP site's `websocket_path`.
+- Outbound TLS (`socket_clients`) checks that the server's certificate is valid for the host it dialled, not just that it chains
+  to a trusted CA; keep `tls_verify` on. Everything written to the log has line breaks and control characters escaped, so a
+  client cannot forge log entries or drive the operator's terminal.
 - Failed WebSocket logins are rate-limited per address (8 per minute, then a one-minute lockout).
 - Listeners bind to `127.0.0.1` by default. Set `bind` to the one interface that needs to be
   reachable (avoid `0.0.0.0`) and firewall the port to the hosts that need it.

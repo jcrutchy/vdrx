@@ -22,3 +22,17 @@ All Pascal source lives in `src/`.
 
 ---
 *Section numbers (§N) are shared across all vdrx docs - see the [section map](README.md#section-map).*
+
+## Executive lifetime (read before adding or changing an executive)
+
+An executive is shared between threads: the kernel's dispatcher takes a snapshot of the matching subscribers for every
+message and calls each one's `HandlePacket`, while the executive's own threads may be unregistering it at the same moment.
+So executives are **reference counted** (`AddRef` / `Release` / `RetireRegistryRef` in `vdrx_core.pas`):
+
+- The registry holds one reference. The dispatcher adds one per subscriber in its snapshot and releases it after delivery.
+- Anything that removes an executive from the registry must take it out of the tables first and then call
+  `RetireRegistryRef`; only when that returns true (nobody else holds a reference) does the caller `Free` it. Both
+  `Registry.Unregister` and `Registry.UnregisterSelf` follow this. Never free an executive straight out of the registry's
+  owning map (`FMasterMap.Remove` would): the dispatcher may still be about to call into it.
+- A thread that finishes an executive's life (a connection thread calling `UnregisterSelf` as its last act) must not touch the
+  object afterwards, because the dispatcher may free it a moment later.

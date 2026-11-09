@@ -23,3 +23,4 @@ tests/*/*.pem
 tests/integration/*/*.pem
 tests/fuzz/fuzz_findings.jsonl
 tests/integration/limits/www/big_test.txt
+tests/integration/*/*.key

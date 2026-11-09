@@ -66,6 +66,10 @@ Now rendering is explicit and independent of which site answered. Anything on th
 publish `{"template":"greeting","params":{...},"reply_to":"x"}` to `template.render` and `{"body":"<html>..."}`
 arrives on `x`.
 
+Two rules apply to such a request. The `template` must be a plain file name (letters, digits, `_`, `-`, `.`) - anything with a
+path separator or `..` renders nothing. And `reply_to` must be a topic the requester could publish to itself: never `sys.` or
+`kernel.` topics, and for a WebSocket client in profile mode only topics its profile's `publish_allow` matches.
+
 ## Variations
 
 - The handler can be a one-shot [runner](cli-api.md) program too - it only needs to print a reply envelope; see the

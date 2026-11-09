@@ -6,7 +6,7 @@
 #   tests/integration/run.sh php-cgi ws   run only the named sections
 #
 # Sections: static-site php-cgi python-cgi cli-api templates websocket-only
-#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction limits regress ws-shared spawn fuzz jobs
+#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction limits regress tls-client ws-shared spawn fuzz jobs
 # Needs: bin/vdrx (./build.sh), curl, python3. php-cgi / php / sort,tr,wc,head,grep
 # are only needed by the sections that use them; those sections skip if missing.
 # Uses ports 8080, 8082, 18080, 18082 - it refuses to run if one is already taken,
@@ -239,6 +239,18 @@ if want regress "$@"; then section "regress (template path traversal, reply_to i
     out=$(cd tests/integration/regress && python3 regress_test.py 2>&1); echo "$out" | sed 's/^/  /'
     case "$out" in *"all passed"*) ok "regression suite";; *) bad "regression suite" "see output above";; esac
   fi
+fi
+
+if want tls-client "$@"; then section "tls-client (outbound TLS must check the certificate's host name)"
+  d=tests/integration/tls-client
+  if command -v openssl >/dev/null 2>&1 && need python3; then
+    ( cd $d && openssl req -x509 -newkey rsa:2048 -nodes -keyout good.key -out good.pem -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1" -days 2 >/dev/null 2>&1 \
+      && openssl req -x509 -newkey rsa:2048 -nodes -keyout bad.key -out bad.pem -subj "/CN=other.example.com" -addext "subjectAltName=DNS:other.example.com" -days 2 >/dev/null 2>&1 )
+    if start $d 18083; then
+      out=$(cd $d && python3 tls_client_test.py 2>&1); echo "$out" | sed 's/^/  /'
+      case "$out" in *"all passed"*) ok "outbound TLS host-name check";; *) bad "outbound TLS host-name check" "see output above";; esac
+    fi
+  else skip "needs openssl and python3"; fi
 fi
 
 if want ws-shared "$@"; then section "ws-shared (WebSocket on the HTTP port, Origin check, connection cap, no handshake leak)"

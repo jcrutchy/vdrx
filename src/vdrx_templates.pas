@@ -527,9 +527,9 @@ begin
     end;
     Obj := TJSONObject(J);
     ReplyTo := Obj.Get('reply_to', '');
-    if IsReservedReplyTopic(ReplyTo) then
+    if (ReplyTo <> '') and not VDRX_ReplyAllowed(AMsg.SourceID, ReplyTo) then
     begin
-      Bus.Publish('log.warn', 'template ' + ID + ': refused reply_to "' + Copy(ReplyTo, 1, 64) + '" (reserved topic namespace) from ' + AMsg.SourceID, ID);
+      Bus.Publish('log.warn', 'template ' + ID + ': refused reply_to "' + Copy(ReplyTo, 1, 64) + '" (reserved topic, or not publishable by ' + AMsg.SourceID + ')', ID);
       Exit;
     end;
     if ReplyTo = '' then

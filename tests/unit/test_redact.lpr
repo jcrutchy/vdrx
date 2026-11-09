@@ -98,6 +98,16 @@ begin
     R.Free;
   end;
   WriteLn;
+  WriteLn('-- log text escaping');
+  Check(VDRX_EscapeLogText('plain text, tab' + #9 + 'and UTF-8 caf' + #195#169) = 'plain text, tab' + #9 + 'and UTF-8 caf' + #195#169, 'ordinary text (tab and UTF-8 included) is unchanged');
+  Check(VDRX_EscapeLogText('') = '', 'empty string');
+  Check(VDRX_EscapeLogText('a' + #10 + '[ERROR] forged') = 'a\n[ERROR] forged', 'LF cannot start a new log line');
+  Check(VDRX_EscapeLogText('a' + #13#10 + 'b') = 'a\r\nb', 'CRLF is escaped');
+  Check(VDRX_EscapeLogText(#27 + '[2J' + #27 + ']0;owned' + #7) = '\x1b[2J\x1b]0;owned\x07', 'ESC (terminal control sequences) and BEL are neutralised');
+  Check(VDRX_EscapeLogText('x' + #0 + 'y' + #127) = 'x\x00y\x7f', 'NUL and DEL are escaped');
+  Check(Pos(#10, VDRX_EscapeLogText(StringOfChar(#10, 1000))) = 0, 'a long run of line breaks stays on one line');
+  Check(Length(VDRX_EscapeLogText(StringOfChar(#1, 1000))) = 4000, 'worst-case growth is handled');
+  WriteLn;
   WriteLn(Passed, ' passed, ', Failed, ' failed');
   if Failed > 0 then Halt(1);
 end.

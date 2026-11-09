@@ -7,7 +7,7 @@ interface
 uses
   Classes, SysUtils, StrUtils, Sockets, SyncObjs, Process, vdrx_core,
   vdrx_config, vdrx_templates, vdrx_procutil, Generics.Collections,
-  openssl, resolve, {$IFDEF UNIX}BaseUnix, dynlibs,{$ENDIF} base64, sha1, fpjson, jsonparser, DateUtils, RegExpr, Types;
+  openssl, resolve, {$IFDEF UNIX}BaseUnix,{$ENDIF} dynlibs, base64, sha1, fpjson, jsonparser, DateUtils, RegExpr, Types;
 
 type
 
@@ -124,6 +124,10 @@ type
     constructor Create(ASocket: TSocket; ACtx: PSSL_CTX; const AHostname: string); overload;
     destructor Destroy; override;
     property Handshook: Boolean read FOK;
+    // True if the certificate the peer presented is valid for AName (a DNS name, or an IP address).
+    // SSL_VERIFY_PEER alone only proves the chain leads to a trusted CA - it says nothing about WHICH
+    // host the certificate was issued to, so without this any certificate from the same CA would do.
+    function PeerCertMatches(const AName: string): Boolean;
     function Read(var ABuf; ALen: Integer): Integer; override;
     function Write(const ABuf; ALen: Integer): Integer; override;
     procedure Close; override;
@@ -535,6 +539,10 @@ procedure VDRX_ConfigureStaticPolicy(const AExtraDeny, AAllow: array of string; 
 
 // True when the static server would refuse a file with this name (by extension).
 function VDRX_StaticDenied(const AFileName: string): Boolean;
+
+// Splits a URL path into safe directory/file segments (percent-decoded); False for anything that
+// could escape the doc root or reach something hidden. Exposed for the unit tests.
+function SplitURLPath(const ARawPath: string; ASegs: TStrings): Boolean;
 
 // Makes sure FPC's OpenSSL binding has found a library, looking for the versioned libssl.so.3 /
 // .1.1 when the plain libssl.so (a -dev package file) is missing. True = TLS can work.
@@ -1069,6 +1077,44 @@ begin
   if AHostname <> '' then
     SslCtrl(FSSL, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, PChar(AHostname));
   FOK := (SslConnect(FSSL) = 1);
+end;
+
+function TVDRX_TLSTransport.PeerCertMatches(const AName: string): Boolean;
+type
+  TCheckHost = function(x: PX509; name: PAnsiChar; namelen: PtrUInt; flags: LongWord; peername: Pointer): LongInt; cdecl;
+  TCheckIP = function(x: PX509; ipasc: PAnsiChar; flags: LongWord): LongInt; cdecl;
+  TGetPeerCert = function(ssl: PSSL): PX509; cdecl;
+var
+  Cert: PX509;
+  P, G: Pointer;
+  IsIP: Boolean;
+  i: Integer;
+begin
+  Result := False;
+  if (not FOK) or (not Assigned(FSSL)) or (AName = '') then Exit;
+  IsIP := Pos(':', AName) > 0;
+  if not IsIP then
+  begin
+    IsIP := True;
+    for i := 1 to Length(AName) do
+      if not (AName[i] in ['0'..'9', '.']) then IsIP := False;
+  end;
+  if IsIP then P := GetProcedureAddress(SSLUtilHandle, 'X509_check_ip_asc')
+  else P := GetProcedureAddress(SSLUtilHandle, 'X509_check_host');
+  if P = nil then Exit;   // libcrypto older than 1.0.2 cannot check names: do not trust, fail closed
+  // OpenSSL 3 turned SSL_get_peer_certificate into a macro for SSL_get1_peer_certificate, so FPC's binding
+  // (which looks up the old name) finds nothing there: ask libssl for whichever of the two it has.
+  G := GetProcedureAddress(SSLLibHandle, 'SSL_get1_peer_certificate');
+  if G = nil then G := GetProcedureAddress(SSLLibHandle, 'SSL_get_peer_certificate');
+  if G = nil then Exit;
+  Cert := TGetPeerCert(G)(FSSL);
+  if Cert = nil then Exit;
+  try
+    if IsIP then Result := TCheckIP(P)(Cert, PAnsiChar(AName), 0) = 1
+    else Result := TCheckHost(P)(Cert, PAnsiChar(AName), Length(AName), 0, nil) = 1;
+  finally
+    X509Free(Cert);
+  end;
 end;
 
 destructor TVDRX_TLSTransport.Destroy;
@@ -1884,11 +1930,46 @@ begin
   SetLength(Result, Used);
 end;
 
+// A Windows 8.3 short-name alias: up to 6 name characters, '~', digits, and an optional extension of
+// at most 3 characters ("GIT~1" is what NTFS calls ".git", "PROGRA~1" what it calls "Program Files").
+// The dot-file rule below would not see through one, so aliases are refused outright.
+function IsShortNameAlias(const ASeg: string): Boolean;
+var
+  Stem, Ext: string;
+  d, t, k: Integer;
+begin
+  Result := False;
+  d := Pos('.', ASeg);
+  if d > 0 then begin Stem := Copy(ASeg, 1, d - 1); Ext := Copy(ASeg, d + 1, MaxInt); end
+  else begin Stem := ASeg; Ext := ''; end;
+  if (Length(Ext) > 3) or (Length(Stem) < 3) or (Length(Stem) > 8) then Exit;
+  t := Pos('~', Stem);
+  if (t < 2) or (t > 7) or (t = Length(Stem)) then Exit;
+  for k := t + 1 to Length(Stem) do
+    if not (Stem[k] in ['0'..'9']) then Exit;
+  Result := True;
+end;
+
+// Windows device names (CON, NUL, COM1 ...) are special whatever the extension or case ("nul.txt" is
+// still the NUL device); opening one can hang a handler or read the console. Refused on every platform.
+function IsReservedDeviceName(const ASeg: string): Boolean;
+var
+  Stem: string;
+  d: Integer;
+begin
+  d := Pos('.', ASeg);
+  if d > 0 then Stem := Copy(ASeg, 1, d - 1) else Stem := ASeg;
+  Stem := UpperCase(TrimRight(Stem));
+  Result := (Stem = 'CON') or (Stem = 'PRN') or (Stem = 'AUX') or (Stem = 'NUL') or (Stem = 'CONIN$') or (Stem = 'CONOUT$') or
+    ((Length(Stem) = 4) and ((Copy(Stem, 1, 3) = 'COM') or (Copy(Stem, 1, 3) = 'LPT')) and (Stem[4] in ['0'..'9']));
+end;
+
 // Maps a URL path (e.g. '/app/index.php') onto a directory, segment by segment.
 // Returns False for anything that could escape or hide something: "..", NUL,
 // backslashes, ':' (NTFS alternate data streams), dot-files (.git, .env ...;
-// ".well-known" is allowed) and segments ending in '.' or ' ' (Windows ignores
-// those, so "x.php." would serve a script's source as plain text).
+// ".well-known" is allowed), their 8.3 aliases (GIT~1), Windows device names and
+// segments ending in '.' or ' ' (Windows ignores those, so "x.php." would serve a
+// script's source as plain text).
 function SplitURLPath(const ARawPath: string; ASegs: TStrings): Boolean;
 var
   Decoded, Seg: string;
@@ -1909,6 +1990,7 @@ begin
     if Seg = '..' then Exit;
     if (Seg[1] = '.') and (Seg <> '.well-known') then Exit;
     if Seg[Length(Seg)] in ['.', ' '] then Exit;
+    if IsShortNameAlias(Seg) or IsReservedDeviceName(Seg) then Exit;
     ASegs.Add(Seg);
   end;
   Result := True;
@@ -3762,6 +3844,7 @@ begin
       if FAuthenticated then
       begin
         FAuthenticated := False;
+        VDRX_ClearSourcePublishPolicy(FConn.ID);
         FListener.Registry.ClearFilters(FConn.ID);
         FListener.Registry.Register(FConn, FConn.ID, FConn.ID + '.rpc.out');   // the connection's own reply channel
         Bus.Publish('log.info', 'ws ' + FConn.ID + ': re-authentication - previous session and subscriptions dropped', ID);
@@ -3782,6 +3865,8 @@ begin
         begin
           FListener.NoteAuthSuccess(PeerIP);
           if FProfile.MaxQueue > 0 then FConn.MaxQueue := FProfile.MaxQueue;
+          // executives that answer a request's reply_to may only publish where this profile could itself
+          VDRX_SetSourcePublishPolicy(FConn.ID, FProfile.PublishAllow);
           Bus.Publish('log.info', 'ws ' + FConn.ID + ': authenticated as profile "' + FProfile.ID + '"', ID);
           Bus.Publish(FConn.ID + '.rpc.out', Format('{"event":"auth.ok","source":%s,"profile":%s}', [JSONString(Src), JSONString(FProfile.ID)]), ID);
           ApplyDefaultSubscribe;
@@ -3923,6 +4008,7 @@ begin
   Bus.Publish('log.info', 'ws ' + ID + ': disconnected', ID);
   Bus.Publish('sys.ws.disconnected', Format('{"id":%s}', [JSONString(ID)]), ID);
   FListener.Registry.Unregister(ID + '.rpc');
+  VDRX_ClearSourcePublishPolicy(ID);
   FListener.Registry.UnregisterSelf(ID);
 end;
 
@@ -4315,6 +4401,16 @@ begin
       begin
         Bus.Publish('log.warn', Format('%s: TLS handshake to %s:%d failed (verify_peer=%s, ca_file="%s")',
           [ID, FHost, FPort, BoolToStr(FTLSVerify, True), FTLSCAFile]), ID);
+        Transport.Close;
+        Transport.Free;
+        Exit;
+      end;
+      // The chain checked out (SSL_VERIFY_PEER); now check the certificate is for THIS host, otherwise
+      // any certificate issued by the same CA would let someone impersonate the server.
+      if FTLSVerify and not TVDRX_TLSTransport(Transport).PeerCertMatches(PeerName) then
+      begin
+        Bus.Publish('log.warn', Format('%s: TLS certificate presented by %s:%d is not valid for the name "%s" - dropping the connection (use tls_peer_name if the server legitimately uses another name)',
+          [ID, FHost, FPort, PeerName]), ID);
         Transport.Close;
         Transport.Free;
         Exit;

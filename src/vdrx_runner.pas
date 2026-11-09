@@ -63,7 +63,7 @@ type
     procedure Process(const AMsg: TVDRX_Message); virtual;
     procedure Reply(const AReplyTo: string; AStatus: Integer; const AContentType, ABody, AStderr: string; AExitCode: Integer);
     function ExpandArgs(AParams: TStringList; ADest: TStrings; out AError: string): Boolean;
-    function ReplyToOf(const APayload: string): string;
+    function ReplyToOf(const AMsg: TVDRX_Message): string;
     // True unless RequireEdgeToken is set and ARequest is not a JSON object
     // carrying "_edge_token" = EdgeToken. See GVDRXEdgeToken in vdrx_network.pas
     // for why this exists: it is what stops a non-HTTP bus publisher from
@@ -261,21 +261,21 @@ begin
   else
   begin
     Bus.Publish('log.warn', 'runner ' + ID + ': queue full (' + IntToStr(FMaxQueue) + ') - rejecting a request with 503', ID);
-    Reply(ReplyToOf(AMsg.Payload), 503, 'text/plain', 'Runner busy - try again shortly', '', -1);
+    Reply(ReplyToOf(AMsg), 503, 'text/plain', 'Runner busy - try again shortly', '', -1);
   end;
 end;
 
-function TVDRX_RunnerExecutive.ReplyToOf(const APayload: string): string;
+function TVDRX_RunnerExecutive.ReplyToOf(const AMsg: TVDRX_Message): string;
 var
   J: TJSONData;
 begin
   Result := FPublishTopic;
   try
-    J := GetJSON(APayload);
+    J := GetJSON(AMsg.Payload);
     try
       if J is TJSONObject then
         if (TJSONObject(J).Get('reply_to', '') <> '') and
-           not IsReservedReplyTopic(TJSONObject(J).Get('reply_to', '')) then
+           VDRX_ReplyAllowed(AMsg.SourceID, TJSONObject(J).Get('reply_to', '')) then
           Result := TJSONObject(J).Get('reply_to', '');
     finally
       J.Free;
@@ -320,7 +320,7 @@ begin
         begin
           Bus.Publish('log.error', 'runner ' + ID + ': unexpected error: ' + E.ClassName + ': ' + E.Message, ID);
           try
-            Reply(ReplyToOf(Msg.Payload), 500, 'text/plain', 'Runner internal error', '', -1);
+            Reply(ReplyToOf(Msg), 500, 'text/plain', 'Runner internal error', '', -1);
           except
           end;
         end;
@@ -498,7 +498,7 @@ begin
         EdgeOK := EdgeTokenOK(Req);
         Body := Req.Get('body', '');
         Query := Req.Get('query', '');
-        if (Req.Get('reply_to', '') <> '') and not IsReservedReplyTopic(Req.Get('reply_to', '')) then
+        if (Req.Get('reply_to', '') <> '') and VDRX_ReplyAllowed(AMsg.SourceID, Req.Get('reply_to', '')) then
           ReplyTo := Req.Get('reply_to', '');
         ParseQuery(Query, Params);
         if Req.Find('params') is TJSONObject then
@@ -590,7 +590,7 @@ var
   RR: TVDRX_RunResult;
   J: TJSONData;
 begin
-  ReplyTo := ReplyToOf(AMsg.Payload);
+  ReplyTo := ReplyToOf(AMsg);
   if FRequireEdgeToken then
   begin
     J := nil;

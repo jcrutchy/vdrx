@@ -115,7 +115,7 @@ begin
   AEnv.Add('SERVER_SOFTWARE=' + VDRX_SERVER_SOFTWARE);
   AEnv.Add('SERVER_PROTOCOL=' + NoCRLF(JStr(AReq, 'protocol', 'HTTP/1.1')));
   AEnv.Add('SERVER_NAME=' + NoCRLF(JStr(AReq, 'server_name', 'localhost')));
-  AEnv.Add('SERVER_PORT=' + JStr(AReq, 'server_port', '80'));
+  AEnv.Add('SERVER_PORT=' + NoCRLF(JStr(AReq, 'server_port', '80')));
   AEnv.Add('REQUEST_METHOD=' + NoCRLF(JStr(AReq, 'method', 'GET')));
   AEnv.Add('REQUEST_URI=' + NoCRLF(JStr(AReq, 'request_uri', JStr(AReq, 'path', '/'))));
   AEnv.Add('SCRIPT_NAME=' + NoCRLF(JStr(AReq, 'script_name', '')));
@@ -129,7 +129,7 @@ begin
   AEnv.Add('QUERY_STRING=' + NoCRLF(JStr(AReq, 'query', '')));
   AEnv.Add('REMOTE_ADDR=' + NoCRLF(JStr(AReq, 'remote_addr', '')));
   AEnv.Add('REMOTE_HOST=' + NoCRLF(JStr(AReq, 'remote_addr', '')));
-  AEnv.Add('REMOTE_PORT=' + JStr(AReq, 'remote_port', ''));
+  AEnv.Add('REMOTE_PORT=' + NoCRLF(JStr(AReq, 'remote_port', '')));
   // php-cgi built with cgi.force_redirect refuses to run unless this is set
   AEnv.Add('REDIRECT_STATUS=200');
   if Https then AEnv.Add('HTTPS=on');
@@ -351,7 +351,7 @@ var
   RR: TVDRX_RunResult;
   Bad: Boolean;
 begin
-  ReplyTo := ReplyToOf(AMsg.Payload);
+  ReplyTo := ReplyToOf(AMsg);
   J := nil;
   try
     J := GetJSON(AMsg.Payload);

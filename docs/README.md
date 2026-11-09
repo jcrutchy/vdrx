@@ -1,25 +1,27 @@
-# Guides
+# Documentation
 
-Task-oriented walkthroughs. Each one has a runnable folder under [`examples/`](../../examples/) -
-**run vdrx from inside that folder** (it reads `vdrx.conf` from the current directory):
+Start with [concepts.md](concepts.md) for the mental model, then pick what you need. Task-oriented walkthroughs
+with a runnable folder under [`examples/`](../examples/) are in [guides/](guides/README.md).
 
-```bash
-./build.sh                      # once, from the repo root -> bin/vdrx
-cd examples/php-cgi
-../../bin/vdrx                  # Windows: ..\..\bin\vdrx.exe
-```
+## Section map
 
-| I want to... | Guide | Example |
+Section numbers (§N) are used across all the pages, in this order:
+
+| § | Page | What it covers |
 |---|---|---|
-| serve static files | [static-web-server.md](static-web-server.md) | `examples/static-site` |
-| run PHP like Apache + mod_php/php-cgi | [php-cgi-web-server.md](php-cgi-web-server.md) | `examples/php-cgi` |
-| run Python (or Perl, shell, any CGI program) | [python-cgi-web-server.md](python-cgi-web-server.md) | `examples/python-cgi` |
-| serve web pages and WebSocket together | [web-and-websocket.md](web-and-websocket.md) | `examples/web-and-websocket` |
-| run a WebSocket server on its own port | [websocket-only.md](websocket-only.md) | `examples/websocket-only` |
-| expose command-line programs as HTTP APIs | [cli-api.md](cli-api.md) | `examples/cli-api` |
-| render HTML from data with templates | [templates.md](templates.md) | `examples/templates` |
-| run programs on a schedule and watch their output live | [../jobs.md](../jobs.md) | `examples/jobs` |
+| 1 | [concepts.md](concepts.md) | The mental model: bus, topics, executives, the four ways to run code |
+| 2 | [processes-and-sockets.md](processes-and-sockets.md) | Supervised `processes` |
+| 3 | [processes-and-sockets.md](processes-and-sockets.md#3-outbound-tcptls---socket_clients) | Outbound TCP/TLS: `socket_clients` |
+| 4 | [http.md](http.md) | HTTP: `http_sites`, `cli_bridges`, CGI (§4a), templates (§4d) |
+| 5 | [websocket.md](websocket.md) | WebSocket: `executives.ws`, `ws_profiles` (§5a) |
+| 6 | [configuration.md](configuration.md) | Everything else in `vdrx.conf` |
+| 7 | [internals.md](internals.md) | Unit map and executive lifetime rules |
+| 8 | [building.md](building.md) | Building and running |
+| 9 | [known-gaps.md](known-gaps.md) | Known gaps and limitations |
+| 10 | [config-viewer.md](config-viewer.md) | The config viewer, `tools/conf_viewer.html` |
+| 11 | [jobs.md](jobs.md) | Scheduled jobs |
+| 12 | [threat-model.md](threat-model.md) | Threat model: assets, actors, controls, review status |
 
-Every example is exercised by `tests/integration/run.sh`, so these pages describe what the code
-actually does. For the full list of options see [../configuration.md](../configuration.md) and
-[../reference.vdrx.conf](../reference.vdrx.conf).
+Also: [legacy-cli-bridges.md](legacy-cli-bridges.md) (the older `cli_bridges` protocols), the
+[full option reference](reference.vdrx.conf), [design notes](design/README.md) (background thinking, not current
+behaviour) and, in the repository root, [SECURITY.md](../SECURITY.md).

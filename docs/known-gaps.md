@@ -31,12 +31,14 @@
 - **Only static files are streamed.** CGI, runner and reverse-proxy responses are still built in
   memory before they are sent (a CGI/runner program is capped by `max_child_output_bytes`), and
   `Range` requests are not supported (a file is always sent whole).
-- **`reply_to` is only blocklisted, not authorised.** Executives that answer to a caller-supplied `reply_to` (templates,
-  runner) refuse the reserved `sys.` and `kernel.` namespaces, but otherwise publish wherever the request says, with the
-  executive as the message source. A client allowed to publish to such a topic can therefore make it publish to any other
-  non-reserved topic, including ones its own profile's `publish_allow` would deny. The admin executive also acts on `sys.>`
-  whatever the message source. Grant `publish_allow` on request topics (e.g. `tpl.in`) only to profiles you trust with
-  every topic those executives could reach.
+- **`reply_to` is bounded for WebSocket profiles only.** A request's `reply_to` is checked against the requester's own
+  `publish_allow` when the requester is a WebSocket connection in profile mode, and `sys.>` / `kernel.>` are always refused.
+  Requests from other sources (HTTP routes, processes, stdin) are unrestricted apart from those reserved namespaces, since
+  those sources are configured by the operator, not by a client. The admin executive also acts on `sys.>` whatever the
+  message source.
+- **Symbolic links under a CGI `doc_root` are followed for scripts.** Static files are checked for symlinks (see
+  `static_follow_symlinks`); a script reached through a link that points outside the doc root is still run. Doc roots are
+  operator-controlled, so keep them free of links to places the web user should not reach.
 - **Programs are not sandboxed.** A CGI program, `cli_bridges` command, job or process runs with the
   daemon's own user, file access and network. The clean environment and output cap limit what a
   *request* can do to the daemon, not what a program the administrator configured can do on the
@@ -53,7 +55,7 @@
   long as they keep reconnecting; put a rate-limiting proxy or firewall in front
   if that matters.
 - The reverse proxy adds no `X-Forwarded-*` headers.
-- CGI output is buffered whole (no streaming), and has no size cap.
+- CGI output is buffered whole (no streaming); it is capped by `max_child_output_bytes` (default 32 MiB).
 
 - **WebSocket authentication.** With no `ws_profiles`, every `sys.auth` is
   rejected unless `executives.ws.allow_open_access` is set (dev only: any
