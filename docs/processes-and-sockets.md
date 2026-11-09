@@ -56,6 +56,14 @@ requests to that address - for an app that already speaks HTTP itself
 (`php -S 127.0.0.1:9101 -t phpapp`, a Node dev server, etc.) rather than
 one you want driven over the bus.
 
+How the proxy behaves: each request opens a fresh connection to the upstream (plain TCP - keep the upstream on
+`127.0.0.1` or a trusted segment) and is sent exactly as validated, with `Connection: close`. The upstream's reply is relayed
+as it came; it is dropped with `502` if it exceeds 64 MiB and with `504` if it does not finish within
+`http_response_timeout_ms`, and a read that stalls for 30 s ends the exchange. A `prefix` ending in `/` covers everything
+under it; one without (`/api`) covers `/api`, `/api/...` and `/api?...` but not `/application` or `/api-admin`. The
+client's own `X-Forwarded-*`, `X-Real-IP` and `Forwarded` headers are passed through untouched and vdrx adds none, so the
+upstream must not trust them for anything security-relevant (see [known-gaps.md](known-gaps.md)).
+
 ---
 
 # 3. Outbound TCP/TLS - `socket_clients`

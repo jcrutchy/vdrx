@@ -6,7 +6,7 @@
 #   tests/integration/run.sh php-cgi ws   run only the named sections
 #
 # Sections: static-site php-cgi python-cgi cli-api templates websocket-only
-#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction limits regress tls-client ws-shared spawn fuzz jobs
+#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction limits regress tls-client proxy ws-shared spawn fuzz jobs
 # Needs: bin/vdrx (./build.sh), curl, python3. php-cgi / php / sort,tr,wc,head,grep
 # are only needed by the sections that use them; those sections skip if missing.
 # Uses ports 8080, 8082, 18080, 18082 - it refuses to run if one is already taken,
@@ -251,6 +251,14 @@ if want tls-client "$@"; then section "tls-client (outbound TLS must check the c
       case "$out" in *"all passed"*) ok "outbound TLS host-name check";; *) bad "outbound TLS host-name check" "see output above";; esac
     fi
   else skip "needs openssl and python3"; fi
+fi
+
+if want proxy "$@"; then section "proxy (reverse proxy and HTTP framing: what is forwarded is exactly what was validated and routed)"
+  d=tests/integration/proxy
+  if need python3 && start $d 18090; then
+    out=$(cd $d && python3 proxy_test.py 2>&1); echo "$out" | sed 's/^/  /'
+    case "$out" in *"all passed"*) ok "reverse proxy and HTTP framing";; *) bad "reverse proxy and HTTP framing" "see output above";; esac
+  fi
 fi
 
 if want ws-shared "$@"; then section "ws-shared (WebSocket on the HTTP port, Origin check, connection cap, no handshake leak)"

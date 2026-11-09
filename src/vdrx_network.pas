@@ -683,7 +683,7 @@ begin
   Result := True;
 end;
 
-function ReadFullRequest(ATransport: TVDRX_Transport; out ATooLarge, ATimedOut: Boolean): string; forward;
+function ReadFullRequest(ATransport: TVDRX_Transport; out ATooLarge, ATimedOut: Boolean; out ABadStatus, ABadWhy: string): string; forward;
 
 function ParseIPv4(const AHost: string; out AAddr: Cardinal): Boolean;
 var
@@ -1794,6 +1794,82 @@ begin
   Result := LowerCase(S);
 end;
 
+// Strict syntax and framing check of a request head (the text before the blank line). Returns '' when it is
+// acceptable, else the status to answer with ('400 Bad Request', '501 Not Implemented'); AWhy says why for the log.
+// On success AContentLength is the body length the request declares (0 if none).
+//
+// This matters because vdrx's front end and whatever is behind it (a reverse-proxied upstream, a CGI program, a
+// proxy in front of vdrx) must agree on where a request ends and what it says. Every rule below closes a way for
+// two parsers to disagree, which is how request smuggling works:
+//   - a bare CR or LF anywhere (some parsers treat it as a line break, others as part of a value)
+//   - a header line starting with space/tab (obsolete line folding), or whitespace before the colon
+//   - a header name that is not a plain token
+//   - more than one Content-Length, or a Content-Length that is not plain decimal digits (FPC's StrToInt would
+//     happily read '$10' or '0x10' as 16)
+//   - any Transfer-Encoding: vdrx does not decode chunked bodies, so it would read the body as empty while a
+//     backend honouring the header reads it as the rest of the stream (RFC 9112 6.1: answer 501)
+function CheckRequestHead(const AHead: string; out AContentLength: Int64; out AWhy: string): string;
+const
+  TokenChars = ['A'..'Z', 'a'..'z', '0'..'9', '!', '#', '$', '%', '&', '''', '*', '+', '-', '.', '^', '_', '`', '|', '~'];
+var
+  i, LineStart, Colon, CLCount, k: Integer;
+  Line, Name, Value: string;
+  c: Char;
+
+  function Bad(const AMsg: string): string;
+  begin
+    AWhy := AMsg;
+    Result := '400 Bad Request';
+  end;
+
+begin
+  Result := '';
+  AWhy := '';
+  AContentLength := 0;
+  CLCount := 0;
+  for i := 1 to Length(AHead) do
+  begin
+    c := AHead[i];
+    if c = #13 then begin if (i = Length(AHead)) or (AHead[i + 1] <> #10) then Exit(Bad('bare CR in the request head')); end
+    else if c = #10 then begin if (i = 1) or (AHead[i - 1] <> #13) then Exit(Bad('bare LF in the request head')); end
+    else if ((c < #32) and (c <> #9)) or (c = #127) then Exit(Bad('control character in the request head'));
+  end;
+  // line 1 is the request line; the header fields start after the first CRLF
+  LineStart := Pos(#13#10, AHead);
+  if LineStart = 0 then Exit;                      // no header fields at all
+  LineStart := LineStart + 2;
+  while LineStart <= Length(AHead) do
+  begin
+    k := PosEx(#13#10, AHead, LineStart);
+    if k = 0 then k := Length(AHead) + 1;
+    Line := Copy(AHead, LineStart, k - LineStart);
+    LineStart := k + 2;
+    if Line = '' then Continue;
+    if Line[1] in [' ', #9] then Exit(Bad('obsolete header line folding'));
+    Colon := Pos(':', Line);
+    if Colon < 2 then Exit(Bad('header line without a name'));
+    Name := Copy(Line, 1, Colon - 1);
+    for k := 1 to Length(Name) do
+      if not (Name[k] in TokenChars) then Exit(Bad('invalid character in a header name (whitespace before the colon?)'));
+    Name := LowerCase(Name);
+    if Name = 'transfer-encoding' then
+    begin
+      AWhy := 'Transfer-Encoding is not supported (chunked request bodies are not decoded)';
+      Exit('501 Not Implemented');
+    end;
+    if Name = 'content-length' then
+    begin
+      Inc(CLCount);
+      Value := Trim(Copy(Line, Colon + 1, MaxInt));
+      if (Value = '') or (Length(Value) > 12) then Exit(Bad('invalid Content-Length'));
+      for k := 1 to Length(Value) do
+        if not (Value[k] in ['0'..'9']) then Exit(Bad('invalid Content-Length'));
+      AContentLength := StrToInt64(Value);
+    end;
+  end;
+  if CLCount > 1 then Exit(Bad('more than one Content-Length header'));
+end;
+
 // True when a comma-separated header value (e.g. "keep-alive, Upgrade") contains AToken.
 function ValueHasToken(const AValue, AToken: string): Boolean;
 var
@@ -1811,11 +1887,12 @@ end;
 //                  just dropped
 // A request cut off in the middle of its body is dropped too, instead of being
 // handled with a shorter body than it declared.
-function ReadFullRequest(ATransport: TVDRX_Transport; out ATooLarge, ATimedOut: Boolean): string;
+function ReadFullRequest(ATransport: TVDRX_Transport; out ATooLarge, ATimedOut: Boolean; out ABadStatus, ABadWhy: string): string;
 var
   Buf: array[0..4095] of Byte;
   Received, HeaderEnd, ContentLength, BodySoFar, ToRead, Used, Cap: Integer;
-  HeaderBlock, CLStr: string;
+  HeaderBlock: string;
+  CL64: Int64;
   StartTick, ReadStart: QWord;
   Armed: Int64;
 
@@ -1847,6 +1924,8 @@ begin
   Result := '';
   ATooLarge := False;
   ATimedOut := False;
+  ABadStatus := '';
+  ABadWhy := '';
   HeaderEnd := 0;
   StartTick := GetTickCount64;
   Armed := 0;
@@ -1872,13 +1951,28 @@ begin
     Move(Buf[0], Result[Length(Result) - Received + 1], Received);
     HeaderEnd := Pos(#13#10#13#10, Result);
   end;
-  if HeaderEnd = 0 then Exit;
+  if HeaderEnd = 0 then
+  begin
+    if Length(Result) >= MAX_HEADER_SIZE then
+    begin
+      ABadStatus := '431 Request Header Fields Too Large';
+      ABadWhy := 'request head longer than ' + IntToStr(MAX_HEADER_SIZE) + ' bytes';
+      Exit('');
+    end;
+    Exit;
+  end;
+  if HeaderEnd - 1 > MAX_HEADER_SIZE then
+  begin
+    ABadStatus := '431 Request Header Fields Too Large';
+    ABadWhy := 'request head longer than ' + IntToStr(MAX_HEADER_SIZE) + ' bytes';
+    Exit('');
+  end;
 
   HeaderBlock := Copy(Result, 1, HeaderEnd - 1);
-  CLStr := ExtractHeaderValue(HeaderBlock, 'Content-Length');
-  ContentLength := 0;
-  if CLStr <> '' then
-    ContentLength := StrToIntDef(Trim(CLStr), 0);
+  ABadStatus := CheckRequestHead(HeaderBlock, CL64, ABadWhy);
+  if ABadStatus <> '' then Exit('');
+  if CL64 > MAX_BODY_SIZE then CL64 := Int64(MAX_BODY_SIZE) + 1;
+  ContentLength := Integer(CL64);
   if ContentLength > MAX_BODY_SIZE then
   begin
     // Previously this just clamped ContentLength and kept reading: the
@@ -1928,6 +2022,10 @@ begin
     Inc(BodySoFar, Received);
   end;
   SetLength(Result, Used);
+  // Anything that arrived beyond the declared body is not part of this request (a second, pipelined request,
+  // or an attempt to smuggle one): it must never be handed on - the reverse proxy forwards the raw bytes.
+  if Length(Result) > HeaderEnd + 3 + ContentLength then
+    SetLength(Result, HeaderEnd + 3 + ContentLength);
 end;
 
 // A Windows 8.3 short-name alias: up to 6 name characters, '~', digits, and an optional extension of
@@ -2163,6 +2261,18 @@ begin
   end;
 end;
 
+// Does APath fall under APrefix? A prefix that ends in '/' covers everything below it. One that does not
+// ("/app") covers "/app", "/app/x" and "/app?x" but NOT "/application" or "/app-admin": matching a bare string
+// prefix would hand those other paths to the route (and, for a reverse proxy, forward them upstream).
+function PathUnderPrefix(const APath, APrefix: string): Boolean;
+var
+  n: Integer;
+begin
+  n := Length(APrefix);
+  if (n = 0) or (Copy(APath, 1, n) <> APrefix) then Exit(False);
+  Result := (APrefix[n] = '/') or (Length(APath) = n) or (APath[n + 1] in ['/', '?']);
+end;
+
 function MatchProxyRoute(const APath: string; const ARoutes: TVDRX_ProxyRoutes; out AMatch: TVDRX_ProxyRoute): Boolean;
 var
   i, bestLen: Integer;
@@ -2170,7 +2280,7 @@ begin
   Result := False;
   bestLen := -1;
   for i := 0 to High(ARoutes) do
-    if (Copy(APath, 1, Length(ARoutes[i].Prefix)) = ARoutes[i].Prefix) and (Length(ARoutes[i].Prefix) > bestLen) then
+    if PathUnderPrefix(APath, ARoutes[i].Prefix) and (Length(ARoutes[i].Prefix) > bestLen) then
     begin
       AMatch := ARoutes[i];
       bestLen := Length(ARoutes[i].Prefix);
@@ -2178,24 +2288,28 @@ begin
     end;
 end;
 
+// Rebuilds the request head for the upstream with 'Connection: close' (one request per upstream connection).
+// Line endings are written as CRLF explicitly: TStringList.Text joins with the PLATFORM line ending, which on
+// Linux is a bare LF - a malformed request that strict upstreams refuse and lenient ones read differently.
 function ForceConnectionClose(const ARequest: string): string;
 var
-  HeaderEnd, i: Integer;
-  OutLines: TStringList;
+  HeaderEnd, LineStart, k: Integer;
+  Line: string;
 begin
   HeaderEnd := Pos(#13#10#13#10, ARequest);
   if HeaderEnd = 0 then Exit(ARequest);
-  OutLines := TStringList.Create;
-  try
-    OutLines.Text := Copy(ARequest, 1, HeaderEnd - 1);
-    for i := OutLines.Count - 1 downto 0 do
-      if Pos('connection:', LowerCase(OutLines[i])) = 1 then
-        OutLines.Delete(i);
-    OutLines.Add('Connection: close');
-    Result := OutLines.Text + #13#10 + Copy(ARequest, HeaderEnd + 4, MaxInt);
-  finally
-    OutLines.Free;
+  Result := '';
+  LineStart := 1;
+  while LineStart <= HeaderEnd do
+  begin
+    k := PosEx(#13#10, ARequest, LineStart);
+    if (k = 0) or (k > HeaderEnd) then k := HeaderEnd + 1;
+    Line := Copy(ARequest, LineStart, k - LineStart);
+    LineStart := k + 2;
+    if (Result <> '') and (Pos('connection:', LowerCase(Line)) = 1) then Continue;   // never drop the request line
+    Result := Result + Line + #13#10;
   end;
+  Result := Result + 'Connection: close' + #13#10 + #13#10 + Copy(ARequest, HeaderEnd + 4, MaxInt);
 end;
 
 function ProxyRequest(const ARequest: string; const ARoute: TVDRX_ProxyRoute;
@@ -2203,13 +2317,19 @@ function ProxyRequest(const ARequest: string; const ARoute: TVDRX_ProxyRoute;
 const
   MAX_CONNECT_ATTEMPTS = 5;
   RETRY_DELAY_MS = 150;
+  MAX_PROXY_RESPONSE = 64 * 1024 * 1024;   // an upstream that never stops sending must not be able to fill our memory
+  UPSTREAM_READ_MS = 30000;                // ...nor one that accepts the request and then goes silent hold a thread
 var
   Transport: TVDRX_Transport;
   Buf: array[0..8191] of Byte;
-  Received, Attempt: Integer;
+  Received, Attempt, Used: Integer;
   Outgoing: string;
+  Deadline: QWord;
+  TooBig, TimedOut: Boolean;
 begin
   Transport := nil;
+  TooBig := False;
+  TimedOut := False;
   for Attempt := 1 to MAX_CONNECT_ATTEMPTS do
   begin
     Transport := ConnectTCP(ARoute.Host, ARoute.Port);
@@ -2225,19 +2345,39 @@ begin
 
   try
     Outgoing := ForceConnectionClose(ARequest);
+    Transport.SetReadTimeout(UPSTREAM_READ_MS);
+    if HTTPResponseTimeoutMs > 0 then Deadline := GetTickCount64 + QWord(HTTPResponseTimeoutMs) else Deadline := 0;
     Transport.Write(Outgoing[1], Length(Outgoing));
     Result := '';
+    Used := 0;
     repeat
       Received := Transport.Read(Buf[0], SizeOf(Buf));
       if Received > 0 then
       begin
-        SetLength(Result, Length(Result) + Received);
-        Move(Buf[0], Result[Length(Result) - Received + 1], Received);
+        if Used + Received > MAX_PROXY_RESPONSE then begin TooBig := True; Break; end;
+        // grow the buffer geometrically: SetLength on every 8 KiB chunk recopies the whole response each time,
+        // which is quadratic - a 60 MB response would take minutes
+        if Used + Received > Length(Result) then SetLength(Result, Used + Received + Used div 2 + 65536);
+        Move(Buf[0], Result[Used + 1], Received);
+        Inc(Used, Received);
+        if (Deadline > 0) and (GetTickCount64 > Deadline) then begin TimedOut := True; Break; end;
       end;
     until Received <= 0;
+    SetLength(Result, Used);
   finally
     Transport.Close;
     Transport.Free;
+  end;
+
+  if TooBig then
+  begin
+    ABus.Publish('log.error', Format('http proxy: response from %s:%d exceeds %d bytes - dropped', [ARoute.Host, ARoute.Port, MAX_PROXY_RESPONSE]), ASourceID);
+    Exit(PlainResponse('502 Bad Gateway', 'text/plain', 'Upstream response too large'));
+  end;
+  if TimedOut then
+  begin
+    ABus.Publish('log.warn', Format('http proxy: response from %s:%d did not finish in time - dropped', [ARoute.Host, ARoute.Port]), ASourceID);
+    Exit(PlainResponse('504 Gateway Timeout', 'text/plain', 'Upstream took too long'));
   end;
 
   if Result = '' then
@@ -2255,7 +2395,7 @@ begin
   Result := False;
   bestLen := -1;
   for i := 0 to High(ARoutes) do
-    if (Copy(APath, 1, Length(ARoutes[i].Prefix)) = ARoutes[i].Prefix) and (Length(ARoutes[i].Prefix) > bestLen) then
+    if PathUnderPrefix(APath, ARoutes[i].Prefix) and (Length(ARoutes[i].Prefix) > bestLen) then
     begin
       AMatch := ARoutes[i];
       bestLen := Length(ARoutes[i].Prefix);
@@ -3114,15 +3254,30 @@ var
   StreamSize: Int64;
   Deadline: QWord;
   TooLarge, TimedOut: Boolean;
+  BadStatus, BadWhy: string;
 begin
   TooLarge := False;
   TimedOut := False;
+  BadStatus := '';
+  BadWhy := '';
   if ARequest <> '' then
     Request := ARequest
   else
-    Request := ReadFullRequest(FTransport, TooLarge, TimedOut);
+    Request := ReadFullRequest(FTransport, TooLarge, TimedOut, BadStatus, BadWhy);
 
-  if TooLarge then
+  if BadStatus <> '' then
+  begin
+    Bus.Publish('log.warn', 'http: rejected request - ' + BadStatus + ': ' + BadWhy, FSourceID);
+    Response := PlainResponse(BadStatus, 'text/plain', BadStatus + #10);
+    Sent := 0;
+    while Sent < Length(Response) do
+    begin
+      N := FTransport.Write(Response[Sent + 1], Length(Response) - Sent);
+      if N <= 0 then Break;
+      Inc(Sent, N);
+    end;
+  end
+  else if TooLarge then
   begin
     Bus.Publish('log.warn', 'http: request body exceeds the configured limit - 413', FSourceID);
     Response := PlainResponse('413 Payload Too Large', 'text/plain',

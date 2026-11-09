@@ -25,6 +25,10 @@ bodies, and the absence of per-topic access control beyond `ws_profiles`.
 - Template names are plain file names and `reply_to` values in `sys.>` / `kernel.>` are refused, so a client that may publish
   to a template or runner topic cannot read files outside the template directory or reach `sys.quit` / `sys.kill*` through them,
   and a profile's `reply_to` is limited to topics its own `publish_allow` matches.
+- Every HTTP request head is validated before it is routed (no bare CR/LF, no obsolete line folding, one strict
+  `Content-Length`, no `Transfer-Encoding`, at most 16 KiB), and bytes beyond the declared body are discarded, so the reverse
+  proxy forwards exactly the request that was routed and nothing a client pipelined behind it. Proxy responses are capped
+  (64 MiB) and time-limited.
 - URL paths are split segment by segment and refused if they contain `..`, NUL, `\`, `:`, dot-files, their Windows 8.3 aliases
   (`GIT~1`), device names (`con`, `nul`, `com1`...) or a trailing dot/space; every CGI environment value has CR, LF and NUL
   stripped, and a `Proxy` header never becomes `HTTP_PROXY`.

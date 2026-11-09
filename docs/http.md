@@ -92,6 +92,15 @@ short-name aliases (`GIT~1`, `PROGRA~1.TXT` - NTFS's names for `.git` and
 any extension, on every platform) or segments ending in `.`/space are refused
 with 403.
 
+**What the HTTP front end accepts.** Every request head is checked before anything else sees it, because vdrx and
+whatever is behind it (a proxied upstream, a CGI program) must agree on where a request ends and what it says.
+A request is refused - `400`, or `501` for `Transfer-Encoding` - if it has: a bare CR or LF or any other control
+character in the head; a header line starting with space/tab (obsolete line folding) or with whitespace before the colon;
+a header name that is not a plain token; more than one `Content-Length`, or one that is not plain decimal digits; or any
+`Transfer-Encoding` (chunked request bodies are not supported, so a client that streams an upload must send a
+`Content-Length`). A head over 16 KiB gets `431`. Bytes that arrive beyond the declared body (a pipelined second request)
+are discarded, never forwarded: every connection answers one request and closes.
+
 The program is started from an argument vector (never a shell):
 `command` + `args`, with `%%script%%` replaced by the absolute script path -
 so the example above runs `php-cgi /www/mysite/index.php`. With `command` ""

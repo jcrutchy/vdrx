@@ -79,6 +79,18 @@ Status: **Mitigated** (a control exists and a test exercises it), **Partly** (a 
 | Crash from a use-after-free when connections end while messages are in flight | Executives are reference counted; a connection leaving the registry waits for the dispatcher to finish with it (`UnregisterSelf` and `Unregister` follow the same rule - see [internals.md](internals.md)) | Mitigated *(a real crash, found and fixed in hardening 9)* | `limits` (repeated runs before and after the fix) |
 | Slow shutdown | Documented | Open | - |
 
+### 4.1a HTTP framing and the reverse proxy
+
+| Threat | Control | Status | Test |
+|---|---|---|---|
+| **Request smuggling to an upstream:** a second request pipelined behind a legitimate one reaches a backend vdrx never meant to expose | The buffer is cut to `head + Content-Length`; everything after is discarded; every connection serves one request and closes *(found and fixed in hardening 9: the extra bytes were forwarded)* | Mitigated | `proxy` |
+| vdrx and a backend (or a proxy in front) disagreeing on where a request ends | Heads with bare CR/LF, control characters, obsolete line folding, whitespace before the colon, non-token header names, repeated or non-decimal `Content-Length` (FPC would read `$10` and `0x10` as 16) or any `Transfer-Encoding` are refused 400/501 *(hardening 9)* | Mitigated | `proxy`, `limits` |
+| A malformed request forwarded on Linux | The forwarded head is rebuilt with explicit CRLF *(the old code used the platform line ending, so on Linux every proxied request had bare LFs, which strict upstreams refuse and lenient ones parse differently)* | Mitigated | `proxy` |
+| A route prefix capturing look-alike paths (`/api` also taking `/api-admin`) | A prefix without a trailing slash matches only itself, `/x` and `?x` | Mitigated | `proxy` |
+| A hostile or broken upstream: endless or huge response, or going silent | Response capped at 64 MiB (502) and by `http_response_timeout_ms` (504); a 30 s idle read limit; the buffer grows geometrically *(it was quadratic: a 60 MB reply took minutes)* | Mitigated | `proxy` |
+| Client-supplied `X-Forwarded-For` / `X-Real-IP` believed by an upstream | Passed through unchanged; vdrx adds none | Open: the upstream must not trust them (see known-gaps) | - |
+| Upstream traffic read or altered on the wire | Plain TCP to the upstream | Open by design: keep upstreams on `127.0.0.1` or a trusted segment | - |
+
 ### 4.2 Authentication and the privilege boundary on the bus
 
 | Threat | Control | Status | Test |
@@ -160,20 +172,20 @@ Reviewed so far (code read plus tests; findings in the "found and fixed" rows ab
 - HTTP listener limits, static file serving, URL path handling
 - Registry and dispatcher lifetime rules; the template executive; the runner (argument expansion, batch guard); the CGI adaptor (environment, script resolution)
 - The jobs executive's client-facing side (what a client can influence); the logger; outbound TLS in `socket_clients`
+- The HTTP request reader and the reverse-proxy routes (framing, forwarding, prefix matching, response bounds)
 - `tools/conf_viewer.html` and `tools/jobs_terminal.html` (every `innerHTML` use)
 
 **Not yet reviewed - treat as unassessed, not as safe:**
 
 - The legacy `cli_bridges` protocols (`vdrx_bridge.pas`) and the way jobs spawn and stop their processes
 - How a hostile remote server's data is bounded in `socket_clients` (the certificate check is done; line and frame limits are not reviewed)
-- The reverse-proxy routes (what is forwarded, header handling, request smuggling)
 - The stdin admin console (`stdin_admin_enabled`, on by default) and the bucket recorder
 - Anything on Windows beyond unit tests (the TLS path and the batch-file guard in particular)
 - The stress and manual stall suites on the latest code
 
 ## 7. Recommended next steps, in order
 
-1. Finish the review list above, starting with the reverse proxy and the data limits on `socket_clients`.
+1. Finish the review list above, starting with the data limits on `socket_clients`, the stdin admin console and the bucket recorder.
 2. Give the admin executive a source check, so `sys.>` is protected even if a future executive forgets `VDRX_ReplyAllowed`.
 3. Hash tokens at rest and add an optional expiry, or move to a per-client credential.
 4. Set a minimum TLS version and cipher policy explicitly; test TLS on Windows.
