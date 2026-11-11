@@ -9,8 +9,7 @@ program test_spawn;
 //   fpc -Mobjfpc -Fu../../src test_spawn.lpr ; ./test_spawn        (exit code 0 = all passed)
 
 uses
-  {$IFDEF UNIX}cthreads,{$ENDIF}
-  Classes, SysUtils, fpjson, jsonparser, vdrx_cgi, openssl, {$IFDEF UNIX}dynlibs,{$ENDIF} vdrx_procutil, vdrx_runner, vdrx_network;
+  {$IFDEF UNIX}cthreads, {$ENDIF}   Classes, SysUtils, fpjson, jsonparser, vdrx_cgi, openssl, {$IFDEF UNIX}dynlibs, {$ENDIF} vdrx_procutil, vdrx_runner, vdrx_transport, vdrx_httpparse;
 
 var
   Passed, Failed: Integer;
@@ -209,6 +208,21 @@ begin
 end;
 {$ENDIF}
 
+procedure TestPHPOptionQuery;
+begin
+  WriteLn('-- php-cgi query strings shaped like command-line options');
+  Check(CGIQueryLooksLikeOptions('-s', '/usr/bin/php-cgi'), '?-s (CVE-2012-1823) is refused');
+  Check(CGIQueryLooksLikeOptions('-d+auto_prepend_file%3dphp://input', 'php-cgi'), '?-d+... with an encoded = is refused');
+  Check(CGIQueryLooksLikeOptions('%2ds', 'C:\\php\\php-cgi.exe'), 'an encoded leading hyphen is refused');
+  Check(CGIQueryLooksLikeOptions('%ADd+allow_url_include%3d1+-d+auto_prepend_file%3dphp://input', 'php-cgi.exe'), 'soft hyphen %AD (CVE-2024-4577) is refused');
+  Check(CGIQueryLooksLikeOptions(#$AD + 'd', 'php-cgi'), 'a raw 0xAD byte is refused');
+  Check(not CGIQueryLooksLikeOptions('a=1&b=-2', 'php-cgi'), 'a normal query with = is untouched');
+  Check(not CGIQueryLooksLikeOptions('-s=1', 'php-cgi'), 'a leading - with a literal = is untouched (php-cgi does not treat it as options)');
+  Check(not CGIQueryLooksLikeOptions('page', 'php-cgi'), 'a bare word is untouched');
+  Check(not CGIQueryLooksLikeOptions('', 'php-cgi'), 'an empty query is untouched');
+  Check(not CGIQueryLooksLikeOptions('-s', '/usr/bin/python3'), 'other programs are not affected');
+end;
+
 begin
   Passed := 0; Failed := 0;
   {$IFDEF UNIX}TestOpenSSL;{$ENDIF}
@@ -218,6 +232,7 @@ begin
   TestStatic;
   TestURLPaths;
   TestCGIEnv;
+  TestPHPOptionQuery;
   WriteLn;
   WriteLn(Passed, ' passed, ', Failed, ' failed');
   if Failed > 0 then Halt(1);

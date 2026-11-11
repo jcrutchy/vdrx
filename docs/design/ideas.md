@@ -14,7 +14,7 @@ Based on VDRX’s clean separation of concerns (a unified pub/sub bus + supervis
    * *Feature:* A `retained: true` flag on publish (or designated topic prefix like `state.>`). The Registry caches the last message published to that topic and immediately pushes it to any new matching subscriber upon registration.
 
 3. **In-Core Request/Reply (`ReplyTo` & `CorrelationId`)**
-   * *Problem:* `PublishAndWait` in `vdrx_network.pas` manually creates dynamic one-shot executives (`TVDRX_OneShotWaiter`) on topics like `http.reply.42`.
+   * *Problem:* `PublishAndWait` in `vdrx_httproute.pas` manually creates dynamic one-shot executives (`TVDRX_OneShotWaiter`) on topics like `http.reply.42`.
    * *Feature:* Add native fields to `TVDRX_Message`: `ReplyTo: string` and `CorrelationID: string`. The Kernel could offer a lightweight non-allocating rendezvous map so executives don’t need to register and unregister temporary executives in `TVDRX_Registry`.
 
 4. **Queue Bounding and Backpressure**

@@ -3,10 +3,7 @@ program test_socket_stall;
 {$mode objfpc}{$H+}
 
 uses
-  {$IFDEF UNIX}
-  cthreads,
-  {$ENDIF}
-  SysUtils, Classes, vdrx_core, vdrx_network, vdrx_logger, vdrx_procutil;
+  {$IFDEF UNIX}   cthreads, {$ENDIF}   SysUtils, Classes, vdrx_core, vdrx_socketclient, vdrx_logger, vdrx_procutil;
 
 var
   Kernel: TVDRX_Kernel;

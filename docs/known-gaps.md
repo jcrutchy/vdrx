@@ -1,4 +1,4 @@
-# 9. Known gaps
+# Known gaps
 
 - **The Origin check is not a defence against DNS rebinding.** A WebSocket
   handshake from a browser is refused unless its `Origin` names the same host as
@@ -11,8 +11,6 @@
   `executives.ws.max_connections` limits live WebSocket connections across the
   WS port and every HTTP site's `websocket_path` together. While one is being
   upgraded it also occupies an HTTP connection slot, briefly.
-- **One config path.** vdrx always reads `vdrx.conf` from the current
-  directory; there is no `--config` option.
 - HTTP is one request per connection (`Connection: close`): no keep-alive, no
   chunked *request* bodies, no `Expect: 100-continue`, no Range/ETag/caching
   headers on static files, no compression. Fine behind a real proxy or for
@@ -59,8 +57,6 @@
   attacker who fills those slots can still deny service to everyone else for as
   long as they keep reconnecting; put a rate-limiting proxy or firewall in front
   if that matters.
-- The reverse proxy adds no `X-Forwarded-*` headers.
-- CGI output is buffered whole (no streaming); it is capped by `max_child_output_bytes` (default 32 MiB).
 
 - **WebSocket authentication.** With no `ws_profiles`, every `sys.auth` is
   rejected unless `executives.ws.allow_open_access` is set (dev only: any

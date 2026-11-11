@@ -5,7 +5,7 @@ unit vdrx_bridge;
 interface
 
 uses
-  Classes, SysUtils, SyncObjs, Process, fpjson, jsonparser, DateUtils, vdrx_core, vdrx_procutil;
+  Classes, SysUtils, SyncObjs, Process, fpjson, jsonparser, DateUtils, vdrx_core, vdrx_procutil, vdrx_linebuf;
 
 
 type
@@ -45,6 +45,7 @@ type
     FOldestPendingAt: TDateTime;
     FOldestPendingSet: Boolean;
     FSendStallMs: Integer;
+    FMaxLineBytes: Integer;
 
     function IsPublishAllowed(const ATopic: string): Boolean;
     function TryParseStructuredLine(const ALine: string; out ATopic, APayload: string): Boolean;
@@ -88,6 +89,10 @@ type
     // 5000ms; set from vdrx.conf's per-process "send_stall_ms" if a
     // particular child is expected to go quiet longer than that.
     property SendStallMs: Integer read FSendStallMs write FSendStallMs;
+    // Longest stdout line accepted from the child (default 1 MiB). A longer line is
+    // dropped with a log.warn - the child is not killed - so a runaway program cannot
+    // make the daemon buffer without limit.
+    property MaxLineBytes: Integer read FMaxLineBytes write FMaxLineBytes;
     // Current child PID, or 0 if no process is currently running - used by
     // vdrx_admin.pas's 'sys.kill' to find "which bridge owns this PID".
     function CurrentPID: Integer;
@@ -118,6 +123,7 @@ begin
   FMaxRestartDelayMs := 30000;
   FGracefulTimeoutMs := 5000;
   FSendStallMs := 5000;
+  FMaxLineBytes := VDRX_DEFAULT_MAX_LINE_BYTES;
   FStopping := False;
   FRestartPolicy := 'always';
   FPublishPatterns := '';
@@ -323,81 +329,63 @@ const
   BufSize = 4096;
 var
   Buf: array[0..BufSize - 1] of Byte;
-  Received, p, SegStart: Integer;
-  Line, LineBuf, StructTopic, StructPayload, ChunkStr, Segment: string;
+  Received, i: Integer;
+  Line, StructTopic, StructPayload: string;
+  Assembler: TVDRX_LineBuffer;
+  Lines: TStringList;
   Proc: TProcess;
 begin
   FillChar(Buf, SizeOf(Buf), 0);
-  LineBuf := '';
   FProcessLock.Enter;
   Proc := FProcess;
   FProcessLock.Leave;
-  // Reads in BufSize-byte chunks instead of one byte (one syscall) at a
-  // time - under high-volume output (log-heavy or JSON-streaming child
-  // processes) the old per-character Read was a real CPU cost. The loop no
-  // longer keys off Proc.Running either: that let it exit the instant a
-  // short-lived process finished, even if there was still unread output
-  // sitting in the OS pipe buffer, silently dropping it. Now it keeps
-  // reading - and processing whatever comes back - until a Read genuinely
-  // comes back empty AND the process has exited, so buffered trailing
-  // output is drained before the loop stops.
-  while (not FStopping) and Assigned(Proc) do
-  begin
-    Received := Proc.Output.Read(Buf, SizeOf(Buf));
-    if Received > 0 then
+  Assembler := TVDRX_LineBuffer.Create(FMaxLineBytes);
+  Lines := TStringList.Create;
+  try
+    // Reads in BufSize-byte chunks (one syscall per chunk, not per byte). The loop does
+    // not key off Proc.Running: that would exit the instant a short-lived process
+    // finished even with unread output still in the OS pipe buffer. It keeps reading
+    // until a Read comes back empty AND the process has exited, so trailing output is
+    // drained. Line assembly (and the per-line length limit) is TVDRX_LineBuffer's job:
+    // O(n) per chunk, and a line longer than MaxLineBytes is dropped rather than buffered.
+    while (not FStopping) and Assigned(Proc) do
     begin
-      // Scan the whole chunk for line breaks and append one segment per
-      // line (minus any bare CRs) instead of growing LineBuf one character
-      // at a time: under FPC's copy-on-write strings, per-character
-      // concatenation makes assembling a single long line (a verbose tool's
-      // one-line output, a stack trace) an O(n^2) cost in that line's
-      // length. This is O(n) per chunk regardless of how few lines it
-      // contains.
-      SetString(ChunkStr, PAnsiChar(@Buf[0]), Received);
-      SegStart := 1;
-      for p := 1 to Length(ChunkStr) do
+      Received := Proc.Output.Read(Buf, SizeOf(Buf));
+      if Received > 0 then
       begin
-        if ChunkStr[p] = #10 then
+        Lines.Clear;
+        if Assembler.Feed(Buf, Received, Lines) then
+          Bus.Publish('log.warn', Format(
+            'bridge %s: dropped an output line longer than max_line_bytes (%d); %d dropped so far',
+            [ID, Assembler.MaxLineBytes, Assembler.Dropped]), ID);
+        for i := 0 to Lines.Count - 1 do
         begin
-          Segment := Copy(ChunkStr, SegStart, p - SegStart);
-          if Pos(#13, Segment) > 0 then
-            Segment := StringReplace(Segment, #13, '', [rfReplaceAll]);
-          LineBuf := LineBuf + Segment;
-          SegStart := p + 1;
-
-          Line := Trim(LineBuf);
-          LineBuf := '';
-          if Line <> '' then
+          Line := Trim(Lines[i]);
+          if Line = '' then Continue;
+          if TryParseStructuredLine(Line, StructTopic, StructPayload) then
           begin
-            if TryParseStructuredLine(Line, StructTopic, StructPayload) then
-            begin
-              if IsPublishAllowed(StructTopic) then
-                Bus.Publish(StructTopic, StructPayload, ID)
-              else
-              begin
-                Bus.Publish('log.warn', Format(
-                  'bridge %s: rejected publish to "%s" - not covered by its publish patterns, falling back to %s.out',
-                  [ID, StructTopic, ID]), ID);
-                Bus.Publish(ID + '.out', Line, ID);
-              end;
-            end
+            if IsPublishAllowed(StructTopic) then
+              Bus.Publish(StructTopic, StructPayload, ID)
             else
-              Bus.Publish(ID + '.out', Line, ID); // plain text - process output re-enters the bus, namespaced by this executive's ID
-          end;
+            begin
+              Bus.Publish('log.warn', Format(
+                'bridge %s: rejected publish to "%s" - not covered by its publish patterns, falling back to %s.out',
+                [ID, StructTopic, ID]), ID);
+              Bus.Publish(ID + '.out', Line, ID);
+            end;
+          end
+          else
+            Bus.Publish(ID + '.out', Line, ID); // plain text - process output re-enters the bus, namespaced by this executive's ID
         end;
-      end;
-      if SegStart <= Length(ChunkStr) then
-      begin
-        Segment := Copy(ChunkStr, SegStart, Length(ChunkStr) - SegStart + 1);
-        if Pos(#13, Segment) > 0 then
-          Segment := StringReplace(Segment, #13, '', [rfReplaceAll]);
-        LineBuf := LineBuf + Segment;
-      end;
-    end
-    else if not Proc.Running then
-      Break // no data waiting and the process is gone - genuinely done, not just quiet
-    else
-      Sleep(20);
+      end
+      else if not Proc.Running then
+        Break // no data waiting and the process is gone - genuinely done, not just quiet
+      else
+        Sleep(20);
+    end;
+  finally
+    Lines.Free;
+    Assembler.Free;
   end;
 end;
 

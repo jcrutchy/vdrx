@@ -14,7 +14,7 @@ binary configured by one JSON file (`vdrx.conf`, with includes and variables).
 ```bash
 ./build.sh                       # Windows: build.bat, or open src/vdrx.lpi in Lazarus   -> bin/vdrx
 cd examples/static-site          # every example is a folder with its own vdrx.conf
-../../bin/vdrx                   # vdrx reads vdrx.conf from the CURRENT directory
+../../bin/vdrx                   # reads vdrx.conf from the CURRENT directory (or: vdrx --config <file>)
 # browse to http://localhost:8080/
 ```
 

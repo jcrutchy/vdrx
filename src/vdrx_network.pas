@@ -6,7 +6,7 @@ interface
 
 uses
   Classes, SysUtils, StrUtils, Sockets, SyncObjs, Process, vdrx_core,
-  vdrx_config, vdrx_templates, vdrx_procutil, Generics.Collections,
+  vdrx_config, vdrx_templates, vdrx_procutil, vdrx_linebuf, Generics.Collections,
   openssl, resolve, {$IFDEF UNIX}BaseUnix,{$ENDIF} dynlibs, base64, sha1, fpjson, jsonparser, DateUtils, RegExpr, Types;
 
 type
@@ -435,6 +435,7 @@ type
     FFraming: string;
     FDelimiter: string;
     FChunkSize: Integer;
+    FMaxLineBytes: Integer;
     FReconnectPolicy: string;
     FReconnectDelayMs, FMaxReconnectDelayMs: Integer;
     FGracefulTimeoutMs: Integer;
@@ -476,6 +477,9 @@ type
     property Framing: string read FFraming write FFraming;
     property Delimiter: string read FDelimiter write FDelimiter;
     property ChunkSize: Integer read FChunkSize write FChunkSize;
+    // Longest line accepted in "delimiter" framing; a peer that sends more without a
+    // newline is disconnected (default 1 MiB, see vdrx_linebuf.pas).
+    property MaxLineBytes: Integer read FMaxLineBytes write FMaxLineBytes;
     property ReconnectPolicy: string read FReconnectPolicy write FReconnectPolicy;
     property PublishTopic: string read FPublishTopic write FPublishTopic;
     property ReconnectDelayMs: Integer read FReconnectDelayMs write FReconnectDelayMs;
@@ -4506,6 +4510,7 @@ begin
   FFraming := 'delimiter';
   FDelimiter := #13#10;
   FChunkSize := 4096;
+  FMaxLineBytes := VDRX_DEFAULT_MAX_LINE_BYTES;
   FReconnectPolicy := 'auto';
   FReconnectDelayMs := 500;
   FMaxReconnectDelayMs := 30000;
@@ -4638,60 +4643,72 @@ const
 var
   Buf: array[0..BufSize - 1] of Byte;
   Received, i: Integer;
-  LineBuf, Line: string;
-  Ch: Char;
+  Assembler: TVDRX_LineBuffer;
+  Lines: TStringList;
   Transport: TVDRX_Transport;
   ChunkBuf: string;
 begin
-  LineBuf := '';
-  while not FStopping do
-  begin
-    FTransportLock.Enter;
-    Transport := FTransport;
-    FTransportLock.Leave;
-    if not Assigned(Transport) then Break;
+  Assembler := TVDRX_LineBuffer.Create(FMaxLineBytes);
+  Lines := TStringList.Create;
+  try
+    while not FStopping do
+    begin
+      FTransportLock.Enter;
+      Transport := FTransport;
+      FTransportLock.Leave;
+      if not Assigned(Transport) then Break;
 
-    if FFraming = 'chunk' then
-    begin
-      SetLength(ChunkBuf, FChunkSize);
-      Received := Transport.Read(ChunkBuf[1], FChunkSize);
-      if Received > 0 then
-        Bus.Publish(FPublishTopic, Copy(ChunkBuf, 1, Received), ID)
-      else
+      if FFraming = 'chunk' then
       begin
-        FTransportLock.Enter;
-        FConnected := False;
-        FTransportLock.Leave;
-        Break;
-      end;
-    end
-    else
-    begin
-      Received := Transport.Read(Buf, SizeOf(Buf));
-      if Received > 0 then
-      begin
-        for i := 0 to Received - 1 do
+        SetLength(ChunkBuf, FChunkSize);
+        Received := Transport.Read(ChunkBuf[1], FChunkSize);
+        if Received > 0 then
+          Bus.Publish(FPublishTopic, Copy(ChunkBuf, 1, Received), ID)
+        else
         begin
-          Ch := Chr(Buf[i]);
-          if Ch = #10 then
-          begin
-            Line := LineBuf;
-            LineBuf := '';
-            if Line <> '' then
-              Bus.Publish(FPublishTopic, Line, ID);
-          end
-          else if Ch <> #13 then
-            LineBuf := LineBuf + Ch;
+          FTransportLock.Enter;
+          FConnected := False;
+          FTransportLock.Leave;
+          Break;
         end;
       end
       else
       begin
-        FTransportLock.Enter;
-        FConnected := False;
-        FTransportLock.Leave;
-        Break;
+        Received := Transport.Read(Buf, SizeOf(Buf));
+        if Received > 0 then
+        begin
+          Lines.Clear;
+          if Assembler.Feed(Buf, Received, Lines) then
+          begin
+            // Deliver what was complete before the oversized line, then cut the connection:
+            // a peer that will not send a newline is misbehaving or hostile, and reconnecting
+            // (per the reconnect policy) gives it a clean slate.
+            for i := 0 to Lines.Count - 1 do
+              if Lines[i] <> '' then Bus.Publish(FPublishTopic, Lines[i], ID);
+            Bus.Publish('log.warn', Format(
+              'socket client %s: peer sent a line longer than max_line_bytes (%d) - disconnecting',
+              [ID, Assembler.MaxLineBytes]), ID);
+            FTransportLock.Enter;
+            FConnected := False;
+            FTransportLock.Leave;
+            Break;
+          end;
+          for i := 0 to Lines.Count - 1 do
+            if Lines[i] <> '' then
+              Bus.Publish(FPublishTopic, Lines[i], ID);
+        end
+        else
+        begin
+          FTransportLock.Enter;
+          FConnected := False;
+          FTransportLock.Leave;
+          Break;
+        end;
       end;
     end;
+  finally
+    Lines.Free;
+    Assembler.Free;
   end;
 end;
 

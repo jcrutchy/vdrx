@@ -57,6 +57,9 @@ work, with a warning). The older `cli_bridges` protocols (`cgi`, `bus`,
 }
 ```
 
+- **Command line:** `vdrx [-c|--config <file>] [-h|--help]`. Without `--config`
+  vdrx loads `vdrx.conf` from the current directory. The named file must exist.
+  `reload` and a `restart` use the same file.
 - `shutdown_grace_ms` - default grace period before a hung child is
   force-killed; per-entry `graceful_timeout_ms` overrides it.
 - `stdin_admin_enabled` - type `quit`/`restart`/`reload`/`kill <id>`/

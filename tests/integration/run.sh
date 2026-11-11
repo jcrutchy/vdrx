@@ -6,10 +6,10 @@
 #   tests/integration/run.sh php-cgi ws   run only the named sections
 #
 # Sections: static-site php-cgi python-cgi cli-api templates websocket-only
-#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction limits regress tls-client proxy ws-shared spawn fuzz jobs
+#           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction limits regress tls-client proxy ws-shared spawn fuzz jobs line-limits cli-args
 # Needs: bin/vdrx (./build.sh), curl, python3. php-cgi / php / sort,tr,wc,head,grep
 # are only needed by the sections that use them; those sections skip if missing.
-# Uses ports 8080, 8082, 18080, 18082 - it refuses to run if one is already taken,
+# Uses ports 8080, 8082, 18080-18090 (and 18701 for a fake server) - it refuses to run if one is already taken,
 # and only ever stops the daemon it started itself.
 cd "$(dirname "$0")/../.." || exit 1
 ROOT=$(pwd); BIN="$ROOT/bin/vdrx"; [ -x "$BIN" ] || BIN="$ROOT/bin/vdrx.exe"; PIDFILE=/tmp/vdrx_it.pid; OUT=/tmp/vdrx_it.out
@@ -251,6 +251,41 @@ if want tls-client "$@"; then section "tls-client (outbound TLS must check the c
       case "$out" in *"all passed"*) ok "outbound TLS host-name check";; *) bad "outbound TLS host-name check" "see output above";; esac
     fi
   else skip "needs openssl and python3"; fi
+fi
+
+if want line-limits "$@"; then section "line-limits (max_line_bytes: a peer or child that never sends a newline cannot make the daemon buffer without limit)"
+  d=tests/integration/line-limits
+  rm -f $d/bucket.jsonl
+  if need python3 && start $d 18084; then
+    out=$(cd $d && python3 line_limits_test.py 2>&1); echo "$out" | sed 's/^/  /'
+    case "$out" in *"all passed"*) ok "over-long lines are dropped, not buffered";; *) bad "over-long lines are dropped, not buffered" "see output above";; esac
+  fi
+fi
+
+if want cli-args "$@"; then section "cli-args (--config picks another configuration file; the file must exist; unknown arguments are refused)"
+  stop
+  out=$("$BIN" --config /nonexistent/vdrx.conf 2>&1); rc=$?
+  [ $rc -eq 1 ] && ok "--config with a missing file: exit 1" || bad "--config with a missing file: exit 1" "rc=$rc"
+  expect "...and it names the file" "$out" "configuration file not found: /nonexistent/vdrx.conf"
+  out=$("$BIN" --bogus 2>&1); rc=$?
+  [ $rc -eq 2 ] && ok "unknown argument: exit 2" || bad "unknown argument: exit 2" "rc=$rc"
+  expect "...and it says which" "$out" 'unknown argument "--bogus"'
+  out=$("$BIN" --config 2>&1); rc=$?
+  [ $rc -eq 2 ] && ok "--config without a value: exit 2" || bad "--config without a value: exit 2" "rc=$rc"
+  out=$("$BIN" --help 2>&1); rc=$?
+  [ $rc -eq 0 ] && ok "--help: exit 0" || bad "--help: exit 0" "rc=$rc"
+  expect "...and prints usage" "$out" "Usage: vdrx"
+  if up 8080; then echo "port 8080 is already in use - stop that program first"; exit 2; fi
+  # Run from the repo root (which has no vdrx.conf) with the example's file named explicitly. The log must appear in
+  # the CURRENT directory, and the site must answer: the config was read from the named path, not from the cwd.
+  tmp=$(mktemp -d); cp -r examples/static-site/. "$tmp/"; mv "$tmp/vdrx.conf" "$tmp/other.conf"
+  ( cd "$tmp" && rm -f vdrx_daemon.log && $SETSID nohup "$BIN" -c other.conf >"$OUT" 2>&1 </dev/null & echo $! >"$PIDFILE" )
+  n=0; until up 8080; do n=$((n+1)); [ $n -gt 50 ] && break; sleep .2; done
+  if up 8080; then
+    expect "-c other.conf: the site from that file is served" "$(curl -s --max-time 3 http://127.0.0.1:8080/)" "<"
+    [ -f "$tmp/vdrx_daemon.log" ] && ok "log is written to the current directory" || bad "log is written to the current directory" "no vdrx_daemon.log"
+  else bad "-c other.conf: daemon did not open port 8080" "$(head -3 "$OUT")"; fi
+  stop; rm -rf "$tmp"
 fi
 
 if want proxy "$@"; then section "proxy (reverse proxy and HTTP framing: what is forwarded is exactly what was validated and routed)"

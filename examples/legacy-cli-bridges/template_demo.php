@@ -35,7 +35,7 @@ $name = !empty($qs['name']) ? (string)$qs['name'] : 'World';
 $response = [
     'status'         => 200,
     'template'       => 'greeting',
-    // Explicit routing (see vdrx_network.pas's BuildBusCLIResponse and
+    // Explicit routing (see vdrx_runner.pas's BuildBusCLIResponse and
     // vdrx_templates.pas's TVDRX_TemplateExecutive): this publishes the
     // render request to the "admin_templates" template executive's own
     // topic, wherever this script happens to be running from, rather than

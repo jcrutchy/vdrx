@@ -15,7 +15,7 @@ Include the version/commit, your configuration (with secrets removed) and steps 
 
 The assets, actors, controls and review status are laid out in [docs/threat-model.md](docs/threat-model.md); the list of
 known weaknesses is [docs/known-gaps.md](docs/known-gaps.md). Security-relevant items there include
-WebSocket authentication defaults, plain-text token comparison, logging of request
+WebSocket authentication defaults, tokens stored in plain text in the config (they are compared in constant time), logging of request
 bodies, and the absence of per-topic access control beyond `ws_profiles`.
 
 ## Operating guidance

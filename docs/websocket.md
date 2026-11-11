@@ -116,7 +116,7 @@ a JSON string. `tests/integration/ws/` has a black-box test (`ws_test.py`).
 **Internally**, a connection is actually two cooperating executives, not
 one - purely an implementation detail (the JSON-RPC surface above is
 unchanged either way), but worth knowing if you're reading logs or
-`vdrx_network.pas` itself:
+`vdrx_websocket.pas` itself:
 
 - `TVDRX_WSConnection` - pure connectivity. Owns the socket, does the
   handshake, frames messages, keeps the ping/pong heartbeat alive, and

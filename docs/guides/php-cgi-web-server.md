@@ -42,6 +42,10 @@ A `cgi` entry is a small executive plus the HTTP route that feeds it. For a URL 
    `Set-Cookie:` headers, a blank line, the body. That is why `header()`, `setcookie()` and
    `http_response_code()` just work.
 
+   vdrx also refuses (400) any request to a PHP interpreter whose query string has no literal `=` and starts with `-` / `%2d`
+   or contains a soft hyphen (`%AD`) or `+-`: php-cgi reads such a query string as command-line options (CVE-2012-1823, and
+   CVE-2024-4577 on Windows). A genuine query like `?a=1` or `?page` is unaffected. Keep PHP up to date as well.
+
 `$_GET`, `$_POST`, `$_COOKIE`, `$_FILES` and `$_SERVER` are filled in by php-cgi itself from that environment.
 Binary uploads and binary responses are carried intact.
 

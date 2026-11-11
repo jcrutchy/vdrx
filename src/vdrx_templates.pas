@@ -56,7 +56,7 @@ type
   // guessing which of several plausible working directories that was
   // relative to; "C:\dev\vdrx\templates\greeting.tpl not found" doesn't -
   // see the public Dir property, used by RunBusCLIScript's own error
-  // messages in vdrx_network.pas for the same reason.
+  // messages in vdrx_httproute.pas for the same reason.
   TVDRX_TemplateStore = class
   private
     FLock: TCriticalSection;
@@ -94,7 +94,7 @@ type
 
 // Flattens a JSON object's scalar members into a Name=Value TStringList -
 // the shape Fill's AParams expects. Shared (declared once here, used by both
-// vdrx_templates.pas's own TVDRX_TemplateExecutive and vdrx_network.pas's
+// vdrx_templates.pas's own TVDRX_TemplateExecutive and vdrx_httproute.pas's
 // BuildBusCLIResponse) so the "which JSON value types count as a usable
 // param" rule can't drift between the two call sites. Non-scalar members
 // (nested objects/arrays) are skipped; AParamsObj may be nil (empty
@@ -118,7 +118,7 @@ type
   // in the readme's §2: an HTTP site's own template_dir is still perfectly
   // fine for simple cases (a bus-CLI reply's plain "template" field renders
   // in-process, no bus round trip - see BuildBusCLIResponse in
-  // vdrx_network.pas), but anything that wants to name a SPECIFIC template
+  // vdrx_httproute.pas), but anything that wants to name a SPECIFIC template
   // set explicitly, regardless of which HTTP site's connection happens to
   // be asking, publishes a render request to this executive's own
   // subscribed topic instead (a bus-CLI reply's "template_topic" field -

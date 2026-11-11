@@ -26,7 +26,7 @@ type
   //   sys.history  - payload is "<bucket name> [count]" (count defaults to
   //                  20). Prints the last <count> entries from that
   //                  bucket's history file - see vdrx_bucket.pas.
-  // Not authenticated - see vdrx_admincmd.pas for what feeds these topics
+  // Not authenticated - see vdrx_admin.pas for what feeds these topics
   // (stdin today; written to be reusable by any future text-command
   // source) and why that's deliberate for now.
   TVDRX_AdminExecutive = class(TVDRX_Executive)

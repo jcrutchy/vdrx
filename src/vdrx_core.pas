@@ -84,7 +84,7 @@ type
     // needs to do I/O that can be slow, queue it and hand it to its own
     // worker thread instead (see TVDRX_BridgeExecutive/
     // TVDRX_SocketClientExecutive/TVDRX_WSConnection's EnqueueLine+SendLoop
-    // pairs in vdrx_bridge.pas/vdrx_network.pas for the established shape).
+    // pairs in vdrx_bridge.pas/vdrx_socketclient.pas for the established shape).
     // TVDRX_Kernel.Execute times every call and logs a log.warn past
     // HANDLEPACKET_WARN_MS as a tripwire for a future violation of this.
     procedure HandlePacket(const AMsg: TVDRX_Message); virtual; abstract;
@@ -690,7 +690,7 @@ begin
   // stopped what it owned. Small race window here: a concurrent Register(AID,...)
   // could re-add a *different* executive under AID before ExtractPair above runs,
   // which would then be silently dropped - acceptable for now (nothing here is
-  // authenticated or under heavy concurrency yet, see vdrx_admincmd.pas).
+  // authenticated or under heavy concurrency yet, see vdrx_admin.pas).
   Exec.Shutdown;
   // We took Exec out of the tables (see ExtractPair above), so nobody new can find it. The dispatcher
   // may still hold a reference from a snapshot it took earlier: then IT frees Exec when it lets go.
@@ -906,7 +906,7 @@ const
   // HandlePacket contracts as "must not block" (see TVDRX_Executive's
   // comment) - every implementation in this codebase now only ever
   // enqueues onto its own async send thread instead of doing I/O inline
-  // (see vdrx_bridge.pas's and vdrx_network.pas's SendLoop/EnqueueLine
+  // (see vdrx_bridge.pas's and vdrx_connection.pas's SendLoop/EnqueueLine
   // pairs). This threshold is deliberately generous relative to that - a
   // compliant HandlePacket should return in well under 1ms - so tripping
   // it means some executive (present or future) is violating the

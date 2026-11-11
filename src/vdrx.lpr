@@ -3,30 +3,7 @@ program vdrx;
 {$mode objfpc}{$H+}
 
 uses
-  {$IFDEF UNIX}
-  cthreads,
-  {$ENDIF}
-  Classes,
-  StrUtils,
-  SysUtils,
-  Process,
-  fpjson,
-  jsonparser,
-  RegExpr,
-  vdrx_core,
-  vdrx_config,
-  vdrx_admin,
-  vdrx_logger,
-  vdrx_stdin,
-  vdrx_bridge,
-  vdrx_bucket,
-  vdrx_network,
-  vdrx_templates,
-  vdrx_runner,
-  vdrx_cgi,
-  vdrx_jobs,
-  vdrx_procutil
-  {$IFDEF UNIX}, BaseUnix{$ENDIF};
+  {$IFDEF UNIX}   cthreads, {$ENDIF}   Classes, StrUtils, SysUtils, Process, fpjson, jsonparser, RegExpr, vdrx_core, vdrx_config, vdrx_linebuf, vdrx_admin, vdrx_logger, vdrx_stdin, vdrx_bridge, vdrx_bucket, vdrx_transport, vdrx_httpparse, vdrx_connection, vdrx_websocket, vdrx_httproute, vdrx_http, vdrx_socketclient, vdrx_templates, vdrx_runner, vdrx_cgi, vdrx_jobs, vdrx_procutil   {$IFDEF UNIX}, BaseUnix{$ENDIF};
 
 type
   // Polls GShutdownRequested (vdrx_procutil.pas) from ordinary thread
@@ -55,6 +32,7 @@ type
 var
   Kernel: TVDRX_Kernel;
   Config: TVDRX_Config;
+  ConfigFile: string;
   Admin: TVDRX_AdminExecutive;
   Logger: TVDRX_LoggerExecutive;
   Stdin: TVDRX_StdinExecutive;
@@ -117,7 +95,7 @@ begin
     WriteLn('  ', AName, ' TLS configured on port ', AListener.TLSPort, ' (a failure to load the certificate is logged as an error).');
 end;
 
-// A random, per-process secret (see GVDRXEdgeToken in vdrx_network.pas) that
+// A random, per-process secret (see GVDRXEdgeToken in vdrx_httproute.pas) that
 // nothing outside this process ever sees - two GUIDs concatenated for 256
 // bits, which is plenty: its job is to stop a non-HTTP bus publisher from
 // impersonating the HTTP edge, not to resist an attacker who already has
@@ -163,6 +141,7 @@ begin
       Bridge.Command := Row.Values['command'];
       BridgeGraceMs := StrToIntDef(Row.Values['graceful_timeout_ms'], AGracefulMs);
       Bridge.GracefulTimeoutMs := BridgeGraceMs;
+      Bridge.MaxLineBytes := VDRX_ClampMaxLineBytes(StrToIntDef(Row.Values['max_line_bytes'], 0));
 
       RestartRaw := Row.Values['restart'];
       if RestartRaw = '' then RestartRaw := 'always';
@@ -520,7 +499,7 @@ begin
         end;
         Exec.SetExtraEnv(Env);
         Exec.RequireEdgeToken := True;
-        Exec.EdgeToken := vdrx_network.GVDRXEdgeToken;
+        Exec.EdgeToken := vdrx_httproute.GVDRXEdgeToken;
         ARegistry.Register(Exec, Id, InTopic);
 
         JSONArrayToList(Row.Values['extensions#json'], Exts);
@@ -705,7 +684,7 @@ begin
         Run.GraceMs := AGracefulMs;
         Run.PublishTopic := Id + '.out';
         Run.RequireEdgeToken := True;
-        Run.EdgeToken := vdrx_network.GVDRXEdgeToken;
+        Run.EdgeToken := vdrx_httproute.GVDRXEdgeToken;
         ARegistry.Register(Run, Id, InTopic);
         ARoutes[n].TimeoutMs := TimeoutMs + 2000;   // let the runner's own 504 arrive first
         WriteLn('  cli_bridges "', Id, '" (bus): deprecated - now a runner (envelope mode) + http route: ',
@@ -722,7 +701,7 @@ begin
         Cgi.PublishTopic := Id + '.out';
         Cgi.RawOutput := True;
         Cgi.RequireEdgeToken := True;
-        Cgi.EdgeToken := vdrx_network.GVDRXEdgeToken;
+        Cgi.EdgeToken := vdrx_httproute.GVDRXEdgeToken;
         ARegistry.Register(Cgi, Id, InTopic);
         ARoutes[n].Kind := 'cgi';
         ARoutes[n].DocRoot := ExpandFileName(Row.Values['script_dir']);
@@ -1015,6 +994,7 @@ begin
       Client.Framing := FramingRaw;
       Client.Delimiter := IfThen(Row.Values['delimiter'] <> '', Row.Values['delimiter'], #13#10);
       Client.ChunkSize := StrToIntDef(Row.Values['chunk_size'], 4096);
+      Client.MaxLineBytes := VDRX_ClampMaxLineBytes(StrToIntDef(Row.Values['max_line_bytes'], 0));
 
       ReconnectRaw := Row.Values['reconnect'];
       if ReconnectRaw = '' then ReconnectRaw := 'auto';
@@ -1192,11 +1172,63 @@ begin
     '. Bus: sched.<id>, jobs.run / jobs.kill / jobs.list -> jobs.state, job.<id>.start/out/err/exit.');
 end;
 
+// Command line:  vdrx [-c|--config <file>] [-h|--help]
+// Returns the configuration file to load: the --config argument, or 'vdrx.conf' in the
+// current directory. Anything else on the command line is a fatal usage error rather than
+// being ignored, so a typo cannot silently start the daemon on the wrong configuration.
+function ParseCommandLine: string;
+var
+  i: Integer;
+  Arg: string;
+begin
+  Result := 'vdrx.conf';
+  i := 1;
+  while i <= ParamCount do
+  begin
+    Arg := ParamStr(i);
+    if (Arg = '-h') or (Arg = '--help') or (Arg = '-?') then
+    begin
+      WriteLn('Usage: vdrx [-c|--config <file>]');
+      WriteLn('  -c, --config <file>   configuration file to load (default: vdrx.conf in the current directory)');
+      WriteLn('  -h, --help            show this help');
+      WriteLn('Relative paths inside the configuration are resolved against the current directory,');
+      WriteLn('not the configuration file''s directory; use {MAIN_CONF_DIR} to refer to the latter.');
+      Halt(0);
+    end
+    else if (Arg = '-c') or (Arg = '--config') then
+    begin
+      Inc(i);
+      if (i > ParamCount) or (ParamStr(i) = '') then
+      begin
+        WriteLn('FATAL: ', Arg, ' needs a file name (see --help)');
+        Halt(2);
+      end;
+      Result := ParamStr(i);
+    end
+    else if Copy(Arg, 1, 9) = '--config=' then
+    begin
+      Result := Copy(Arg, 10, MaxInt);
+      if Result = '' then
+      begin
+        WriteLn('FATAL: --config= needs a file name (see --help)');
+        Halt(2);
+      end;
+    end
+    else
+    begin
+      WriteLn('FATAL: unknown argument "', Arg, '" (see --help)');
+      Halt(2);
+    end;
+    Inc(i);
+  end;
+end;
+
 begin
 
-  if FileExists('vdrx.conf') = false then
+  ConfigFile := ParseCommandLine;
+  if not FileExists(ConfigFile) then
   begin
-    WriteLn('FATAL: vdrx.conf not found');
+    WriteLn('FATAL: configuration file not found: ', ConfigFile);
     Halt(1);
   end;
 
@@ -1204,7 +1236,7 @@ begin
     InstallShutdownSignalHandler;
     Kernel := TVDRX_Kernel.Create;
 
-    Config := TVDRX_Config.Create('vdrx.conf');
+    Config := TVDRX_Config.Create(ConfigFile);
     if not Config.Loaded then
       raise Exception.Create('configuration errors in ' + ExpandFileName(Config.FilePath)
         + LineEnding + Config.LastErrors);
@@ -1269,7 +1301,7 @@ begin
       Kernel.Registry.Register(WS, 'ws', 'sys.none');
     end;
 
-    vdrx_network.GVDRXEdgeToken := GenerateEdgeToken;
+    vdrx_httproute.GVDRXEdgeToken := GenerateEdgeToken;
     WriteLn('  Edge token: generated (keeps non-HTTP bus publishers from impersonating the HTTP edge for cgi/bus routes).');
 
     SetupWSProfiles(Config, WS);

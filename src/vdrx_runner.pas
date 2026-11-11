@@ -65,7 +65,7 @@ type
     function ExpandArgs(AParams: TStringList; ADest: TStrings; out AError: string): Boolean;
     function ReplyToOf(const AMsg: TVDRX_Message): string;
     // True unless RequireEdgeToken is set and ARequest is not a JSON object
-    // carrying "_edge_token" = EdgeToken. See GVDRXEdgeToken in vdrx_network.pas
+    // carrying "_edge_token" = EdgeToken. See GVDRXEdgeToken in vdrx_httproute.pas
     // for why this exists: it is what stops a non-HTTP bus publisher from
     // impersonating the HTTP edge for a route wired through this executive.
     function EdgeTokenOK(ARequest: TJSONObject): Boolean;

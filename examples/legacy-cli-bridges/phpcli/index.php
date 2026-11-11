@@ -8,7 +8,7 @@
  * file under its "script_dir" ("phpcli"), spawns the configured "command"
  * (plain "php", not "php-cgi") with this file's path as its one argument,
  * and sets a handful of CGI env vars before reading its raw stdout back
- * verbatim as the response body - see RunCLIScript in vdrx_network.pas.
+ * verbatim as the response body - see RunCLIScript in vdrx_runner.pas.
  *
  * Because the command is plain "php" rather than "php-cgi", the CGI SAPI's
  * automatic $_GET/$_POST/$_SERVER population never kicks in - read the env

@@ -1,7 +1,7 @@
 # Guides
 
 Task-oriented walkthroughs. Each one has a runnable folder under [`examples/`](../../examples/) -
-**run vdrx from inside that folder** (it reads `vdrx.conf` from the current directory):
+**run vdrx from inside that folder** (by default it reads `vdrx.conf` from the current directory; `--config <file>` picks another):
 
 ```bash
 ./build.sh                      # once, from the repo root -> bin/vdrx

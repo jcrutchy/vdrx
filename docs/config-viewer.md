@@ -16,7 +16,10 @@ Give it a read-mostly profile, e.g. the `viewer` entry in [`reference.vdrx.conf`
 **Files over the bus.** *Open via bus…* and *Load includes* read config
 files from the machine running vdrx: the viewer publishes to `confserver.in`
 and the `confserver` runner (`tools/confserver.php`) answers on the
-viewer's own `viewer.reply.*` topic. The script only serves `.conf`/`.json`
+viewer's own `viewer.reply.*` topic. The profile must therefore be allowed to publish to
+`viewer.reply.*` as well as `confserver.in` (as in `reference.vdrx.conf`): a request's `reply_to`
+is refused unless the requester could publish to that topic itself, and a profile with only
+`confserver.in` gets no answer and the viewer times out. The script only serves `.conf`/`.json`
 files below the `$roots` listed at its top - edit that list for projects
 outside the vdrx folder. Open the root conf via the bus first so relative
 include paths resolve against its real folder.

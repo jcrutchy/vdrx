@@ -18,7 +18,7 @@ type
   //
   // Deliberately full history, not "latest value per topic": every message
   // is appended, nothing is overwritten or summarized. Retrieval is the
-  // "history" admin command (see vdrx_admin.pas / vdrx_admincmd.pas), not
+  // "history" admin command (see vdrx_admin.pas), not
   // automatic replay onto the bus at startup - replaying an entire history
   // would re-fire whatever every current subscriber does in response to
   // each message, which for something like an old sys.kill would be

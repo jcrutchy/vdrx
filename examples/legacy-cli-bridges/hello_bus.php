@@ -7,7 +7,7 @@
  * doesn't get CGI env vars or a per-path script file lookup - it gets
  * spawned fresh, reads exactly ONE JSON line off STDIN describing the
  * whole request, and must write exactly ONE JSON line back to STDOUT
- * before exiting. See RunBusCLIScript's comment in vdrx_network.pas for
+ * before exiting. See RunBusCLIScript's comment in vdrx_runner.pas for
  * the full contract; the short version:
  *
  *   stdin  (one line): {"method":"GET","path":"/hello/channel/%23blah",

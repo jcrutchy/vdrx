@@ -17,11 +17,25 @@ package is **not** needed: FPC's `openssl` unit only looks for the unversioned
 temporary link that it removes again, and logs one line saying so. If TLS
 still does not start, the log says why: `TLS port ... NOT started`.)
 
-**Running.** vdrx reads `vdrx.conf` from the *current directory* (there is no
-command-line option for a different path) and writes `vdrx_daemon.log` there.
-Relative paths in the config (`static_dir`, `doc_root`, `script_dir`, runner and
-process commands) resolve against that same directory. So you run it from the
-folder that holds the config:
+**Hardened and paranoid builds.** `HARDEN=1 ./build.sh` links a position-independent
+executable with full RELRO (ASLR for the main image). FreePascal's RTL still
+contributes some text relocations, so check `readelf -d bin/vdrx` against your
+distribution's or SELinux policy before relying on it. `PARANOID=1 ./build.sh tests`
+adds range, overflow, stack and virtual-call checks (slower; run the unit tests,
+`tests/run.sh` and the fuzzer with it to flush out memory bugs - the current suite
+passes with no findings). The default build is neither.
+
+**Running.** By default vdrx reads `vdrx.conf` from the *current directory* and
+writes `vdrx_daemon.log` there. To use a different file, pass `-c <file>` /
+`--config <file>` (or `--config=<file>`); it must exist or vdrx stops with
+`configuration file not found`, and `-h` / `--help` prints the usage. Any other
+argument is an error, so a typo cannot silently start vdrx on the wrong
+configuration. Relative paths in the config (`static_dir`, `doc_root`,
+`script_dir`, runner and process commands) resolve against the *current
+directory*, not against the config file's folder - use `{MAIN_CONF_DIR}` in a
+path when you want it anchored to the config file. So either run vdrx from the
+folder that holds the config, or give it `--config` and start it from the folder
+the relative paths are meant for:
 
 ```bash
 cd examples/php-cgi

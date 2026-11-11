@@ -12,6 +12,8 @@ set OPTS=-Mobjfpc -Sh -O1 -Fusrc -FUbuild\units -FEbin
 "%FPC%" %OPTS% src\vdrx.lpr || exit /b 1
 if /i "%1"=="tests" (
   "%FPC%" %OPTS% tests\unit\test_jsonconf.lpr || exit /b 1
+  "%FPC%" %OPTS% tests\unit\test_linebuf.lpr || exit /b 1
+  "%FPC%" %OPTS% tests\unit\test_topiccover.lpr || exit /b 1
   for %%t in (test_stall test_socket_stall) do "%FPC%" %OPTS% tests\manual\%%t.lpr || exit /b 1
   "%FPC%" %OPTS% tests\stress\vdrx_stress.lpr || exit /b 1
 )

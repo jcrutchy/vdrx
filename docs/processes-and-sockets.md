@@ -33,6 +33,13 @@ config - handy for keeping a handful of alternates around (see the
 `socket_clients` example below, which does exactly this for
 soylentnews vs. libera).
 
+`max_line_bytes` (default 1048576 = 1 MiB, allowed 1024 - 67108864) bounds how
+long one stdout line may be. A longer line is dropped, with a `log.warn`
+(`bridge <id>: dropped an output line longer than max_line_bytes ...`); the
+lines on either side of it are delivered normally and the process is left
+running. Without a limit, a child that printed endlessly without a newline would
+grow the daemon's memory until it failed.
+
 **Queue groups - `queue_group`**: give two or more `processes` entries
 (each still needs its own `id`) the same `queue_group` name and a matching
 `subscribe` filter, and each published message goes to exactly one member
@@ -89,6 +96,13 @@ Raw bytes in become `<id>.out` on the bus (line-delimited by default -
 matching `subscribe` gets written to the socket. `reconnect`: `"auto"`
 (default, with `reconnect_delay_ms`/`max_reconnect_delay_ms` backoff) |
 `"never"`.
+
+`max_line_bytes` (default 1048576 = 1 MiB, allowed 1024 - 67108864) bounds how
+much of an unfinished line vdrx will hold in `delimiter` framing. A peer that
+sends more than that without a newline is disconnected (`socket client <id>:
+peer sent a line longer than max_line_bytes ... - disconnecting` in the log) and
+the usual `reconnect` policy applies; lines that completed before the oversized
+one are still delivered. `chunk` framing is bounded by `chunk_size` instead.
 
 This is deliberately dumb - it doesn't know IRC exists. All the NICK/USER/
 PING-PONG/JOIN protocol logic lives entirely in the `irc_bot` process

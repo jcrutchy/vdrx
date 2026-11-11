@@ -226,7 +226,7 @@ $('#wc').onclick=()=>{if(ws){ws.close();return}
   else if(f.topic!==undefined){const r=req[f.topic];if(r){delete req[f.topic];clearTimeout(r.t);const e=f.payload||{};+e.status===200?r.ok(e.body):r.no(new Error(`${e.status} ${String(e.body||'').trim()||'(no detail)'}`))}else pend.push(f)}};
  ws.onclose=()=>{if(ws===me){ws=null;authed=false}$('#wc').textContent='Go live';wsS('disconnected');sys('disconnected')};ws.onerror=()=>wsS('connection error')};
 // ---- reading conf files from the vdrx host: publish to confserver.in, wait for the reply on our own topic
-const fetchConf=path=>new Promise((ok,no)=>{if(!ws||!authed)return no(new Error('go live first (needs a profile allowed to publish confserver.in)'));
+const fetchConf=path=>new Promise((ok,no)=>{if(!ws||!authed)return no(new Error('go live first (needs a profile allowed to publish confserver.in and viewer.reply.*)'));
  const t='viewer.reply.'+Math.random().toString(36).slice(2,9);req[t]={ok,no,t:setTimeout(()=>{delete req[t];no(new Error('timeout - is the confserver runner configured?'))},8000)};
  ws.send(JSON.stringify({method:'publish',topic:'confserver.in',payload:{reply_to:t,params:{file:path}}}))}).then(b=>{const j=JSON.parse(b);return{path:j.path,obj:JSON.parse(j.text.replace(/^\uFEFF/,''))}});
 const dirOf=p=>p.replace(/[^\/]*$/,'').replace(/\/$/,''),isAbs=p=>/^([A-Za-z]:)?\//.test(p);

@@ -172,20 +172,23 @@ Reviewed so far (code read plus tests; findings in the "found and fixed" rows ab
 - HTTP listener limits, static file serving, URL path handling
 - Registry and dispatcher lifetime rules; the template executive; the runner (argument expansion, batch guard); the CGI adaptor (environment, script resolution)
 - The jobs executive's client-facing side (what a client can influence); the logger; outbound TLS in `socket_clients`
+- php-cgi option injection: when the CGI program is a PHP interpreter, a query string with no literal `=` that starts with `-`, `%2d` or contains a soft hyphen (`%AD` / `0xAD`) or `+-` is refused with 400 (CVE-2012-1823 / CVE-2024-4577 class; `CGIQueryLooksLikeOptions`). Still keep PHP current: this is a second layer, not a replacement for patching
+- `ws_profiles` allow rules: `TopicFilterCovers` is checked exhaustively against the bus matcher over 24,025 pattern pairs (`tests/unit/test_topiccover.lpr`) and never grants more than the allow pattern; it over-denies a few shapes such as allow `a.>` for filter `a`, which is the safe direction
+- Line-length bounds on every newline-delimited reader: `socket_clients` and supervised-process stdout (`max_line_bytes`, default 1 MiB; an over-long line is dropped, and a socket peer that sends one is disconnected) and the stdin admin console (4096 bytes); `jobs` already split long output lines. Tests: `tests/unit/test_linebuf.lpr`, integration section `line-limits`
 - The HTTP request reader and the reverse-proxy routes (framing, forwarding, prefix matching, response bounds)
 - `tools/conf_viewer.html` and `tools/jobs_terminal.html` (every `innerHTML` use)
 
 **Not yet reviewed - treat as unassessed, not as safe:**
 
 - The legacy `cli_bridges` protocols (`vdrx_bridge.pas`) and the way jobs spawn and stop their processes
-- How a hostile remote server's data is bounded in `socket_clients` (the certificate check is done; line and frame limits are not reviewed)
-- The stdin admin console (`stdin_admin_enabled`, on by default) and the bucket recorder
+- Whether `chunk` framing in `socket_clients` (bounded by `chunk_size`, but each chunk is published as one bus message) needs its own rate limit
+- The bucket recorder (`vdrx_bucket.pas`): file path handling and rotation under failure
 - Anything on Windows beyond unit tests (the TLS path and the batch-file guard in particular)
 - The stress and manual stall suites on the latest code
 
 ## 7. Recommended next steps, in order
 
-1. Finish the review list above, starting with the data limits on `socket_clients`, the stdin admin console and the bucket recorder.
+1. Finish the review list above, starting with the bucket recorder and the legacy `cli_bridges` protocols.
 2. Give the admin executive a source check, so `sys.>` is protected even if a future executive forgets `VDRX_ReplyAllowed`.
 3. Hash tokens at rest and add an optional expiry, or move to a per-client credential.
 4. Set a minimum TLS version and cipher policy explicitly; test TLS on Windows.

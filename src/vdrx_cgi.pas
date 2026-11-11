@@ -10,7 +10,7 @@ unit vdrx_cgi;
 //   php-cgi, python, perl, a compiled .cgi / .exe ... are just consumers: they
 //   neither know nor care that a message bus sits between them and the browser.
 //
-// Request envelope (what the HTTP edge publishes; see vdrx_network.pas):
+// Request envelope (what the HTTP edge publishes; see vdrx_httproute.pas):
 //   { "method", "path", "query", "headers": {..}, "body" | "body_b64",
 //     "protocol", "remote_addr", "remote_port", "server_name", "server_port",
 //     "https", "request_uri",
@@ -74,6 +74,14 @@ procedure BuildCGIEnv(AReq: TJSONObject; const ABody: string; AEnv: TStrings);
 function ParseCGIOutput(const AOutput: string; out AStatus: Integer;
   out AContentType: string; AHeaders: TStrings; out ABody: string): Boolean;
 
+// php-cgi (and some other CGI programs) treat a query string WITHOUT a literal '=' as command-line
+// options: "?-s" prints source, "?-d+auto_prepend_file=..." changes settings (CVE-2012-1823), and on
+// Windows a soft hyphen (0xAD, %AD or UTF-8 C2 AD) is best-fit mapped to '-' to get past the old fix
+// (CVE-2024-4577). True when AExe is a PHP interpreter and AQuery has the shape of such an attack, so
+// the request is refused before the program is started. Ordinary queries ("?a=1", "?page", "?x-y")
+// are untouched.
+function CGIQueryLooksLikeOptions(const AQuery, AExe: string): Boolean;
+
 implementation
 
 { ---- request side ---------------------------------------------------------- }
@@ -95,6 +103,21 @@ begin
   Result := S;
   for i := 1 to Length(Result) do
     if Result[i] in [#0, #10, #13] then Result[i] := ' ';
+end;
+
+function CGIQueryLooksLikeOptions(const AQuery, AExe: string): Boolean;
+var
+  Exe, Q: string;
+begin
+  Result := False;
+  Exe := LowerCase(ExtractFileName(StringReplace(AExe, '\', '/', [rfReplaceAll])));
+  if Pos('php', Exe) = 0 then Exit;
+  if Pos('=', AQuery) > 0 then Exit;
+  Q := LowerCase(AQuery);
+  if (Q = '') then Exit;
+  if (Q[1] = '-') or (Copy(Q, 1, 3) = '%2d') or (Q[1] = #$AD) then Exit(True);
+  if (Pos('%ad', Q) > 0) or (Pos(#$AD, Q) > 0) or (Pos('+-', Q) > 0) or (Pos('%2b-', Q) > 0)
+    or (Pos('+%2d', Q) > 0) then Exit(True);
 end;
 
 procedure BuildCGIEnv(AReq: TJSONObject; const ABody: string; AEnv: TStrings);
@@ -431,6 +454,13 @@ begin
       end;
       for i := CommandParts.Count - 1 downto 1 do
         Args.Insert(0, CommandParts[i]);
+    end;
+
+    if CGIQueryLooksLikeOptions(Req.Get('query', ''), Exe) then
+    begin
+      Bus.Publish('log.warn', 'cgi ' + ID + ': refused a query string shaped like php-cgi command-line options (CVE-2012-1823 / CVE-2024-4577 class) for ' + ScriptFile, ID);
+      Reply(ReplyTo, 400, 'text/plain', 'Bad Request', '', -1);
+      Exit;
     end;
 
     // CGI convention (Apache, nginx+fcgiwrap): run in the script's directory

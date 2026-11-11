@@ -170,7 +170,7 @@ page in headless Chromium (optional; needs Playwright).
 
 ## 11e. Running it headless (Linux, systemd)
 
-vdrx reads `vdrx.conf` from its working directory. Set `"stdin_admin_enabled": false`
+vdrx reads `vdrx.conf` from its working directory (or the file named by `--config`, e.g. `ExecStart=/opt/vdrx/vdrx --config /etc/vdrx/vdrx.conf` - relative paths still resolve against `WorkingDirectory`). Set `"stdin_admin_enabled": false`
 and `"executives": {"jobs": {"console_color": false}}` for a service, then:
 
 ```ini
