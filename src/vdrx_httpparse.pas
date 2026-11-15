@@ -118,6 +118,22 @@ function ExtractBody(const ARequest: string): string;
 
 function HeadersToJSON(const AHeaderBlock: string): TJSONObject;
 
+// vdrx is usually the first server a client reaches, so any header that claims to say who the client is
+// (X-Forwarded-For, Forwarded, X-Real-IP, CF-Connecting-IP ...) was written by the client and is a lie.
+// Applications behind vdrx (CGI scripts, bus subscribers, reverse-proxied servers) often trust those headers
+// for rate limiting, audit logs and "is this an internal address" checks, so vdrx removes them from the
+// request unless the peer is a configured trusted proxy. Only the head is touched; folded continuation lines
+// of a removed header go with it; the request line is never removed.
+function StripForwardedHeaders(const ARequest: string): string;
+
+// True for the config spellings of "no": false, 0, no, off (any case). Anything else, and '', is not.
+function VDRX_IsFalseText(const AText: string): Boolean;
+
+// For a request vdrx passes on to an upstream: appends the connecting address to X-Forwarded-For (creating it)
+// and sets X-Forwarded-Proto when the request has none. Run it AFTER StripForwardedHeaders, so that for an
+// untrusted client these headers hold only what vdrx saw itself.
+function AddForwardedHeaders(const ARequest, APeerAddr: string; ASecure: Boolean): string;
+
 procedure ParseRequestLine(const ARequest: string; out AMethod, APath: string);
 
 function GuessContentType(const APath: string): string;
@@ -949,6 +965,97 @@ begin
   finally
     SL.Free;
   end;
+end;
+
+function VDRX_IsFalseText(const AText: string): Boolean;
+var
+  T: string;
+begin
+  T := LowerCase(Trim(AText));
+  Result := (T = 'false') or (T = '0') or (T = 'no') or (T = 'off');
+end;
+
+function IsForwardedHeaderName(const AName: string): Boolean;
+var
+  L: string;
+begin
+  L := StringReplace(LowerCase(Trim(AName)), '_', '-', [rfReplaceAll]);
+  Result := (L = 'forwarded') or (Copy(L, 1, 12) = 'x-forwarded-') or (L = 'x-real-ip') or
+    (L = 'x-client-ip') or (L = 'true-client-ip') or (L = 'cf-connecting-ip') or
+    (L = 'x-cluster-client-ip') or (L = 'x-original-forwarded-for');
+end;
+
+function StripForwardedHeaders(const ARequest: string): string;
+var
+  HeadEnd, LineStart, k, Colon: Integer;
+  Line: string;
+  Dropping: Boolean;
+begin
+  HeadEnd := Pos(#13#10#13#10, ARequest);
+  if HeadEnd = 0 then Exit(ARequest);
+  Result := '';
+  Dropping := False;
+  LineStart := 1;
+  while LineStart <= HeadEnd do
+  begin
+    k := PosEx(#13#10, ARequest, LineStart);
+    if (k = 0) or (k > HeadEnd) then k := HeadEnd + 1;
+    Line := Copy(ARequest, LineStart, k - LineStart);
+    LineStart := k + 2;
+    if Result = '' then
+      Result := Line + #13#10                                    // the request line
+    else if (Line <> '') and (Line[1] in [' ', #9]) then
+    begin
+      if not Dropping then Result := Result + Line + #13#10;      // continuation of the previous header
+    end
+    else
+    begin
+      Colon := Pos(':', Line);
+      Dropping := (Colon > 0) and IsForwardedHeaderName(Copy(Line, 1, Colon - 1));
+      if not Dropping then Result := Result + Line + #13#10;
+    end;
+  end;
+  Result := Result + #13#10 + Copy(ARequest, HeadEnd + 4, MaxInt);
+end;
+
+function AddForwardedHeaders(const ARequest, APeerAddr: string; ASecure: Boolean): string;
+var
+  HeadEnd, LineStart, k, Colon: Integer;
+  Line, Name, Extra, Proto, Prior: string;
+  Seen: Boolean;
+begin
+  HeadEnd := Pos(#13#10#13#10, ARequest);
+  if (HeadEnd = 0) or (APeerAddr = '') then Exit(ARequest);
+  if ASecure then Proto := 'https' else Proto := 'http';
+  Prior := '';
+  Seen := False;
+  Result := '';
+  LineStart := 1;
+  while LineStart <= HeadEnd do
+  begin
+    k := PosEx(#13#10, ARequest, LineStart);
+    if (k = 0) or (k > HeadEnd) then k := HeadEnd + 1;
+    Line := Copy(ARequest, LineStart, k - LineStart);
+    LineStart := k + 2;
+    Colon := Pos(':', Line);
+    if (Result <> '') and (Colon > 0) then
+    begin
+      Name := LowerCase(Trim(Copy(Line, 1, Colon - 1)));
+      if Name = 'x-forwarded-for' then
+      begin
+        // an existing value (only possible from a trusted proxy) is extended, not replaced
+        if Prior <> '' then Prior := Prior + ', ';
+        Prior := Prior + Trim(Copy(Line, Colon + 1, MaxInt));
+        Continue;
+      end;
+      if Name = 'x-forwarded-proto' then Seen := True;
+    end;
+    Result := Result + Line + #13#10;
+  end;
+  if Prior <> '' then Prior := Prior + ', ';
+  Extra := 'X-Forwarded-For: ' + Prior + APeerAddr + #13#10;
+  if not Seen then Extra := Extra + 'X-Forwarded-Proto: ' + Proto + #13#10;
+  Result := Result + Extra + #13#10 + Copy(ARequest, HeadEnd + 4, MaxInt);
 end;
 
 end.

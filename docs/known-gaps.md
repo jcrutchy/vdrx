@@ -20,12 +20,13 @@
 - The logger masks credentials by pattern (`log_redact`, on by default, bodies
   included). That is a safety net: a secret carried in a member the patterns do
   not know, or in a job's own output, is logged as-is. Buckets are never masked.
-- **TLS settings are OpenSSL's defaults.** vdrx does not set a minimum protocol version or a cipher
-  list. On current Linux distributions OpenSSL 3 already refuses anything below TLS 1.2, but an older
-  or custom OpenSSL build (the Windows DLLs you ship, for instance) may still offer TLS 1.0/1.1, which
-  a scanner will flag. Use OpenSSL 3.x, check the port with a scanner (`nmap --script ssl-enum-ciphers`,
-  `testssl.sh`), or terminate TLS at a reverse proxy configured to your policy. TLS on Windows is
-  untested here (the Linux path - TLS 1.3 handshakes, stalled-handshake and `wss://` tests - is).
+- **TLS policy is read at startup only, and Windows is untested.** vdrx now sets its own TLS policy
+  (`tls_min_version`, `tls_ciphers`, `tls_ciphersuites`, `tls_session_tickets`; see docs/http.md) and refuses
+  to start a TLS port whose policy it cannot enforce, but a `sys.reload` does not re-read those keys (restart
+  to change them). The policy needs a 64-bit build. The Linux path is tested against OpenSSL 3.0 (`tls-policy`
+  section); the Windows DLLs you ship are not, so check the port with a scanner (`nmap --script
+  ssl-enum-ciphers`, `testssl.sh`) after deploying. Renegotiation being off and session tickets being off
+  are set but not exercised by a test. Certificate expiry is not monitored.
 - **Only static files are streamed.** CGI, runner and reverse-proxy responses are still built in
   memory before they are sent (a CGI/runner program is capped by `max_child_output_bytes`), and
   `Range` requests are not supported (a file is always sent whole).

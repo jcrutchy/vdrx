@@ -3,7 +3,7 @@ program vdrx;
 {$mode objfpc}{$H+}
 
 uses
-  {$IFDEF UNIX}   cthreads, {$ENDIF}   Classes, StrUtils, SysUtils, Process, fpjson, jsonparser, RegExpr, vdrx_core, vdrx_config, vdrx_linebuf, vdrx_admin, vdrx_logger, vdrx_stdin, vdrx_bridge, vdrx_bucket, vdrx_transport, vdrx_httpparse, vdrx_connection, vdrx_websocket, vdrx_httproute, vdrx_http, vdrx_socketclient, vdrx_templates, vdrx_runner, vdrx_cgi, vdrx_jobs, vdrx_procutil   {$IFDEF UNIX}, BaseUnix{$ENDIF};
+  {$IFDEF UNIX}   cthreads, {$ENDIF}   Classes, StrUtils, SysUtils, Process, fpjson, jsonparser, RegExpr, vdrx_core, vdrx_config, vdrx_iplimit, vdrx_linebuf, vdrx_admin, vdrx_logger, vdrx_stdin, vdrx_bridge, vdrx_bucket, vdrx_transport, vdrx_httpparse, vdrx_connection, vdrx_websocket, vdrx_httproute, vdrx_http, vdrx_socketclient, vdrx_templates, vdrx_runner, vdrx_cgi, vdrx_jobs, vdrx_procutil   {$IFDEF UNIX}, BaseUnix{$ENDIF};
 
 type
   // Polls GShutdownRequested (vdrx_procutil.pas) from ordinary thread
@@ -75,12 +75,108 @@ begin
   end;
 end;
 
+// Per-address limits for a listener (see vdrx_iplimit.pas). Every value arrives as text so the same
+// helper serves the http_sites rows and executives.ws. An empty value keeps the built-in default; 0
+// switches that limit off. An unparsable value is refused loudly rather than silently ignored.
+procedure ApplyIPLimits(AListener: TVDRX_SocketListenerExecutive; const AWhere, AMaxPerIP, AMaxLive,
+  ARate, ABurst, AExempt: string);
+var
+  L: TVDRX_IPLimiter;
+  N: Integer;
+  R: Double;
+  Item: string;
+
+  function IntOpt(const AText, AName: string; var ATarget: Integer): Boolean;
+  begin
+    Result := True;
+    if Trim(AText) = '' then Exit;
+    N := StrToIntDef(Trim(AText), -1);
+    if N < 0 then
+    begin
+      WriteLn('  WARNING: ', AWhere, ': ', AName, ' "', AText, '" is not a number >= 0 - keeping ', ATarget);
+      Exit(False);
+    end;
+    ATarget := N;
+  end;
+
+begin
+  L := AListener.Limiter;
+  N := L.MaxPerIP;   IntOpt(AMaxPerIP, 'max_connections_per_ip', N);   L.MaxPerIP := N;
+  N := L.MaxLivePerIP; IntOpt(AMaxLive, 'max_websockets_per_ip', N); L.MaxLivePerIP := N;
+  N := L.Burst;      IntOpt(ABurst, 'connection_burst_per_ip', N);   L.Burst := N;
+  if Trim(ARate) <> '' then
+  begin
+    R := StrToFloatDef(Trim(ARate), -1, DefaultFormatSettings);
+    if R < 0 then
+      WriteLn('  WARNING: ', AWhere, ': connection_rate_per_ip "', ARate, '" is not a number >= 0 - keeping ', FloatToStr(L.RatePerSec))
+    else
+      L.RatePerSec := R;
+  end;
+  if (L.RatePerSec > 0) and (L.Burst < 1) then
+  begin
+    WriteLn('  WARNING: ', AWhere, ': connection_burst_per_ip must be at least 1 when a rate limit is set - using 1');
+    L.Burst := 1;
+  end;
+  for Item in SplitString(AExempt, ',') do
+    if Trim(Item) <> '' then
+      if not L.AddExempt(Trim(Item)) then
+        WriteLn('  WARNING: ', AWhere, ': limit_exempt entry "', Item, '" is not an IPv4 address or a.b.c.d/n range - ignored (that address stays limited)');
+  if (L.MaxPerIP = 0) and (L.RatePerSec = 0) then
+    WriteLn('  WARNING: ', AWhere, ': per-address connection limits are OFF (max_connections_per_ip and connection_rate_per_ip are 0)');
+end;
+
+// tls_min_version / tls_ciphers / tls_ciphersuites / tls_session_tickets for one listener, as text.
+// Empty = the built-in default (see TVDRX_TLSPolicy in vdrx_transport.pas).
+// security_headers / hsts_max_age / trusted_proxies of one HTTP site (see TVDRX_HTTPExecutive).
+procedure ApplyHTTPEdgePolicy(AHTTP: TVDRX_HTTPExecutive; const AWhere, ASecurityHeaders, AHSTS, ATrusted: string);
+var
+  Item: string;
+begin
+  AHTTP.SecurityHeaders := not VDRX_IsFalseText(ASecurityHeaders);
+  AHTTP.HSTSMaxAge := StrToIntDef(Trim(AHSTS), 0);
+  if (Trim(AHSTS) <> '') and (StrToIntDef(Trim(AHSTS), -1) < 0) then
+    WriteLn('  WARNING: ', AWhere, ': hsts_max_age "', AHSTS, '" is not a number of seconds - HSTS is off');
+  for Item in SplitString(ATrusted, ',') do
+    if Trim(Item) <> '' then
+      if AHTTP.TrustedProxies.Add(Trim(Item)) then
+        WriteLn('  ', AWhere, ': trusting X-Forwarded-For & co. from ', Trim(Item))
+      else
+        WriteLn('  WARNING: ', AWhere, ': trusted_proxies entry "', Item, '" is not an IPv4 address or a.b.c.d/n range - ignored (that peer is NOT trusted)');
+end;
+
+procedure ConfigureListenerTLSPolicy(AListener: TVDRX_SocketListenerExecutive; const AMinVersion, ACiphers,
+  ASuites, ATickets: string);
+var
+  P: TVDRX_TLSPolicy;
+begin
+  P := VDRX_DefaultTLSPolicy;
+  if Trim(AMinVersion) <> '' then P.MinVersion := Trim(AMinVersion);
+  P.Ciphers := Trim(ACiphers);
+  P.CipherSuites := Trim(ASuites);
+  P.SessionTickets := SameText(Trim(ATickets), 'true') or (Trim(ATickets) = '1');
+  AListener.ConfigureTLSPolicy(P);
+end;
+
+procedure WarnKeyPermissions(const AWhere, AKeyFile: string);
+var
+  W: string;
+begin
+  if AKeyFile = '' then Exit;
+  W := VDRX_KeyFilePermissionWarning(AKeyFile);
+  if W <> '' then WriteLn('  WARNING: ', AWhere, ': ', W);
+end;
+
 procedure ConfigureListenerTLS(AListener: TVDRX_SocketListenerExecutive; const AKeyPrefix: string);
 begin
   AListener.ConfigureTLS(
     Config.GetInteger(AKeyPrefix + '.tls_port', 0),
     Config.GetString(AKeyPrefix + '.tls_cert', ''),
     Config.GetString(AKeyPrefix + '.tls_key', ''));
+  ConfigureListenerTLSPolicy(AListener, Config.GetString(AKeyPrefix + '.tls_min_version', ''),
+    Config.GetString(AKeyPrefix + '.tls_ciphers', ''), Config.GetString(AKeyPrefix + '.tls_ciphersuites', ''),
+    Config.GetString(AKeyPrefix + '.tls_session_tickets', ''));
+  if Config.GetInteger(AKeyPrefix + '.tls_port', 0) <> 0 then
+    WarnKeyPermissions(AKeyPrefix, Config.GetString(AKeyPrefix + '.tls_key', ''));
 end;
 
 procedure ReportListener(AListener: TVDRX_SocketListenerExecutive; const AName: string);
@@ -244,6 +340,10 @@ begin
       Site.HTTP.Backlog := StrToIntDef(Row.Values['backlog'], Site.HTTP.Backlog);
       if Row.Values['bind'] <> '' then Site.HTTP.BindAddress := Row.Values['bind'];
       Site.HTTP.MaxConnections := StrToIntDef(Row.Values['max_connections'], Site.HTTP.MaxConnections);
+      ApplyHTTPEdgePolicy(Site.HTTP, 'http_sites[' + Site.ID + ']', Row.Values['security_headers'],
+        Row.Values['hsts_max_age'], Row.Values['trusted_proxies']);
+      ApplyIPLimits(Site.HTTP, 'http_sites[' + Site.ID + ']', Row.Values['max_connections_per_ip'], '',
+        Row.Values['connection_rate_per_ip'], Row.Values['connection_burst_per_ip'], Row.Values['limit_exempt']);
       if Row.Values['websocket_path'] <> '' then
       begin
         if AWS = nil then
@@ -285,8 +385,14 @@ begin
       end;
 
       if Row.Values['tls_port'] <> '' then
+      begin
         Site.HTTP.ConfigureTLS(StrToIntDef(Row.Values['tls_port'], 0),
           Row.Values['tls_cert'], Row.Values['tls_key']);
+        ConfigureListenerTLSPolicy(Site.HTTP, Row.Values['tls_min_version'], Row.Values['tls_ciphers'],
+          Row.Values['tls_ciphersuites'], Row.Values['tls_session_tickets']);
+        if StrToIntDef(Row.Values['tls_port'], 0) <> 0 then
+          WarnKeyPermissions('http_sites[' + Site.ID + ']', Row.Values['tls_key']);
+      end;
 
       ARegistry.Register(Site.HTTP, Site.ID, 'sys.none');
 
@@ -1290,6 +1396,11 @@ begin
       WS.Backlog := Config.GetInteger('executives.ws.backlog', WS.Backlog);
       WS.BindAddress := Config.GetString('executives.ws.bind', WS.BindAddress);
       WS.MaxConnections := Config.GetInteger('executives.ws.max_connections', WS.MaxConnections);
+      ApplyIPLimits(WS, 'executives.ws', Config.GetString('executives.ws.max_connections_per_ip', ''),
+        Config.GetString('executives.ws.max_websockets_per_ip', ''),
+        Config.GetString('executives.ws.connection_rate_per_ip', ''),
+        Config.GetString('executives.ws.connection_burst_per_ip', ''),
+        Config.GetString('executives.ws.limit_exempt', ''));
       WS.AllowOpenAccess := Config.GetBoolean('executives.ws.allow_open_access', False);
       WS.MaxFrameBytes := Config.GetInteger('executives.ws.max_frame_bytes', WS.MaxFrameBytes);
       WS.FrameTimeoutMs := Config.GetInteger('executives.ws.frame_timeout_ms', WS.FrameTimeoutMs);

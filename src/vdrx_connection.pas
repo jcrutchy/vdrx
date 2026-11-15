@@ -8,7 +8,7 @@ unit vdrx_connection;
 interface
 
 uses
-  Classes, SysUtils, StrUtils, Sockets, SyncObjs, {$IFDEF UNIX}BaseUnix, {$ENDIF} dynlibs, vdrx_core, vdrx_procutil, vdrx_transport;
+  Classes, SysUtils, StrUtils, Sockets, SyncObjs, {$IFDEF UNIX}BaseUnix, {$ENDIF} dynlibs, vdrx_core, vdrx_procutil, vdrx_transport, vdrx_iplimit;
 
 type
 
@@ -32,9 +32,13 @@ type
     FPendingSock: TSocket;
     FPendingAddr: string;
     FPendingPort: Word;
+    FLimitAddr: string;
   protected
     procedure Execute; override;
   public
+    // The address whose per-IP slot (and the listener's global slot) this connection holds;
+    // handed back when the thread ends.
+    property LimitAddr: string read FLimitAddr write FLimitAddr;
     constructor Create(AOwner: TVDRX_SocketListenerExecutive; ATransport: TVDRX_Transport);
     constructor CreateTLS(AOwner: TVDRX_SocketListenerExecutive; ASock: TSocket;
       const APeerAddr: string; APeerPort: Word);
@@ -48,6 +52,7 @@ type
     FTLSPort: Word;
     FTLSCertFile: string;
     FTLSKeyFile: string;
+    FTLSPolicy: TVDRX_TLSPolicy;
     FTLSContext: TVDRX_TLSContext;
     FBacklog: Integer;
     FPlainSocket: TSocket;
@@ -60,17 +65,21 @@ type
     FActiveConnections: TList;
     FBindAddress: string;
     FLastRejectLog: QWord;
-    FRejectedSinceLog: Integer;
+    FRejectedSinceLog: array[0..2] of Integer;   // global cap, per-IP concurrent cap, per-IP rate
+    FLastRejectAddr: string;
+    FOpenConns: LongInt;                         // reserved at accept time, released when the thread ends
+    FLimiter: TVDRX_IPLimiter;
 
     function BindListenSocket(APort: Word): TSocket;
     function CompleteTLSHandshake(ASock: TSocket; const APeerAddr: string; APeerPort: Word): TVDRX_Transport;
-    function ConnectionLimitReached: Boolean;
+    function TryReserve(const AAddr: string): Boolean;
     procedure AcceptLoopPlain;
     procedure AcceptLoopTLS;
     function WaitConnGone(AThread: TVDRX_ListenerConnThread; ATimeoutMs: Integer): Boolean;
   protected
     FMaxConnections: Integer;
-    procedure NoteRejected;
+    procedure NoteRejected(AReason: Integer; const AAddr: string);
+    procedure ReleaseSlot(const AAddr: string);
     procedure HandleConnection(ATransport: TVDRX_Transport); virtual; abstract;
     procedure RegisterConnection(AThread: TVDRX_ListenerConnThread);
     procedure UnregisterConnection(AThread: TVDRX_ListenerConnThread);
@@ -81,6 +90,8 @@ type
     property TLSPort: Word read FTLSPort;
     function TLSActive: Boolean;
     procedure ConfigureTLS(ATLSPort: Word; const ACertFile, AKeyFile: string);
+    // Protocol versions and ciphers this listener's TLS port will accept (default: TVDRX_TLSPolicy's).
+    procedure ConfigureTLSPolicy(const APolicy: TVDRX_TLSPolicy);
     property Backlog: Integer read FBacklog write FBacklog;
     // Interface the listener binds to. Default 127.0.0.1 (loopback only);
     // '0.0.0.0' = every interface, or the address of one specific interface.
@@ -88,6 +99,9 @@ type
     // Concurrent connections this listener will serve; more are closed at
     // once. 0 = unlimited (not recommended).
     property MaxConnections: Integer read FMaxConnections write FMaxConnections;
+    // Per-address limits (concurrent connections, new-connection rate, exempt ranges). Configured by the
+    // owner of the listener; defaults are in TVDRX_IPLimiter.
+    property Limiter: TVDRX_IPLimiter read FLimiter;
     property Stopping: Boolean read FStopping;
     property GracefulTimeoutMs: Integer read FGracefulTimeoutMs write FGracefulTimeoutMs;
     procedure Initialize; override;
@@ -150,6 +164,7 @@ begin
     end;
   finally
     FOwner.UnregisterConnection(Self);
+    FOwner.ReleaseSlot(FLimitAddr);
     FreeOnTerminate := True;
   end;
 end;
@@ -168,13 +183,16 @@ begin
   FBacklog := 128;
   FGracefulTimeoutMs := 5000;
   FBindAddress := '127.0.0.1';
+  FTLSPolicy := VDRX_DefaultTLSPolicy;
   FMaxConnections := 256;
   FCriticalSection := TCriticalSection.Create;
   FActiveConnections := TList.Create;
+  FLimiter := TVDRX_IPLimiter.Create;
 end;
 
 destructor TVDRX_SocketListenerExecutive.Destroy;
 begin
+  FLimiter.Free;
   FActiveConnections.Free;
   FCriticalSection.Free;
   FTLSContext.Free;
@@ -207,6 +225,11 @@ begin
   FTLSPort := ATLSPort;
   FTLSCertFile := ACertFile;
   FTLSKeyFile := AKeyFile;
+end;
+
+procedure TVDRX_SocketListenerExecutive.ConfigureTLSPolicy(const APolicy: TVDRX_TLSPolicy);
+begin
+  FTLSPolicy := APolicy;
 end;
 
 function TVDRX_SocketListenerExecutive.BindListenSocket(APort: Word): TSocket;
@@ -251,44 +274,72 @@ begin
   end;
 end;
 
-function TVDRX_SocketListenerExecutive.ConnectionLimitReached: Boolean;
+// Reserves a connection slot at ACCEPT time. (Counting only when the connection thread starts, as this
+// used to, let a burst of connections overshoot max_connections: threads register after the accept loop
+// has already moved on.) Order matters: the cheap global cap first, so a refused connection never
+// spends a token from the address's rate bucket.
+function TVDRX_SocketListenerExecutive.TryReserve(const AAddr: string): Boolean;
+var
+  V: TVDRX_LimitVerdict;
 begin
-  if FMaxConnections <= 0 then Exit(False);
-  FCriticalSection.Acquire;
-  try
-    Result := FActiveConnections.Count >= FMaxConnections;
-  finally
-    FCriticalSection.Release;
+  Result := False;
+  if (FMaxConnections > 0) and (InterlockedIncrement(FOpenConns) > FMaxConnections) then
+  begin
+    InterlockedDecrement(FOpenConns);
+    NoteRejected(0, AAddr);
+    Exit;
   end;
+  if FMaxConnections <= 0 then InterlockedIncrement(FOpenConns);
+  V := FLimiter.TryAcquire(AAddr);
+  if V <> lvOK then
+  begin
+    InterlockedDecrement(FOpenConns);
+    if V = lvTooManyConns then NoteRejected(1, AAddr) else NoteRejected(2, AAddr);
+    Exit;
+  end;
+  Result := True;
 end;
 
-// Logs at most once every 10 s (with a count) so a flood of refused
-// connections cannot also flood the log.
-procedure TVDRX_SocketListenerExecutive.NoteRejected;
+procedure TVDRX_SocketListenerExecutive.ReleaseSlot(const AAddr: string);
+begin
+  FLimiter.Release(AAddr);
+  InterlockedDecrement(FOpenConns);
+end;
+
+// Logs at most once every 10 s (with counts) so a flood of refused
+// connections cannot also flood the log. The address is the last one refused; it comes from
+// NetAddrToStr, so it cannot carry control characters.
+procedure TVDRX_SocketListenerExecutive.NoteRejected(AReason: Integer; const AAddr: string);
 var
   Now: QWord;
-  Count: Integer;
+  C: array[0..2] of Integer;
   DoLog: Boolean;
+  LastAddr: string;
 begin
   DoLog := False;
-  Count := 0;
+  FillChar(C, SizeOf(C), 0);
+  LastAddr := '';
   FCriticalSection.Acquire;
   try
-    Inc(FRejectedSinceLog);
+    Inc(FRejectedSinceLog[AReason]);
+    FLastRejectAddr := AAddr;
     Now := GetTickCount64;
     if (FLastRejectLog = 0) or (Now - FLastRejectLog >= 10000) then
     begin
       DoLog := True;
-      Count := FRejectedSinceLog;
+      C[0] := FRejectedSinceLog[0]; C[1] := FRejectedSinceLog[1]; C[2] := FRejectedSinceLog[2];
+      LastAddr := FLastRejectAddr;
       FLastRejectLog := Now;
-      FRejectedSinceLog := 0;
+      FillChar(FRejectedSinceLog, SizeOf(FRejectedSinceLog), 0);
     end;
   finally
     FCriticalSection.Release;
   end;
   if DoLog then
-    Bus.Publish('log.warn', ID + ': connection limit (' + IntToStr(FMaxConnections) +
-      ') reached - closed ' + IntToStr(Count) + ' new connection(s)', ID);
+    Bus.Publish('log.warn', ID + ': refused connections - ' + IntToStr(C[0]) + ' over max_connections (' +
+      IntToStr(FMaxConnections) + '), ' + IntToStr(C[1]) + ' over max_connections_per_ip (' +
+      IntToStr(FLimiter.MaxPerIP) + '), ' + IntToStr(C[2]) + ' over connection_rate_per_ip (' +
+      FloatToStr(FLimiter.RatePerSec) + '/s); most recent: ' + LastAddr, ID);
 end;
 
 procedure TVDRX_SocketListenerExecutive.AcceptLoopPlain;
@@ -298,6 +349,7 @@ var
   ClientSock: TSocket;
   ConnThread: TVDRX_ListenerConnThread;
   PlainT: TVDRX_PlainTransport;
+  PeerStr: string;
 begin
   FPlainSocket := BindListenSocket(FPort);
   if FPlainSocket = -1 then
@@ -316,10 +368,10 @@ begin
       Continue;
     end;
 
-    if ConnectionLimitReached then
+    PeerStr := NetAddrToStr(ClientAddr.sin_addr);
+    if not TryReserve(PeerStr) then
     begin
       CloseSocket(ClientSock);
-      NoteRejected;
       Continue;
     end;
 
@@ -328,12 +380,14 @@ begin
       if FStopping then
       begin
         CloseSocket(ClientSock);
+        ReleaseSlot(PeerStr);
         Break;
       end;
       PlainT := TVDRX_PlainTransport.Create(ClientSock);
-      PlainT.PeerAddr := NetAddrToStr(ClientAddr.sin_addr);
+      PlainT.PeerAddr := PeerStr;
       PlainT.PeerPort := ntohs(ClientAddr.sin_port);
       ConnThread := TVDRX_ListenerConnThread.Create(Self, PlainT);
+      ConnThread.LimitAddr := PeerStr;
     finally
       FCriticalSection.Release;
     end;
@@ -374,6 +428,7 @@ var
   AddrLen: TSockLen;
   ClientSock: TSocket;
   ConnThread: TVDRX_ListenerConnThread;
+  PeerStr: string;
 begin
   FTLSSocket := BindListenSocket(FTLSPort);
   if FTLSSocket = -1 then
@@ -392,10 +447,10 @@ begin
       Continue;
     end;
 
-    if ConnectionLimitReached then
+    PeerStr := NetAddrToStr(ClientAddr.sin_addr);
+    if not TryReserve(PeerStr) then
     begin
       CloseSocket(ClientSock);
-      NoteRejected;
       Continue;
     end;
 
@@ -406,10 +461,12 @@ begin
       if FStopping then
       begin
         CloseSocket(ClientSock);
+        ReleaseSlot(PeerStr);
         Break;
       end;
       ConnThread := TVDRX_ListenerConnThread.CreateTLS(Self, ClientSock,
-        NetAddrToStr(ClientAddr.sin_addr), ntohs(ClientAddr.sin_port));
+        PeerStr, ntohs(ClientAddr.sin_port));
+      ConnThread.LimitAddr := PeerStr;
     finally
       FCriticalSection.Release;
     end;
@@ -447,9 +504,18 @@ begin
         FTLSCertFile + '" / key "' + FTLSKeyFile + '", or OpenSSL could not be loaded' +
         IfThen(VDRX_OpenSSLNote <> '', ' (' + VDRX_OpenSSLNote + ')', ''), ID);
     end
+    else if not FTLSContext.ApplyPolicy(FTLSPolicy) then
+    begin
+      // Never serve TLS with a policy that could not be enforced.
+      Bus.Publish('log.error', ID + ': TLS port ' + IntToStr(FTLSPort) + ' NOT started - ' +
+        FTLSContext.PolicyNote, ID);
+      FTLSContext.Free;
+      FTLSContext := nil;
+    end
     else
     begin
       if VDRX_OpenSSLNote <> '' then Bus.Publish('log.info', ID + ': ' + VDRX_OpenSSLNote, ID);
+      Bus.Publish('log.info', ID + ': TLS port ' + IntToStr(FTLSPort) + ' - ' + FTLSContext.PolicyNote, ID);
       FTLSThread := TVDRX_WorkerThread.Create(@AcceptLoopTLS);
       FTLSThread.FreeOnTerminate := False;
       FTLSThread.Start;

@@ -14,6 +14,13 @@ on top:
 WebSocket port and any HTTP site's shared port (below). A new connection over the limit is answered
 `503` and closed. Size it for the number of browser tabs you expect.
 
+**`max_websockets_per_ip`** (default `100`, `0` = no limit) caps the *live* WebSocket connections one client
+address may hold; the next upgrade from that address is answered `503` until one closes. It is counted from the
+moment the WebSocket server adopts the connection until it ends, on the WebSocket port and on any shared HTTP
+port alike. The accept-time limits of §4 (`max_connections_per_ip`, `connection_rate_per_ip`,
+`connection_burst_per_ip`, `limit_exempt`) are also read from `executives.ws` and apply to connections arriving
+on the WebSocket port itself; on a shared port the HTTP site's own limits apply to the connection first.
+
 ## One port for pages and WebSocket
 
 Set `websocket_path` on an HTTP site and an `Upgrade: websocket` request for exactly that path is handed

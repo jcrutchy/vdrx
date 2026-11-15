@@ -8,7 +8,7 @@ unit vdrx_transport;
 interface
 
 uses
-  SysUtils, Sockets, openssl, resolve, {$IFDEF UNIX}BaseUnix, {$ENDIF} dynlibs, vdrx_core, vdrx_config;
+  SysUtils, StrUtils, Sockets, ctypes, openssl, resolve, {$IFDEF UNIX}BaseUnix, {$ENDIF} dynlibs, vdrx_core, vdrx_config;
 
 type
 
@@ -64,15 +64,34 @@ type
     procedure SetWriteTimeout(ATimeoutMs: Integer); override;
   end;
 
+  // What a listening TLS endpoint will negotiate. The defaults are a "modern-ish" profile: TLS 1.2 and
+  // 1.3 only, ECDHE key exchange with AEAD ciphers only (forward secrecy, no CBC, no RC4/3DES), compression
+  // and renegotiation off, session tickets off (OpenSSL never rotates ticket keys by itself, which would
+  // undo forward secrecy for as long as the daemon runs; resumption still works through the server-side
+  // session cache).
+  TVDRX_TLSPolicy = record
+    MinVersion: string;       // '1.2' or '1.3'
+    Ciphers: string;          // TLS 1.2 cipher list, OpenSSL syntax; '' = VDRX_DEFAULT_TLS_CIPHERS
+    CipherSuites: string;     // TLS 1.3 suites, colon separated; '' = OpenSSL's own default
+    SessionTickets: Boolean;
+  end;
+
   TVDRX_TLSContext = class
   private
     FCtx: PSSL_CTX;
     FOK: Boolean;
+    FPolicyNote: string;
   public
     constructor Create(const ACertFile, AKeyFile: string);
     destructor Destroy; override;
+    // Applies and VERIFIES the policy. False = something could not be enforced (the reason is in
+    // PolicyNote); the caller must not serve TLS with this context then, because a policy that is
+    // silently not applied is worse than no TLS at all.
+    function ApplyPolicy(const APolicy: TVDRX_TLSPolicy): Boolean;
     property OK: Boolean read FOK;
     property Ctx: PSSL_CTX read FCtx;
+    // On success: one line describing what is enforced. On failure: why not.
+    property PolicyNote: string read FPolicyNote;
   end;
 
   TVDRX_TLSClientContext = class
@@ -88,6 +107,15 @@ type
 
 const
   TLS_HANDSHAKE_TIMEOUT_MS = 5000;
+  VDRX_DEFAULT_TLS_CIPHERS =
+    'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:' +
+    'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:' +
+    'ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305';
+
+function VDRX_DefaultTLSPolicy: TVDRX_TLSPolicy;
+// '' when the private key file is not readable by anyone but its owner (or not a Unix file system);
+// otherwise a warning to show the operator.
+function VDRX_KeyFilePermissionWarning(const AKeyFile: string): string;
 
 function ConnectTCP(const AHost: string; APort: Word): TVDRX_Transport;
 function ConnectTCPHost(const AHost: string; APort: Word): TVDRX_Transport;
@@ -650,7 +678,157 @@ begin
   FCtx := SslCtxNew(SslTLSMethod);
   FOK := Assigned(FCtx)
     and (SslCtxUseCertificateFile(FCtx, ACertFile, SSL_FILETYPE_PEM) = 1)
-    and (SslCtxUsePrivateKeyFile(FCtx, AKeyFile, SSL_FILETYPE_PEM) = 1);
+    and (SslCtxUsePrivateKeyFile(FCtx, AKeyFile, SSL_FILETYPE_PEM) = 1)
+    and (SslCtxCheckPrivateKeyFile(FCtx) = 1);        // the key must belong to the certificate
+end;
+
+function VDRX_DefaultTLSPolicy: TVDRX_TLSPolicy;
+begin
+  Result.MinVersion := '1.2';
+  Result.Ciphers := '';
+  Result.CipherSuites := '';
+  Result.SessionTickets := False;
+end;
+
+function VDRX_KeyFilePermissionWarning(const AKeyFile: string): string;
+{$IFDEF UNIX}
+var
+  St: Stat;
+begin
+  Result := '';
+  if fpStat(PChar(AKeyFile), St) <> 0 then Exit;
+  if (St.st_mode and &077) <> 0 then
+    Result := 'private key "' + AKeyFile + '" is readable by users other than its owner (mode ' +
+      OctStr(St.st_mode and &777, 3) + '); run chmod 600 on it';
+end;
+{$ELSE}
+begin
+  Result := '';
+end;
+{$ENDIF}
+
+function TVDRX_TLSContext.ApplyPolicy(const APolicy: TVDRX_TLSPolicy): Boolean;
+const
+  SSL_OP_NO_COMPRESSION            = $00020000;
+  SSL_OP_CIPHER_SERVER_PREFERENCE  = $00400000;
+  SSL_OP_NO_TICKET                 = $00004000;
+  SSL_OP_NO_SSLv3                  = $02000000;
+  SSL_OP_NO_TLSv1                  = $04000000;
+  SSL_OP_NO_TLSv1_1                = $10000000;
+  SSL_OP_NO_TLSv1_2                = $08000000;
+  SSL_OP_NO_RENEGOTIATION          = $40000000;     // OpenSSL 1.1.1 and later
+  SSL_CTRL_SET_MIN_PROTO_VERSION   = 123;
+  SSL_CTRL_GET_MIN_PROTO_VERSION   = 130;
+  TLS1_2_VERSION                   = $0303;
+  TLS1_3_VERSION                   = $0304;
+type
+  TCtxCtrl        = function(ACtx: PSSL_CTX; ACmd: cint; ALarg: clong; AParg: Pointer): clong; cdecl;
+  TCtxSetOptions  = function(ACtx: PSSL_CTX; AOp: QWord): QWord; cdecl;
+  TCtxGetOptions  = function(ACtx: PSSL_CTX): QWord; cdecl;
+  TCtxSetSuites   = function(ACtx: PSSL_CTX; AStr: PAnsiChar): cint; cdecl;
+  TVersionNum     = function: culong; cdecl;
+var
+  Ctrl: TCtxCtrl;
+  SetOpts: TCtxSetOptions;
+  GetOpts: TCtxGetOptions;
+  SetSuites: TCtxSetSuites;
+  VerNum: TVersionNum;
+  Want: QWord;
+  MinVer: clong;
+  Ciphers: string;
+  P: Pointer;
+  Tickets: string;
+begin
+  Result := False;
+  FPolicyNote := '';
+  if (not FOK) or (not Assigned(FCtx)) then
+  begin
+    FPolicyNote := 'no TLS context';
+    Exit;
+  end;
+  {$IFNDEF CPU64}
+  FPolicyNote := 'the TLS policy needs a 64-bit build (OpenSSL option flags are 64-bit)';
+  Exit;
+  {$ENDIF}
+
+  if APolicy.MinVersion = '1.2' then MinVer := TLS1_2_VERSION
+  else if APolicy.MinVersion = '1.3' then MinVer := TLS1_3_VERSION
+  else
+  begin
+    FPolicyNote := 'tls_min_version "' + APolicy.MinVersion + '" is not allowed (use "1.2" or "1.3")';
+    Exit;
+  end;
+
+  P := GetProcedureAddress(SSLLibHandle, 'SSL_CTX_ctrl');
+  if P = nil then begin FPolicyNote := 'libssl has no SSL_CTX_ctrl'; Exit; end;
+  Ctrl := TCtxCtrl(P);
+  P := GetProcedureAddress(SSLLibHandle, 'SSL_CTX_set_options');
+  if P = nil then begin FPolicyNote := 'libssl has no SSL_CTX_set_options'; Exit; end;
+  SetOpts := TCtxSetOptions(P);
+  P := GetProcedureAddress(SSLLibHandle, 'SSL_CTX_get_options');
+  if P = nil then begin FPolicyNote := 'libssl has no SSL_CTX_get_options'; Exit; end;
+  GetOpts := TCtxGetOptions(P);
+
+  // 1. Minimum protocol version: the version API where it exists, and the older "disable this version"
+  //    options as well, then read both back.
+  if Ctrl(FCtx, SSL_CTRL_SET_MIN_PROTO_VERSION, MinVer, nil) <> 1 then
+  begin
+    FPolicyNote := 'OpenSSL refused to set the minimum protocol version (too old a library?)';
+    Exit;
+  end;
+  if Ctrl(FCtx, SSL_CTRL_GET_MIN_PROTO_VERSION, 0, nil) <> MinVer then
+  begin
+    FPolicyNote := 'the minimum protocol version did not take effect';
+    Exit;
+  end;
+
+  Want := SSL_OP_NO_SSLv3 or SSL_OP_NO_TLSv1 or SSL_OP_NO_TLSv1_1 or SSL_OP_NO_COMPRESSION or
+          SSL_OP_CIPHER_SERVER_PREFERENCE;
+  if MinVer = TLS1_3_VERSION then Want := Want or SSL_OP_NO_TLSv1_2;
+  if not APolicy.SessionTickets then Want := Want or SSL_OP_NO_TICKET;
+  // Client-initiated renegotiation lets one connection demand endless expensive handshakes. The option
+  // exists from OpenSSL 1.1.1 on; its bit meant something else in 1.0.2.
+  P := GetProcedureAddress(SSLUtilHandle, 'OpenSSL_version_num');
+  if P <> nil then
+  begin
+    VerNum := TVersionNum(P);
+    if VerNum() >= $10101000 then Want := Want or SSL_OP_NO_RENEGOTIATION;
+  end;
+  SetOpts(FCtx, Want);
+  if (GetOpts(FCtx) and Want) <> Want then
+  begin
+    FPolicyNote := 'OpenSSL did not accept every TLS option (wanted $' + IntToHex(Want, 8) + ', have $' +
+      IntToHex(GetOpts(FCtx), 8) + ')';
+    Exit;
+  end;
+
+  // 2. TLS 1.2 cipher list.
+  Ciphers := APolicy.Ciphers;
+  if Ciphers = '' then Ciphers := VDRX_DEFAULT_TLS_CIPHERS;
+  if SslCtxSetCipherList(FCtx, Ciphers) <> 1 then
+  begin
+    FPolicyNote := 'tls_ciphers matched no cipher OpenSSL knows: ' + Ciphers;
+    Exit;
+  end;
+
+  // 3. TLS 1.3 suites (only when the operator names them).
+  if APolicy.CipherSuites <> '' then
+  begin
+    P := GetProcedureAddress(SSLLibHandle, 'SSL_CTX_set_ciphersuites');
+    if P = nil then begin FPolicyNote := 'this OpenSSL has no TLS 1.3 support (tls_ciphersuites)'; Exit; end;
+    SetSuites := TCtxSetSuites(P);
+    if SetSuites(FCtx, PAnsiChar(AnsiString(APolicy.CipherSuites))) <> 1 then
+    begin
+      FPolicyNote := 'tls_ciphersuites was refused by OpenSSL: ' + APolicy.CipherSuites;
+      Exit;
+    end;
+  end;
+
+  if APolicy.SessionTickets then Tickets := 'on' else Tickets := 'off';
+  FPolicyNote := 'TLS policy: minimum TLS ' + APolicy.MinVersion + ', compression off, renegotiation off, ' +
+    'session tickets ' + Tickets + ', server cipher order, TLS 1.2 ciphers ' + Ciphers +
+    IfThen(APolicy.CipherSuites <> '', ', TLS 1.3 suites ' + APolicy.CipherSuites, '');
+  Result := True;
 end;
 
 destructor TVDRX_TLSContext.Destroy;

@@ -40,7 +40,7 @@ var
   GVDRXEdgeToken: string = '';
 
 function ProxyRequest(const ARequest: string; const ARoute: TVDRX_ProxyRoute;
-  ABus: TVDRX_MessageQueue; const ASourceID: string): string;
+  ABus: TVDRX_MessageQueue; const ASourceID: string; const APeerAddr: string = ''; ASecure: Boolean = False): string;
 
 function ServeStaticFile(const APath, AStaticDir: string; ABus: TVDRX_MessageQueue;
   const ASourceID: string; var AStreamFile: string; var AStreamSize: Int64;
@@ -251,7 +251,7 @@ begin
 end;
 
 function ProxyRequest(const ARequest: string; const ARoute: TVDRX_ProxyRoute;
-  ABus: TVDRX_MessageQueue; const ASourceID: string): string;
+  ABus: TVDRX_MessageQueue; const ASourceID: string; const APeerAddr: string = ''; ASecure: Boolean = False): string;
 const
   MAX_CONNECT_ATTEMPTS = 5;
   RETRY_DELAY_MS = 150;
@@ -282,7 +282,8 @@ begin
   end;
 
   try
-    Outgoing := ForceConnectionClose(ARequest);
+    // the upstream sees the real client in X-Forwarded-For / X-Forwarded-Proto, not just vdrx's own address
+    Outgoing := ForceConnectionClose(AddForwardedHeaders(ARequest, APeerAddr, ASecure));
     Transport.SetReadTimeout(UPSTREAM_READ_MS);
     if HTTPResponseTimeoutMs > 0 then Deadline := GetTickCount64 + QWord(HTTPResponseTimeoutMs) else Deadline := 0;
     Transport.Write(Outgoing[1], Length(Outgoing));

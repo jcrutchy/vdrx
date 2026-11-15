@@ -40,6 +40,11 @@ bodies, and the absence of per-topic access control beyond `ws_profiles`.
 - WebSocket handshakes from a browser must come from the same host as the request (or an entry in
   `executives.ws.allowed_origins`); `max_connections` caps live WebSocket connections. Pages and WebSocket can
   share one port with an HTTP site's `websocket_path`.
+- Facing the internet: client-supplied `X-Forwarded-For` / `Forwarded` / `X-Real-IP` headers are deleted before routing
+  (list a proxy you control in `trusted_proxies` to keep them), reverse-proxied upstreams are told the real client
+  in `X-Forwarded-For`, and responses carry `nosniff` / `X-Frame-Options` / `Referrer-Policy`; add `hsts_max_age`
+  once the site is https-only, and a `Content-Security-Policy` in the site's `headers`. TLS is 1.2+ with
+  forward-secret AEAD ciphers by default. See [docs/http.md](docs/http.md).
 - Outbound TLS (`socket_clients`) checks that the server's certificate is valid for the host it dialled, not just that it chains
   to a trusted CA; keep `tls_verify` on. Everything written to the log has line breaks and control characters escaped, so a
   client cannot forge log entries or drive the operator's terminal.
@@ -47,6 +52,10 @@ bodies, and the absence of per-topic access control beyond `ws_profiles`.
 - Listeners bind to `127.0.0.1` by default. Set `bind` to the one interface that needs to be
   reachable (avoid `0.0.0.0`) and firewall the port to the hosts that need it.
 - Keep `max_connections` at a sensible figure for the expected number of clients (default 256 per listener).
+  Each listener also limits a single client address (`max_connections_per_ip`, `connection_rate_per_ip`,
+  `connection_burst_per_ip`; WebSocket: `max_websockets_per_ip`) so one host cannot take every slot - see
+  [docs/http.md](docs/http.md). Use `limit_exempt` for monitoring hosts, and raise the limits if many real users
+  share one address (a corporate NAT, a mobile carrier gateway).
 - Run vdrx as an unprivileged account that can only read what it serves.
 - Treat `vdrx.conf` as sensitive; keep tokens in environment variables (`{ENV:NAME}`). CGI and `cli_bridges`
   programs get a clean environment, so those variables do not reach them unless you list them in

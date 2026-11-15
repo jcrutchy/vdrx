@@ -138,7 +138,7 @@ Status: **Mitigated** (a control exists and a test exercises it), **Partly** (a 
 | Reading another profile's topics | `subscribe_allow` per profile | Mitigated |
 | Impersonating a server vdrx dials out to (`socket_clients` over TLS) | The certificate must chain to a trusted CA **and** be valid for the dialled host name or `tls_peer_name`; refused otherwise, and refused if libcrypto cannot check names *(a real hole - any certificate from the same CA was accepted - found and fixed in hardening 9)* | Mitigated | `tls-client` |
 | A client forges log lines or drives the operator's terminal through a logged value | CR, LF, ESC and other control characters are escaped in every logged topic and payload, after redaction *(found and fixed in hardening 9)* | Mitigated | unit, `regress` |
-| Traffic sniffing | TLS available on HTTP and WebSocket; settings are OpenSSL's defaults, with no minimum version set | Partly: use OpenSSL 3.x or terminate TLS at a proxy; TLS on Windows is untested |
+| Traffic sniffing / downgrade | TLS on HTTP and WebSocket with an explicit policy: TLS 1.2+ (configurable to 1.3), ECDHE + AEAD ciphers only, compression, renegotiation and session tickets off; a TLS port whose policy cannot be enforced does not start | Mitigated on Linux/OpenSSL 3 (`tls-policy`); TLS on Windows is untested |
 | Another local user reading config/logs | Not enforced by vdrx | Open: file permissions are the operator's job |
 
 ### 4.6 Script injection in the browser tools
@@ -191,7 +191,7 @@ Reviewed so far (code read plus tests; findings in the "found and fixed" rows ab
 1. Finish the review list above, starting with the bucket recorder and the legacy `cli_bridges` protocols.
 2. Give the admin executive a source check, so `sys.>` is protected even if a future executive forgets `VDRX_ReplyAllowed`.
 3. Hash tokens at rest and add an optional expiry, or move to a per-client credential.
-4. Set a minimum TLS version and cipher policy explicitly; test TLS on Windows.
+4. ~~Set a minimum TLS version and cipher policy explicitly~~ (done); test TLS on Windows; warn before certificate expiry.
 5. Offer an optional sandbox wrapper for child programs (a separate account, a job object on Windows, a container).
 6. Run the regression suite in CI on every commit, with the stress and stall tests nightly.
 

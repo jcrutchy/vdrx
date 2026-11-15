@@ -8,7 +8,7 @@ unit vdrx_http;
 interface
 
 uses
-  Classes, SysUtils, StrUtils, openssl, {$IFDEF UNIX}BaseUnix, {$ENDIF} dynlibs, fpjson, jsonparser, vdrx_core, vdrx_config, vdrx_templates, vdrx_transport, vdrx_httpparse, vdrx_connection, vdrx_websocket, vdrx_httproute;
+  Classes, SysUtils, StrUtils, openssl, {$IFDEF UNIX}BaseUnix, {$ENDIF} dynlibs, fpjson, jsonparser, vdrx_core, vdrx_config, vdrx_templates, vdrx_transport, vdrx_iplimit, vdrx_httpparse, vdrx_connection, vdrx_websocket, vdrx_httproute;
 
 type
 
@@ -22,6 +22,10 @@ type
     FCustomHeaders: TStringList;
     FWebSocket: TVDRX_WebSocketExecutive;
     FWebSocketPath: string;
+    FSecurityHeaders: Boolean;
+    FHSTSMaxAge: Integer;
+    FTrustedProxies: TVDRX_IPMatcher;
+    procedure BuildEffectiveHeaders(AList: TStringList; ASecure: Boolean);
   protected
     procedure HandleConnection(ATransport: TVDRX_Transport); override;
   public
@@ -33,6 +37,15 @@ type
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
     procedure ApplyConfig; override;
     property CustomHeaders: TStringList read FCustomHeaders;
+    // Default response headers that cost nothing and close common browser-side holes: X-Content-Type-Options:
+    // nosniff, X-Frame-Options: SAMEORIGIN, Referrer-Policy. A header of the same name in "headers" wins.
+    property SecurityHeaders: Boolean read FSecurityHeaders write FSecurityHeaders;
+    // Seconds for Strict-Transport-Security on responses sent over TLS; 0 = not sent. Browsers remember it,
+    // so turn it on only once every name that site serves works over https.
+    property HSTSMaxAge: Integer read FHSTSMaxAge write FHSTSMaxAge;
+    // Peers whose X-Forwarded-For / Forwarded / X-Real-IP headers are believed and passed on (and extended with
+    // the peer's own address when proxying). For every other client those headers are deleted.
+    property TrustedProxies: TVDRX_IPMatcher read FTrustedProxies;
     // Shared port: a WebSocket upgrade request for exactly WebSocketPath on this site is handed to
     // WebSocket (same profiles, lockout, limits and Origin check as the WS port). nil / '' = off.
     property WebSocket: TVDRX_WebSocketExecutive read FWebSocket write FWebSocket;
@@ -57,9 +70,12 @@ type
     FCustomHeaders: TStringList;
     FWebSocket: TVDRX_WebSocketExecutive;
     FWebSocketPath: string;
+    FTrustForwarded: Boolean;
   public
     property WebSocket: TVDRX_WebSocketExecutive read FWebSocket write FWebSocket;
     property WebSocketPath: string read FWebSocketPath write FWebSocketPath;
+    // False (the default): client-supplied X-Forwarded-For & co. are removed before anything sees the request.
+    property TrustForwarded: Boolean read FTrustForwarded write FTrustForwarded;
     constructor Create(ABus: TVDRX_MessageQueue; ATransport: TVDRX_Transport;
       ATemplates: TVDRX_TemplateStore; AConfig: TVDRX_Config; const AStaticDir: string;
       const ARoutes: TVDRX_RouteTable; const AConn: TVDRX_ConnInfo;
@@ -82,13 +98,37 @@ begin
   FRoutes := ARoutes;
   FRegistry := ARegistry;
   FCustomHeaders := TStringList.Create;
+  FSecurityHeaders := True;
+  FTrustedProxies := TVDRX_IPMatcher.Create;
   Port := 8081;
 end;
 
 destructor TVDRX_HTTPExecutive.Destroy;
 begin
   FCustomHeaders.Free;
+  FTrustedProxies.Free;
   inherited Destroy;
+end;
+
+// Headers for ONE connection: the defaults, HSTS on TLS, then the site's own "headers" (which win).
+// A private list per connection, so a sys.reload that rebuilds the shared one cannot change it mid-response.
+procedure TVDRX_HTTPExecutive.BuildEffectiveHeaders(AList: TStringList; ASecure: Boolean);
+var
+  i: Integer;
+begin
+  if FSecurityHeaders then
+  begin
+    AList.Values['X-Content-Type-Options'] := 'nosniff';
+    AList.Values['X-Frame-Options'] := 'SAMEORIGIN';
+    AList.Values['Referrer-Policy'] := 'strict-origin-when-cross-origin';
+  end;
+  if ASecure and (FHSTSMaxAge > 0) then
+    AList.Values['Strict-Transport-Security'] := 'max-age=' + IntToStr(FHSTSMaxAge);
+  for i := 0 to FCustomHeaders.Count - 1 do
+    if FCustomHeaders.Names[i] <> '' then
+      AList.Values[FCustomHeaders.Names[i]] := FCustomHeaders.ValueFromIndex[i]
+    else if Trim(FCustomHeaders[i]) <> '' then
+      AList.Add(FCustomHeaders[i]);
 end;
 
 class function TVDRX_HTTPExecutive.BuildResponse(const ARequest: string;
@@ -136,7 +176,7 @@ begin
   if MatchProxyRoute(Path, ARoutes.Proxy, Route) then
   begin
     ABus.Publish('log.info', Format('http: %s %s -> proxy %s:%d', [Method, Path, Route.Host, Route.Port]), ASourceID);
-    Exit(ProxyRequest(Request, Route, ABus, ASourceID));
+    Exit(ProxyRequest(Request, Route, ABus, ASourceID, AConn.RemoteAddr, AConn.Secure));
   end;
 
   // 3. bus routes: http_routes and cgi entries
@@ -226,6 +266,9 @@ begin
     Request := ARequest
   else
     Request := ReadFullRequest(FTransport, TooLarge, TimedOut, BadStatus, BadWhy);
+  // "Who is the client" headers are only believed from a configured trusted proxy (see TrustedProxies).
+  if (Request <> '') and (BadStatus = '') and not FTrustForwarded then
+    Request := StripForwardedHeaders(Request);
 
   if BadStatus <> '' then
   begin
@@ -341,19 +384,24 @@ procedure TVDRX_HTTPExecutive.HandleConnection(ATransport: TVDRX_Transport);
 var
   Conn: TVDRX_HTTPConnection;
   Info: TVDRX_ConnInfo;
+  Headers: TStringList;
 begin
   Info.RemoteAddr := ATransport.PeerAddr;
   Info.RemotePort := ATransport.PeerPort;
   Info.Secure := ATransport.Secure;
   if Info.Secure then Info.ServerPort := TLSPort else Info.ServerPort := Port;
+  Headers := TStringList.Create;
+  BuildEffectiveHeaders(Headers, Info.Secure);
   Conn := TVDRX_HTTPConnection.Create(Bus, ATransport, FTemplates, FConfig, FStaticDir,
-    FRoutes, Info, FRegistry, ID, FCustomHeaders);
+    FRoutes, Info, FRegistry, ID, Headers);
   Conn.WebSocket := FWebSocket;
   Conn.WebSocketPath := FWebSocketPath;
+  Conn.TrustForwarded := FTrustedProxies.Matches(Info.RemoteAddr);
   try
     Conn.Run;
   finally
     Conn.Free;
+    Headers.Free;
   end;
 end;
 
@@ -402,6 +450,8 @@ begin
     CertFile := SiteRow.Values['tls_cert'];
     KeyFile := SiteRow.Values['tls_key'];
 
+    FSecurityHeaders := not VDRX_IsFalseText(SiteRow.Values['security_headers']);
+    FHSTSMaxAge := StrToIntDef(SiteRow.Values['hsts_max_age'], 0);
     FCustomHeaders.Clear;
     if (SiteRow.Values['cors'] = 'True') or (SiteRow.Values['cors'] = 'true') or (SiteRow.Values['cors'] = '1') then
     begin

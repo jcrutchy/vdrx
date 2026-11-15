@@ -24,6 +24,64 @@ rate-limited `log.warn`. Both apply to the plain and the TLS port.
 { "id": "intranet", "port": 8081, "bind": "10.1.2.3", "max_connections": 256 }
 ```
 
+**Per-address limits.** `max_connections` alone lets one client fill every slot, so each listener also
+limits what a single client address may do (all default to values that suit ordinary browsers; tune them for
+your traffic, and remember that many users behind one NAT or proxy share an address):
+
+| key | default | meaning |
+|---|---|---|
+| `max_connections_per_ip` | `64` | connections one address may have open at once; `0` = no limit |
+| `connection_rate_per_ip` | `20` | sustained new connections per second from one address (token bucket); `0` = no limit |
+| `connection_burst_per_ip` | `100` | bucket size: how many new connections an address may open at once before the rate applies |
+| `limit_exempt` | none | comma-separated IPv4 addresses or `a.b.c.d/n` ranges that are never limited (monitoring, a trusted proxy). Anything that does not parse is reported at startup and ignored, so that address stays limited |
+
+A refused connection is closed immediately without reading anything, and is counted in the same
+rate-limited `log.warn` as `max_connections` (which names the limit that was hit and the most recent address).
+The checks happen when the connection is *accepted*, in this order: `max_connections`, then the per-address
+limits, so a connection refused by the global cap never spends a token. The table of tracked addresses is
+bounded (65,536); when an attacker fills it with distinct addresses, new addresses are let through to the
+global cap rather than refused, so that exhausting the table cannot lock everybody out. Addresses are IPv4 only
+for now.
+
+**Who is the client? (forwarded headers).** vdrx is normally the first server a client reaches, so a request's
+`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `X-Client-IP`, `True-Client-IP`, `CF-Connecting-IP` and
+`X-Forwarded-*` headers (and their underscore spellings) were written by the client. Scripts and services behind
+vdrx often believe them (for rate limits, audit logs, "is this an internal address" checks), so vdrx **deletes
+them from every request** before routing: CGI never sees `HTTP_X_FORWARDED_FOR`, bus messages don't carry them,
+and a reverse-proxied upstream doesn't get them. For a reverse-proxy route vdrx instead tells the upstream the
+truth: `X-Forwarded-For: <the connecting address>` and `X-Forwarded-Proto: http|https`. CGI's `REMOTE_ADDR` was
+always the real peer.
+
+If vdrx sits behind a proxy or load balancer you do control, list it in **`trusted_proxies`** (comma-separated
+IPv4 addresses or `a.b.c.d/n` ranges, e.g. `"10.0.0.5, 10.1.0.0/16"`). Headers from those peers are believed and
+passed on, and a proxied request extends `X-Forwarded-For` with the peer's address. Note that vdrx's *own* idea of
+the client (per-address limits, the WebSocket login lockout, `REMOTE_ADDR`) is still the connecting address,
+which behind a proxy is the proxy: run vdrx directly on the internet if those must see real clients.
+
+**Security headers.** Every response from a site carries `X-Content-Type-Options: nosniff`,
+`X-Frame-Options: SAMEORIGIN` and `Referrer-Policy: strict-origin-when-cross-origin`. A header of the same name in
+the site's `headers` replaces the default (use that for `Content-Security-Policy`, `Permissions-Policy` or
+`X-Frame-Options: DENY`); `"security_headers": false` removes the defaults. **`hsts_max_age`** (seconds, default
+`0` = off) adds `Strict-Transport-Security` to responses sent over TLS only. Browsers remember HSTS, so turn it on
+once every name the site answers to works over https (start with a small value). `security_headers` and
+`hsts_max_age` are re-read by `sys.reload`; `trusted_proxies` is read at startup only.
+
+**TLS policy.** A site with a `tls_port` also takes these keys (the same four exist under `executives.ws`):
+
+| key | default | meaning |
+|---|---|---|
+| `tls_min_version` | `"1.2"` | `"1.2"` or `"1.3"`. Anything else (including `"1.0"`, `"1.1"`) is refused |
+| `tls_ciphers` | ECDHE with AES-GCM or ChaCha20-Poly1305 | TLS 1.2 cipher list in OpenSSL syntax. The server's order wins |
+| `tls_ciphersuites` | OpenSSL's TLS 1.3 default | TLS 1.3 suites, colon separated |
+| `tls_session_tickets` | `false` | OpenSSL never rotates ticket keys by itself, so tickets would undo forward secrecy for as long as the daemon runs; resumption still works through the server-side session cache |
+
+Compression and client-initiated renegotiation are always off. vdrx checks that the key belongs to the
+certificate and warns at startup if the key file is readable by anyone but its owner. The policy is applied
+and read back when the TLS port starts; if OpenSSL cannot honour it (an unknown cipher list, an
+old library), the TLS port is **not started** and the reason is logged as an error, while the plain port of
+the same site keeps running. A started port logs one `TLS policy: ...` line describing what is enforced.
+These keys are read at startup, not on `sys.reload`.
+
 **`websocket_path`** (e.g. `"/ws"`) serves WebSocket upgrades for that exact path on this site's port,
 so pages and WebSocket share one port - see [websocket.md](websocket.md). It needs `executives.ws.enabled`.
 

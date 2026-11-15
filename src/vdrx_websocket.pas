@@ -32,6 +32,7 @@ type
   TVDRX_WSConnection = class(TVDRX_ConnectionExecutive)
   private
     FListener: TVDRX_WebSocketExecutive;
+    FPeerAddr: string;    // kept for giving back the per-IP live slot after the transport is gone
     FThread: TThread;
     FSendThread: TThread;
     FSendLock: TCriticalSection;
@@ -118,7 +119,7 @@ type
     property AllowedOrigins: TStringList read FAllowedOrigins;
     function OriginAllowed(const ARequest: string): Boolean;
     // Called by a WS connection when it has fully ended (frees its slot in the live count).
-    procedure ConnectionEnded;
+    procedure ConnectionEnded(const APeerAddr: string);
     // Largest WebSocket frame a client may send (default 1 MiB). Bigger -> the connection is closed.
     property MaxFrameBytes: Integer read FMaxFrameBytes write FMaxFrameBytes;
     // Once a frame has started, how long each further read may take (default 15 s).
@@ -201,6 +202,7 @@ begin
   inherited Create(ABus);
   FListener := AListener;
   FTransport := ATransport;
+  FPeerAddr := ATransport.PeerAddr;
   FSendLock := TCriticalSection.Create;
   FSendEvent := TEvent.Create(nil, False, False, '');
   FSendQueue := TStringList.Create;
@@ -827,7 +829,7 @@ begin
   FStopping := True;
   // The connection is over: give its slot back now, not after the chores below (joining the ping
   // thread can take a second). Must stay before UnregisterSelf, which can destroy this object.
-  FListener.ConnectionEnded;
+  FListener.ConnectionEnded(FPeerAddr);
   if Assigned(FPingThread) then
   begin
     WaitThreadOrTimeout(FPingThread, 1000);
@@ -1097,10 +1099,19 @@ begin
     InterlockedDecrement(FLiveConns);
     try ATransport.Write(REFUSED[1], Length(REFUSED)); except end;
     ATransport.Free;
-    NoteRejected;
+    NoteRejected(0, '');
     Exit;
   end;
   if FMaxConnections <= 0 then InterlockedIncrement(FLiveConns);
+  // per-address cap on LIVE connections (the accept-time per-IP count is gone once this thread returns)
+  if not Limiter.TryAcquireLive(ATransport.PeerAddr) then
+  begin
+    InterlockedDecrement(FLiveConns);
+    try ATransport.Write(REFUSED[1], Length(REFUSED)); except end;
+    NoteRejected(1, ATransport.PeerAddr);
+    ATransport.Free;
+    Exit;
+  end;
   Result := True;
   Conn := TVDRX_WSConnection.Create(Bus, Self, ATransport);
   Conn.PendingRequest := AInitialRequest;
@@ -1117,8 +1128,9 @@ begin
   Conn.Initialize;
 end;
 
-procedure TVDRX_WebSocketExecutive.ConnectionEnded;
+procedure TVDRX_WebSocketExecutive.ConnectionEnded(const APeerAddr: string);
 begin
+  Limiter.ReleaseLive(APeerAddr);
   InterlockedDecrement(FLiveConns);
 end;
 
