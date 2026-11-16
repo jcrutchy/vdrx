@@ -14,9 +14,20 @@ with its own static-file root and its own template store:
 
 **Network exposure.** A listener binds to **`127.0.0.1` (loopback only) unless told otherwise**,
 so a fresh config is not reachable from other machines. To serve other hosts, set `bind` to the
-address of the interface they reach you on, or to `"0.0.0.0"` for every interface (vdrx prints a
+address of the interface they reach you on, or to `"0.0.0.0"` for every IPv4 interface (vdrx prints a
 warning at startup when you do). An address that doesn't parse is refused rather than falling
-back to all interfaces. `max_connections` (default `256`, `0` = unlimited) is how many
+back to all interfaces.
+
+**IPv6.** `bind` also takes an IPv6 address: `"::1"` (IPv6 loopback), a specific global address, or **`"::"` for every
+interface on both IPv6 and IPv4** (dual stack). To serve both families on a public host, `"bind": "::"` is all you
+need. A dual-stack socket sees an IPv4 client as `::ffff:a.b.c.d`; vdrx reports, limits and matches it as plain
+`a.b.c.d` everywhere (logs, `REMOTE_ADDR`, `X-Forwarded-For`, `limit_exempt`, `trusted_proxies`), so nothing
+else in the configuration changes. A specific IPv6 address listens on IPv6 only, and an IPv4-mapped address
+(`"::ffff:1.2.3.4"`) is refused (write it as `1.2.3.4`). If the host has no IPv6, an IPv6 `bind` logs an error and
+that listener does not start; other listeners are unaffected. **Per-client counting treats an IPv6 client as its
+/64:** whoever holds an IPv6 network normally holds the whole /64, so counting single addresses would let them
+dodge every limit. The per-address connection limits and the WebSocket login lockout both use it. IPv6 reaches
+vdrx's *clients* only: reverse-proxy upstreams, `socket_clients` and the other outbound connections are IPv4. `max_connections` (default `256`, `0` = unlimited) is how many
 connections the listener serves at once; further ones are closed immediately and counted in a
 rate-limited `log.warn`. Both apply to the plain and the TLS port.
 
@@ -33,15 +44,15 @@ your traffic, and remember that many users behind one NAT or proxy share an addr
 | `max_connections_per_ip` | `64` | connections one address may have open at once; `0` = no limit |
 | `connection_rate_per_ip` | `20` | sustained new connections per second from one address (token bucket); `0` = no limit |
 | `connection_burst_per_ip` | `100` | bucket size: how many new connections an address may open at once before the rate applies |
-| `limit_exempt` | none | comma-separated IPv4 addresses or `a.b.c.d/n` ranges that are never limited (monitoring, a trusted proxy). Anything that does not parse is reported at startup and ignored, so that address stays limited |
+| `limit_exempt` | none | comma-separated IP addresses or ranges (`203.0.113.7`, `10.0.0.0/8`, `2001:db8::/32`) that are never limited (monitoring, a trusted proxy). Anything that does not parse is reported at startup and ignored, so that address stays limited |
 
 A refused connection is closed immediately without reading anything, and is counted in the same
 rate-limited `log.warn` as `max_connections` (which names the limit that was hit and the most recent address).
 The checks happen when the connection is *accepted*, in this order: `max_connections`, then the per-address
 limits, so a connection refused by the global cap never spends a token. The table of tracked addresses is
 bounded (65,536); when an attacker fills it with distinct addresses, new addresses are let through to the
-global cap rather than refused, so that exhausting the table cannot lock everybody out. Addresses are IPv4 only
-for now.
+global cap rather than refused, so that exhausting the table cannot lock everybody out. IPv6 clients are counted
+per /64 (see above); for `limit_exempt` and `trusted_proxies` a range's prefix length is in its own family.
 
 **Who is the client? (forwarded headers).** vdrx is normally the first server a client reaches, so a request's
 `X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `X-Client-IP`, `True-Client-IP`, `CF-Connecting-IP` and
@@ -53,7 +64,7 @@ truth: `X-Forwarded-For: <the connecting address>` and `X-Forwarded-Proto: http|
 always the real peer.
 
 If vdrx sits behind a proxy or load balancer you do control, list it in **`trusted_proxies`** (comma-separated
-IPv4 addresses or `a.b.c.d/n` ranges, e.g. `"10.0.0.5, 10.1.0.0/16"`). Headers from those peers are believed and
+IP addresses or ranges, e.g. `"10.0.0.5, 10.1.0.0/16, 2001:db8:1::/48"`). Headers from those peers are believed and
 passed on, and a proxied request extends `X-Forwarded-For` with the peer's address. Note that vdrx's *own* idea of
 the client (per-address limits, the WebSocket login lockout, `REMOTE_ADDR`) is still the connecting address,
 which behind a proxy is the proxy: run vdrx directly on the internet if those must see real clients.

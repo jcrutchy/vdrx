@@ -49,7 +49,7 @@ bodies, and the absence of per-topic access control beyond `ws_profiles`.
   to a trusted CA; keep `tls_verify` on. Everything written to the log has line breaks and control characters escaped, so a
   client cannot forge log entries or drive the operator's terminal.
 - Failed WebSocket logins are rate-limited per address (8 per minute, then a one-minute lockout).
-- Listeners bind to `127.0.0.1` by default. Set `bind` to the one interface that needs to be
+- Listeners bind to `127.0.0.1` by default (`"::"` serves IPv6 and IPv4 together; per-client limits and the login lockout count an IPv6 client as its /64). Set `bind` to the one interface that needs to be
   reachable (avoid `0.0.0.0`) and firewall the port to the hosts that need it.
 - Keep `max_connections` at a sensible figure for the expected number of clients (default 256 per listener).
   Each listener also limits a single client address (`max_connections_per_ip`, `connection_rate_per_ip`,

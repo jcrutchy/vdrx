@@ -21,6 +21,8 @@ echo; echo "== unit: per-address connection limits"
 out=$(bin/test_iplimit 2>/dev/null); rc=$?; echo "  $(echo "$out" | tail -1)"; [ $rc -eq 0 ] || { echo "$out" | grep -E "FAIL" | sed "s/^/  /"; fail=1; }
 echo; echo "== unit: forwarded headers"
 out=$(bin/test_httphdr 2>/dev/null); rc=$?; echo "  $(echo "$out" | tail -1)"; [ $rc -eq 0 ] || { echo "$out" | grep -E "FAIL" | sed "s/^/  /"; fail=1; }
+echo; echo "== unit: accepted-peer decoding (IPv4 / IPv6 socket layouts)"
+out=$(bin/test_peer 2>/dev/null); rc=$?; echo "  $(echo "$out" | tail -1)"; [ $rc -eq 0 ] || { echo "$out" | grep -E "FAIL" | sed "s/^/  /"; fail=1; }
 echo; echo "== unit: topic coverage (ws_profiles allow rules are sound)"
 out=$(bin/test_topiccover 2>/dev/null); rc=$?; echo "  $(echo "$out" | tail -1)"; [ $rc -eq 0 ] || { echo "$out" | grep -E "FAIL|UNSOUND" | sed "s/^/  /"; fail=1; }
 echo; tests/integration/run.sh || fail=1

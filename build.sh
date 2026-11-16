@@ -22,6 +22,7 @@ if [ "$1" = "tests" ]; then
   $FPC tests/unit/test_linebuf.lpr
   $FPC tests/unit/test_iplimit.lpr
   $FPC tests/unit/test_httphdr.lpr
+  $FPC tests/unit/test_peer.lpr
   $FPC tests/unit/test_topiccover.lpr
   for t in test_stall test_socket_stall; do $FPC tests/manual/$t.lpr; done
   $FPC tests/stress/vdrx_stress.lpr

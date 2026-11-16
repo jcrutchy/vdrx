@@ -61,6 +61,18 @@ check("X-Forwarded-Proto: http\r\n" in log and "X-Forwarded-Proto: https" not in
 r = talk(18099, FORGED, src="127.0.0.2"); log2 = upstream_log()
 check("X-Forwarded-For: 127.0.0.2\r\n" in log2, "a different client address is reported as that address", log2[-300:])
 
+print("-- what a CGI program sees")
+ENVREQ = (b"GET /cgi/env.py HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 6.6.6.6\r\nX-Real-IP: 7.7.7.7\r\nForwarded: for=8.8.8.8\r\nX-Other: kept\r\n\r\n")
+def cgi_env(port):
+    body = talk(port, ENVREQ).split(b"\r\n\r\n", 1)[-1].decode("latin1")
+    return dict(l.split("=", 1) for l in body.splitlines() if "=" in l)
+env = cgi_env(18099)
+check(env.get("HTTP_X_OTHER") == "kept", "an ordinary header still reaches the program", sorted(k for k in env if k.startswith("HTTP_")))
+check(not any(k in env for k in ("HTTP_X_FORWARDED_FOR", "HTTP_X_REAL_IP", "HTTP_FORWARDED")), "an untrusted client's forwarded headers are not in the program's environment", {k: v for k, v in env.items() if k.startswith("HTTP_")})
+check(env.get("REMOTE_ADDR") == "127.0.0.1", "REMOTE_ADDR is the real peer", env.get("REMOTE_ADDR"))
+env = cgi_env(18100)
+check(env.get("HTTP_X_FORWARDED_FOR") == "6.6.6.6" and env.get("HTTP_X_REAL_IP") == "7.7.7.7", "a trusted peer's headers are passed to the program", {k: v for k, v in env.items() if k.startswith("HTTP_")})
+
 print("-- a trusted proxy is believed, and its chain is extended")
 reset(); r = talk(18100, FORGED)
 log = upstream_log()

@@ -72,7 +72,7 @@ try:
     check("no HOME / USER / SHELL leak either", not any(k in env for k in ("HOME", "USER", "SHELL", "LOGNAME")), [k for k in ("HOME", "USER", "SHELL") if k in env])
 
     if mode == "default":
-        print("-- request headers become HTTP_* variables")
+        print("-- request headers become HTTP_* variables (this fixture trusts 127.0.0.1 as a proxy, so X-Forwarded-For is passed on)")
         env = envdict(raw_get("/cgi/env.py", ["X_Forwarded_For: 6.6.6.6", "X-Forwarded-For: 1.1.1.1", "x-forwarded-for: 2.2.2.2",
                                                "x.weird: dotted", "Proxy: http://evil.example:8888", "X-Real: ok"]))
         check("X-Forwarded-For: the first spelling wins, the underscore and lowercase copies are ignored", env.get("HTTP_X_FORWARDED_FOR") == "1.1.1.1", env.get("HTTP_X_FORWARDED_FOR"))

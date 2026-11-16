@@ -120,7 +120,7 @@ begin
   for Item in SplitString(AExempt, ',') do
     if Trim(Item) <> '' then
       if not L.AddExempt(Trim(Item)) then
-        WriteLn('  WARNING: ', AWhere, ': limit_exempt entry "', Item, '" is not an IPv4 address or a.b.c.d/n range - ignored (that address stays limited)');
+        WriteLn('  WARNING: ', AWhere, ': limit_exempt entry "', Item, '" is not an IP address or address/prefix range - ignored (that address stays limited)');
   if (L.MaxPerIP = 0) and (L.RatePerSec = 0) then
     WriteLn('  WARNING: ', AWhere, ': per-address connection limits are OFF (max_connections_per_ip and connection_rate_per_ip are 0)');
 end;
@@ -141,7 +141,7 @@ begin
       if AHTTP.TrustedProxies.Add(Trim(Item)) then
         WriteLn('  ', AWhere, ': trusting X-Forwarded-For & co. from ', Trim(Item))
       else
-        WriteLn('  WARNING: ', AWhere, ': trusted_proxies entry "', Item, '" is not an IPv4 address or a.b.c.d/n range - ignored (that peer is NOT trusted)');
+        WriteLn('  WARNING: ', AWhere, ': trusted_proxies entry "', Item, '" is not an IP address or address/prefix range - ignored (that peer is NOT trusted)');
 end;
 
 procedure ConfigureListenerTLSPolicy(AListener: TVDRX_SocketListenerExecutive; const AMinVersion, ACiphers,
@@ -181,9 +181,14 @@ end;
 
 procedure ReportListener(AListener: TVDRX_SocketListenerExecutive; const AName: string);
 begin
-  WriteLn('  ', AName, ' listening on ', AListener.BindAddress, ':', AListener.Port, '.');
-  if (AListener.BindAddress = '0.0.0.0') or (AListener.BindAddress = '') then
+  if Pos(':', AListener.BindAddress) > 0 then
+    WriteLn('  ', AName, ' listening on [', AListener.BindAddress, ']:', AListener.Port, '.')
+  else
+    WriteLn('  ', AName, ' listening on ', AListener.BindAddress, ':', AListener.Port, '.');
+  if (AListener.BindAddress = '0.0.0.0') or (AListener.BindAddress = '') or (Trim(AListener.BindAddress) = '::') then
     WriteLn('  ', AName, ' WARNING: bound to ALL network interfaces - make sure a firewall limits who can reach it.');
+  if Trim(AListener.BindAddress) = '::' then
+    WriteLn('  ', AName, ' ("::" accepts IPv6 and IPv4 clients; IPv4 clients are reported as plain IPv4 addresses.)');
   // The TLS listener is created when the kernel starts the executive, which is
   // after this runs - so whether it came up cannot be known here. A failure is
   // logged as an error by TVDRX_SocketListenerExecutive.Initialize.

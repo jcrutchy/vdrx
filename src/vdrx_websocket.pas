@@ -8,7 +8,7 @@ unit vdrx_websocket;
 interface
 
 uses
-  Classes, SysUtils, StrUtils, SyncObjs, Generics.Collections, openssl, {$IFDEF UNIX}BaseUnix, {$ENDIF} dynlibs, base64, sha1, fpjson, jsonparser, DateUtils, Types, vdrx_core, vdrx_config, vdrx_procutil, vdrx_transport, vdrx_connection, vdrx_httpparse;
+  Classes, SysUtils, StrUtils, SyncObjs, Generics.Collections, openssl, {$IFDEF UNIX}BaseUnix, {$ENDIF} dynlibs, base64, sha1, fpjson, jsonparser, DateUtils, Types, vdrx_core, vdrx_config, vdrx_procutil, vdrx_transport, vdrx_connection, vdrx_iplimit, vdrx_httpparse;
 
 type
 
@@ -961,11 +961,13 @@ end;
 function TVDRX_WebSocketExecutive.AuthLocked(const AIP: string): Boolean;
 var
   T: TVDRX_AuthTrack;
+  Addr: string;
 begin
   Result := False;
+  Addr := VDRX_LimitKey(AIP);          // an IPv6 client is locked out as its whole /64
   FAuthLock.Acquire;
   try
-    if FAuthTrack.TryGetValue(AIP, T) then
+    if FAuthTrack.TryGetValue(Addr, T) then
       Result := T.LockedUntil > GetTickCount64;
   finally
     FAuthLock.Release;
@@ -978,12 +980,14 @@ var
   Now: QWord;
   Key: string;
   Stale: TStringList;
+  Addr: string;
 begin
   Result := False;
   Now := GetTickCount64;
+  Addr := VDRX_LimitKey(AIP);          // an IPv6 client is locked out as its whole /64
   FAuthLock.Acquire;
   try
-    if not FAuthTrack.TryGetValue(AIP, T) then
+    if not FAuthTrack.TryGetValue(Addr, T) then
     begin
       T.Fails := 0; T.WindowStart := Now; T.LockedUntil := 0;
       if FAuthTrack.Count >= AUTH_TRACK_MAX then
@@ -1013,7 +1017,7 @@ begin
       T.WindowStart := Now;
       Result := True;
     end;
-    FAuthTrack.AddOrSetValue(AIP, T);
+    FAuthTrack.AddOrSetValue(Addr, T);
   finally
     FAuthLock.Release;
   end;
@@ -1023,7 +1027,7 @@ procedure TVDRX_WebSocketExecutive.NoteAuthSuccess(const AIP: string);
 begin
   FAuthLock.Acquire;
   try
-    FAuthTrack.Remove(AIP);
+    FAuthTrack.Remove(VDRX_LimitKey(AIP));
   finally
     FAuthLock.Release;
   end;

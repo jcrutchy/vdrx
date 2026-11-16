@@ -20,6 +20,12 @@
 - The logger masks credentials by pattern (`log_redact`, on by default, bodies
   included). That is a safety net: a secret carried in a member the patterns do
   not know, or in a job's own output, is logged as-is. Buckets are never masked.
+- **IPv6 listening is new and was only partly tested.** The address logic (parsing, formatting, /64 counting, IPv6
+  ranges) and the decoding of an accepted peer against the kernel's socket layout are unit-tested, and an IPv6 `bind`
+  on a host without IPv6 is tested to fail closed. The `ipv6` integration section exercises real IPv6 and dual-stack
+  sockets but skips itself on a host without IPv6 - it has not been run against a live IPv6 stack, so run
+  `tests/integration/run.sh ipv6` on one before relying on it. Windows and macOS differ in socket constants and are
+  untested. Outbound connections (proxy upstreams, `socket_clients`) are IPv4 only.
 - **TLS policy is read at startup only, and Windows is untested.** vdrx now sets its own TLS policy
   (`tls_min_version`, `tls_ciphers`, `tls_ciphersuites`, `tls_session_tickets`; see docs/http.md) and refuses
   to start a TLS port whose policy it cannot enforce, but a `sys.reload` does not re-read those keys (restart

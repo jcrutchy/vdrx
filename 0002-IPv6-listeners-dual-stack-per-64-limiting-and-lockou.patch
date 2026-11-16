@@ -1,0 +1,1294 @@
+From 74dd3bde2df71ea2da178031f2e49db3ff1cb2cc Mon Sep 17 00:00:00 2001
+From: Claude <claude@example.invalid>
+Date: Sun, 15 Nov 2026 22:35:10 +0000
+Subject: [PATCH 2/2] IPv6 listeners (dual stack), per-/64 limiting and
+ lockout, IPv6 ranges in limit_exempt/trusted_proxies
+
+- bind accepts IPv6 (::1, specific address, :: = dual stack); IPv4-mapped peers reported as plain IPv4
+- vdrx_iplimit: IPv4/IPv6 parse+format (RFC 5952), per-/64 limit key, 128-bit CIDR matcher
+- WebSocket login lockout counted per /64
+- DecodePeer unit-tested against kernel sockaddr layouts; ipv6 integration section (skips without IPv6)
+- spawn fixture trusts 127.0.0.1 as proxy; edge-policy checks CGI-side forwarded headers
+---
+ SECURITY.md                                   |   2 +-
+ build.sh                                      |   1 +
+ docs/http.md                                  |  23 +-
+ docs/known-gaps.md                            |   6 +
+ docs/websocket.md                             |   2 +-
+ src/vdrx.lpr                                  |  13 +-
+ src/vdrx_connection.pas                       | 136 +++++++++++-
+ src/vdrx_iplimit.pas                          | 210 ++++++++++++++++--
+ src/vdrx_websocket.pas                        |  14 +-
+ tests/integration/edge-policy/cgi/env.py      |   3 +
+ .../edge-policy/edge_policy_test.py           |  12 +
+ tests/integration/edge-policy/vdrx.conf       |   2 +
+ tests/integration/ipv6/ipv6_test.py           | 110 +++++++++
+ tests/integration/ipv6/upstream.py            |  43 ++++
+ tests/integration/ipv6/vdrx.conf              |  17 ++
+ tests/integration/ipv6/www/index.html         |   1 +
+ tests/integration/run.sh                      |  11 +-
+ tests/integration/spawn/spawn_test.py         |   2 +-
+ tests/integration/spawn/vdrx.conf             |   2 +-
+ tests/run.sh                                  |   2 +
+ tests/unit/test_iplimit.lpr                   |  86 +++++++
+ tests/unit/test_peer.lpr                      |  86 +++++++
+ 22 files changed, 736 insertions(+), 48 deletions(-)
+ create mode 100644 tests/integration/edge-policy/cgi/env.py
+ create mode 100644 tests/integration/ipv6/ipv6_test.py
+ create mode 100644 tests/integration/ipv6/upstream.py
+ create mode 100644 tests/integration/ipv6/vdrx.conf
+ create mode 100644 tests/integration/ipv6/www/index.html
+ create mode 100644 tests/unit/test_peer.lpr
+
+diff --git a/SECURITY.md b/SECURITY.md
+index 0613119..059be3e 100644
+--- a/SECURITY.md
++++ b/SECURITY.md
+@@ -49,7 +49,7 @@ bodies, and the absence of per-topic access control beyond `ws_profiles`.
+   to a trusted CA; keep `tls_verify` on. Everything written to the log has line breaks and control characters escaped, so a
+   client cannot forge log entries or drive the operator's terminal.
+ - Failed WebSocket logins are rate-limited per address (8 per minute, then a one-minute lockout).
+-- Listeners bind to `127.0.0.1` by default. Set `bind` to the one interface that needs to be
++- Listeners bind to `127.0.0.1` by default (`"::"` serves IPv6 and IPv4 together; per-client limits and the login lockout count an IPv6 client as its /64). Set `bind` to the one interface that needs to be
+   reachable (avoid `0.0.0.0`) and firewall the port to the hosts that need it.
+ - Keep `max_connections` at a sensible figure for the expected number of clients (default 256 per listener).
+   Each listener also limits a single client address (`max_connections_per_ip`, `connection_rate_per_ip`,
+diff --git a/build.sh b/build.sh
+index 2f7c7c4..273adaf 100755
+--- a/build.sh
++++ b/build.sh
+@@ -22,6 +22,7 @@ if [ "$1" = "tests" ]; then
+   $FPC tests/unit/test_linebuf.lpr
+   $FPC tests/unit/test_iplimit.lpr
+   $FPC tests/unit/test_httphdr.lpr
++  $FPC tests/unit/test_peer.lpr
+   $FPC tests/unit/test_topiccover.lpr
+   for t in test_stall test_socket_stall; do $FPC tests/manual/$t.lpr; done
+   $FPC tests/stress/vdrx_stress.lpr
+diff --git a/docs/http.md b/docs/http.md
+index add0f74..3035aee 100644
+--- a/docs/http.md
++++ b/docs/http.md
+@@ -14,9 +14,20 @@ with its own static-file root and its own template store:
+ 
+ **Network exposure.** A listener binds to **`127.0.0.1` (loopback only) unless told otherwise**,
+ so a fresh config is not reachable from other machines. To serve other hosts, set `bind` to the
+-address of the interface they reach you on, or to `"0.0.0.0"` for every interface (vdrx prints a
++address of the interface they reach you on, or to `"0.0.0.0"` for every IPv4 interface (vdrx prints a
+ warning at startup when you do). An address that doesn't parse is refused rather than falling
+-back to all interfaces. `max_connections` (default `256`, `0` = unlimited) is how many
++back to all interfaces.
++
++**IPv6.** `bind` also takes an IPv6 address: `"::1"` (IPv6 loopback), a specific global address, or **`"::"` for every
++interface on both IPv6 and IPv4** (dual stack). To serve both families on a public host, `"bind": "::"` is all you
++need. A dual-stack socket sees an IPv4 client as `::ffff:a.b.c.d`; vdrx reports, limits and matches it as plain
++`a.b.c.d` everywhere (logs, `REMOTE_ADDR`, `X-Forwarded-For`, `limit_exempt`, `trusted_proxies`), so nothing
++else in the configuration changes. A specific IPv6 address listens on IPv6 only, and an IPv4-mapped address
++(`"::ffff:1.2.3.4"`) is refused (write it as `1.2.3.4`). If the host has no IPv6, an IPv6 `bind` logs an error and
++that listener does not start; other listeners are unaffected. **Per-client counting treats an IPv6 client as its
++/64:** whoever holds an IPv6 network normally holds the whole /64, so counting single addresses would let them
++dodge every limit. The per-address connection limits and the WebSocket login lockout both use it. IPv6 reaches
++vdrx's *clients* only: reverse-proxy upstreams, `socket_clients` and the other outbound connections are IPv4. `max_connections` (default `256`, `0` = unlimited) is how many
+ connections the listener serves at once; further ones are closed immediately and counted in a
+ rate-limited `log.warn`. Both apply to the plain and the TLS port.
+ 
+@@ -33,15 +44,15 @@ your traffic, and remember that many users behind one NAT or proxy share an addr
+ | `max_connections_per_ip` | `64` | connections one address may have open at once; `0` = no limit |
+ | `connection_rate_per_ip` | `20` | sustained new connections per second from one address (token bucket); `0` = no limit |
+ | `connection_burst_per_ip` | `100` | bucket size: how many new connections an address may open at once before the rate applies |
+-| `limit_exempt` | none | comma-separated IPv4 addresses or `a.b.c.d/n` ranges that are never limited (monitoring, a trusted proxy). Anything that does not parse is reported at startup and ignored, so that address stays limited |
++| `limit_exempt` | none | comma-separated IP addresses or ranges (`203.0.113.7`, `10.0.0.0/8`, `2001:db8::/32`) that are never limited (monitoring, a trusted proxy). Anything that does not parse is reported at startup and ignored, so that address stays limited |
+ 
+ A refused connection is closed immediately without reading anything, and is counted in the same
+ rate-limited `log.warn` as `max_connections` (which names the limit that was hit and the most recent address).
+ The checks happen when the connection is *accepted*, in this order: `max_connections`, then the per-address
+ limits, so a connection refused by the global cap never spends a token. The table of tracked addresses is
+ bounded (65,536); when an attacker fills it with distinct addresses, new addresses are let through to the
+-global cap rather than refused, so that exhausting the table cannot lock everybody out. Addresses are IPv4 only
+-for now.
++global cap rather than refused, so that exhausting the table cannot lock everybody out. IPv6 clients are counted
++per /64 (see above); for `limit_exempt` and `trusted_proxies` a range's prefix length is in its own family.
+ 
+ **Who is the client? (forwarded headers).** vdrx is normally the first server a client reaches, so a request's
+ `X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `X-Client-IP`, `True-Client-IP`, `CF-Connecting-IP` and
+@@ -53,7 +64,7 @@ truth: `X-Forwarded-For: <the connecting address>` and `X-Forwarded-Proto: http|
+ always the real peer.
+ 
+ If vdrx sits behind a proxy or load balancer you do control, list it in **`trusted_proxies`** (comma-separated
+-IPv4 addresses or `a.b.c.d/n` ranges, e.g. `"10.0.0.5, 10.1.0.0/16"`). Headers from those peers are believed and
++IP addresses or ranges, e.g. `"10.0.0.5, 10.1.0.0/16, 2001:db8:1::/48"`). Headers from those peers are believed and
+ passed on, and a proxied request extends `X-Forwarded-For` with the peer's address. Note that vdrx's *own* idea of
+ the client (per-address limits, the WebSocket login lockout, `REMOTE_ADDR`) is still the connecting address,
+ which behind a proxy is the proxy: run vdrx directly on the internet if those must see real clients.
+diff --git a/docs/known-gaps.md b/docs/known-gaps.md
+index 07ef886..7c53f0e 100644
+--- a/docs/known-gaps.md
++++ b/docs/known-gaps.md
+@@ -20,6 +20,12 @@
+ - The logger masks credentials by pattern (`log_redact`, on by default, bodies
+   included). That is a safety net: a secret carried in a member the patterns do
+   not know, or in a job's own output, is logged as-is. Buckets are never masked.
++- **IPv6 listening is new and was only partly tested.** The address logic (parsing, formatting, /64 counting, IPv6
++  ranges) and the decoding of an accepted peer against the kernel's socket layout are unit-tested, and an IPv6 `bind`
++  on a host without IPv6 is tested to fail closed. The `ipv6` integration section exercises real IPv6 and dual-stack
++  sockets but skips itself on a host without IPv6 - it has not been run against a live IPv6 stack, so run
++  `tests/integration/run.sh ipv6` on one before relying on it. Windows and macOS differ in socket constants and are
++  untested. Outbound connections (proxy upstreams, `socket_clients`) are IPv4 only.
+ - **TLS policy is read at startup only, and Windows is untested.** vdrx now sets its own TLS policy
+   (`tls_min_version`, `tls_ciphers`, `tls_ciphersuites`, `tls_session_tickets`; see docs/http.md) and refuses
+   to start a TLS port whose policy it cannot enforce, but a `sys.reload` does not re-read those keys (restart
+diff --git a/docs/websocket.md b/docs/websocket.md
+index 1f86bfc..dc66a8e 100644
+--- a/docs/websocket.md
++++ b/docs/websocket.md
+@@ -8,7 +8,7 @@ on top:
+ { "enabled": true, "port": 8082, "ping_interval_ms": 15000, "pong_timeout_ms": 10000 }
+ ```
+ 
+-`bind` works exactly as for `http_sites` (§4): loopback only by default.
++`bind` works exactly as for `http_sites` (§4), IPv6 and `"::"` included: loopback only by default. The failed-login lockout counts an IPv6 client as its whole /64.
+ 
+ **`max_connections`** (default `256`) is the number of *live* WebSocket connections, counted across the
+ WebSocket port and any HTTP site's shared port (below). A new connection over the limit is answered
+diff --git a/src/vdrx.lpr b/src/vdrx.lpr
+index 347b710..16d5972 100644
+--- a/src/vdrx.lpr
++++ b/src/vdrx.lpr
+@@ -120,7 +120,7 @@ begin
+   for Item in SplitString(AExempt, ',') do
+     if Trim(Item) <> '' then
+       if not L.AddExempt(Trim(Item)) then
+-        WriteLn('  WARNING: ', AWhere, ': limit_exempt entry "', Item, '" is not an IPv4 address or a.b.c.d/n range - ignored (that address stays limited)');
++        WriteLn('  WARNING: ', AWhere, ': limit_exempt entry "', Item, '" is not an IP address or address/prefix range - ignored (that address stays limited)');
+   if (L.MaxPerIP = 0) and (L.RatePerSec = 0) then
+     WriteLn('  WARNING: ', AWhere, ': per-address connection limits are OFF (max_connections_per_ip and connection_rate_per_ip are 0)');
+ end;
+@@ -141,7 +141,7 @@ begin
+       if AHTTP.TrustedProxies.Add(Trim(Item)) then
+         WriteLn('  ', AWhere, ': trusting X-Forwarded-For & co. from ', Trim(Item))
+       else
+-        WriteLn('  WARNING: ', AWhere, ': trusted_proxies entry "', Item, '" is not an IPv4 address or a.b.c.d/n range - ignored (that peer is NOT trusted)');
++        WriteLn('  WARNING: ', AWhere, ': trusted_proxies entry "', Item, '" is not an IP address or address/prefix range - ignored (that peer is NOT trusted)');
+ end;
+ 
+ procedure ConfigureListenerTLSPolicy(AListener: TVDRX_SocketListenerExecutive; const AMinVersion, ACiphers,
+@@ -181,9 +181,14 @@ end;
+ 
+ procedure ReportListener(AListener: TVDRX_SocketListenerExecutive; const AName: string);
+ begin
+-  WriteLn('  ', AName, ' listening on ', AListener.BindAddress, ':', AListener.Port, '.');
+-  if (AListener.BindAddress = '0.0.0.0') or (AListener.BindAddress = '') then
++  if Pos(':', AListener.BindAddress) > 0 then
++    WriteLn('  ', AName, ' listening on [', AListener.BindAddress, ']:', AListener.Port, '.')
++  else
++    WriteLn('  ', AName, ' listening on ', AListener.BindAddress, ':', AListener.Port, '.');
++  if (AListener.BindAddress = '0.0.0.0') or (AListener.BindAddress = '') or (Trim(AListener.BindAddress) = '::') then
+     WriteLn('  ', AName, ' WARNING: bound to ALL network interfaces - make sure a firewall limits who can reach it.');
++  if Trim(AListener.BindAddress) = '::' then
++    WriteLn('  ', AName, ' ("::" accepts IPv6 and IPv4 clients; IPv4 clients are reported as plain IPv4 addresses.)');
+   // The TLS listener is created when the kernel starts the executive, which is
+   // after this runs - so whether it came up cannot be known here. A failure is
+   // logged as an error by TVDRX_SocketListenerExecutive.Initialize.
+diff --git a/src/vdrx_connection.pas b/src/vdrx_connection.pas
+index ea25117..9325518 100644
+--- a/src/vdrx_connection.pas
++++ b/src/vdrx_connection.pas
+@@ -11,6 +11,9 @@ uses
+   Classes, SysUtils, StrUtils, Sockets, SyncObjs, {$IFDEF UNIX}BaseUnix, {$ENDIF} dynlibs, vdrx_core, vdrx_procutil, vdrx_transport, vdrx_iplimit;
+ 
+ type
++  // big enough (and aligned) for any socket address: what accept() fills in
++  TVDRX_SockStorage = array[0..15] of Int64;
++
+ 
+   TVDRX_SocketListenerExecutive = class;
+ 
+@@ -73,6 +76,7 @@ type
+     function BindListenSocket(APort: Word): TSocket;
+     function CompleteTLSHandshake(ASock: TSocket; const APeerAddr: string; APeerPort: Word): TVDRX_Transport;
+     function TryReserve(const AAddr: string): Boolean;
++    function BindListenSocket6(APort: Word; const ABindStr: string): TSocket;
+     procedure AcceptLoopPlain;
+     procedure AcceptLoopTLS;
+     function WaitConnGone(AThread: TVDRX_ListenerConnThread; ATimeoutMs: Integer): Boolean;
+@@ -115,6 +119,10 @@ type
+     destructor Destroy; override;
+   end;
+ 
++// The peer of an accepted connection as vdrx reports it everywhere (logs, REMOTE_ADDR, limits): a dotted
++// quad for IPv4 and for an IPv4-mapped IPv6 peer, RFC 5952 text for IPv6. False for any other address family.
++function DecodePeer(var AStore: TVDRX_SockStorage; out AAddr: string; out APort: Word): Boolean;
++
+ implementation
+ 
+ constructor TVDRX_ListenerConnThread.Create(AOwner: TVDRX_SocketListenerExecutive; ATransport: TVDRX_Transport);
+@@ -232,6 +240,107 @@ begin
+   FTLSPolicy := APolicy;
+ end;
+ 
++// ---- address families -------------------------------------------------------------------------
++// An IPv4 listener is the original code path below, unchanged. An IPv6 bind address ("::" or "::1" or a
++// global address) takes the separate BindListenSocket6 path. "::" listens on IPv4 as well (dual stack);
++// an IPv4 client then arrives as ::ffff:a.b.c.d and DecodePeer reports it as plain a.b.c.d, so limits,
++// exempt ranges and trusted proxies treat it exactly as they would on an IPv4 socket.
++const
++  VDRX_IPPROTO_IPV6 = 41;
++  {$IFDEF LINUX}
++  VDRX_IPV6_V6ONLY = 26;
++  {$ELSE}
++  VDRX_IPV6_V6ONLY = 27;
++  {$ENDIF}
++
++function DecodePeer(var AStore: TVDRX_SockStorage; out AAddr: string; out APort: Word): Boolean;
++var
++  P4: PInetSockAddr;
++  P6: PInetSockAddr6;
++  B: TVDRX_IP16;
++begin
++  Result := True;
++  case PSockAddr(@AStore)^.sa_family of
++    AF_INET:
++      begin
++        P4 := PInetSockAddr(@AStore);
++        AAddr := NetAddrToStr(P4^.sin_addr);
++        APort := ntohs(P4^.sin_port);
++      end;
++    AF_INET6:
++      begin
++        P6 := PInetSockAddr6(@AStore);
++        Move(P6^.sin6_addr, B, SizeOf(B));
++        AAddr := VDRX_FormatIP(B);
++        APort := ntohs(P6^.sin6_port);
++      end;
++  else
++    AAddr := '';
++    APort := 0;
++    Result := False;
++  end;
++end;
++
++function TVDRX_SocketListenerExecutive.BindListenSocket6(APort: Word; const ABindStr: string): TSocket;
++var
++  Addr: TInetSockAddr6;
++  B: TVDRX_IP16;
++  OptVal: LongInt;
++  i: Integer;
++  AnyAddr, Mapped: Boolean;
++begin
++  if (not VDRX_ParseIP(ABindStr, B)) then
++  begin
++    Bus.Publish('log.error', ID + ': invalid bind address "' + FBindAddress +
++      '" (use an IPv4 address, an IPv6 address such as "::1" or "::", or "localhost") - not listening on port ' +
++      IntToStr(APort), ID);
++    Exit(-1);
++  end;
++  Mapped := True;
++  for i := 0 to 9 do if B[i] <> 0 then Mapped := False;
++  if Mapped and (B[10] = $FF) and (B[11] = $FF) then
++  begin
++    Bus.Publish('log.error', ID + ': bind address "' + FBindAddress + '" is an IPv4-mapped IPv6 address - ' +
++      'write it as a plain IPv4 address, or use "::" to listen on IPv4 and IPv6 - not listening on port ' +
++      IntToStr(APort), ID);
++    Exit(-1);
++  end;
++  AnyAddr := True;
++  for i := 0 to 15 do if B[i] <> 0 then AnyAddr := False;
++  Result := fpSocket(AF_INET6, SOCK_STREAM, 0);
++  if Result = -1 then
++  begin
++    Bus.Publish('log.error', ID + ': cannot create an IPv6 socket (errno ' + IntToStr(socketerror) +
++      ') - is IPv6 enabled on this host? Not listening on port ' + IntToStr(APort), ID);
++    Exit(-1);
++  end;
++  OptVal := 1;
++  fpSetSockOpt(Result, SOL_SOCKET, SO_REUSEADDR, @OptVal, SizeOf(OptVal));
++  // "::" = every interface, IPv4 and IPv6 (dual stack); any specific IPv6 address = IPv6 only
++  if AnyAddr then OptVal := 0 else OptVal := 1;
++  if (fpSetSockOpt(Result, VDRX_IPPROTO_IPV6, VDRX_IPV6_V6ONLY, @OptVal, SizeOf(OptVal)) <> 0) and AnyAddr then
++    Bus.Publish('log.warn', ID + ': could not make the "::" socket dual-stack (errno ' + IntToStr(socketerror) +
++      '); IPv4 clients may not be able to connect', ID);
++  FillChar(Addr, SizeOf(Addr), 0);
++  Addr.sin6_family := AF_INET6;
++  Addr.sin6_port := htons(APort);
++  Move(B, Addr.sin6_addr, SizeOf(B));
++  if fpBind(Result, @Addr, SizeOf(Addr)) <> 0 then
++  begin
++    Bus.Publish('log.error', ID + ': fpBind failed on [' + ABindStr + ']:' + IntToStr(APort) +
++      ' (errno ' + IntToStr(socketerror) + ') - port likely already in use', ID);
++    CloseSocket(Result);
++    Exit(-1);
++  end;
++  if fpListen(Result, FBacklog) <> 0 then
++  begin
++    Bus.Publish('log.error', ID + ': fpListen failed on port ' + IntToStr(APort) +
++      ' (errno ' + IntToStr(socketerror) + ')', ID);
++    CloseSocket(Result);
++    Exit(-1);
++  end;
++end;
++
+ function TVDRX_SocketListenerExecutive.BindListenSocket(APort: Word): TSocket;
+ var
+   Addr: TInetSockAddr;
+@@ -244,11 +353,12 @@ begin
+   // by name and anything else that parses to 0 is refused.
+   BindStr := Trim(FBindAddress);
+   if SameText(BindStr, 'localhost') then BindStr := '127.0.0.1';
++  if Pos(':', BindStr) > 0 then Exit(BindListenSocket6(APort, BindStr));     // an IPv6 address
+   NetAddr := StrToNetAddr(BindStr);
+   if (NetAddr.s_addr = 0) and (BindStr <> '0.0.0.0') then
+   begin
+     Bus.Publish('log.error', ID + ': invalid bind address "' + FBindAddress +
+-      '" (use an IPv4 address, "localhost" or "0.0.0.0") - not listening on port ' + IntToStr(APort), ID);
++      '" (use an IPv4 address, an IPv6 address, "localhost" or "0.0.0.0") - not listening on port ' + IntToStr(APort), ID);
+     Exit(-1);
+   end;
+   Result := fpSocket(AF_INET, SOCK_STREAM, 0);
+@@ -344,12 +454,13 @@ end;
+ 
+ procedure TVDRX_SocketListenerExecutive.AcceptLoopPlain;
+ var
+-  ClientAddr: TInetSockAddr;
++  ClientAddr: TVDRX_SockStorage;
+   AddrLen: TSockLen;
+   ClientSock: TSocket;
+   ConnThread: TVDRX_ListenerConnThread;
+   PlainT: TVDRX_PlainTransport;
+   PeerStr: string;
++  PeerPort: Word;
+ begin
+   FPlainSocket := BindListenSocket(FPort);
+   if FPlainSocket = -1 then
+@@ -359,6 +470,7 @@ begin
+   end;
+   while not FStopping do
+   begin
++    FillChar(ClientAddr, SizeOf(ClientAddr), 0);
+     AddrLen := SizeOf(ClientAddr);
+     ClientSock := fpAccept(FPlainSocket, @ClientAddr, @AddrLen);
+     if ClientSock = -1 then
+@@ -368,7 +480,11 @@ begin
+       Continue;
+     end;
+ 
+-    PeerStr := NetAddrToStr(ClientAddr.sin_addr);
++    if not DecodePeer(ClientAddr, PeerStr, PeerPort) then
++    begin
++      CloseSocket(ClientSock);
++      Continue;
++    end;
+     if not TryReserve(PeerStr) then
+     begin
+       CloseSocket(ClientSock);
+@@ -385,7 +501,7 @@ begin
+       end;
+       PlainT := TVDRX_PlainTransport.Create(ClientSock);
+       PlainT.PeerAddr := PeerStr;
+-      PlainT.PeerPort := ntohs(ClientAddr.sin_port);
++      PlainT.PeerPort := PeerPort;
+       ConnThread := TVDRX_ListenerConnThread.Create(Self, PlainT);
+       ConnThread.LimitAddr := PeerStr;
+     finally
+@@ -424,11 +540,12 @@ end;
+ 
+ procedure TVDRX_SocketListenerExecutive.AcceptLoopTLS;
+ var
+-  ClientAddr: TInetSockAddr;
++  ClientAddr: TVDRX_SockStorage;
+   AddrLen: TSockLen;
+   ClientSock: TSocket;
+   ConnThread: TVDRX_ListenerConnThread;
+   PeerStr: string;
++  PeerPort: Word;
+ begin
+   FTLSSocket := BindListenSocket(FTLSPort);
+   if FTLSSocket = -1 then
+@@ -438,6 +555,7 @@ begin
+   end;
+   while not FStopping do
+   begin
++    FillChar(ClientAddr, SizeOf(ClientAddr), 0);
+     AddrLen := SizeOf(ClientAddr);
+     ClientSock := fpAccept(FTLSSocket, @ClientAddr, @AddrLen);
+     if ClientSock = -1 then
+@@ -447,7 +565,11 @@ begin
+       Continue;
+     end;
+ 
+-    PeerStr := NetAddrToStr(ClientAddr.sin_addr);
++    if not DecodePeer(ClientAddr, PeerStr, PeerPort) then
++    begin
++      CloseSocket(ClientSock);
++      Continue;
++    end;
+     if not TryReserve(PeerStr) then
+     begin
+       CloseSocket(ClientSock);
+@@ -465,7 +587,7 @@ begin
+         Break;
+       end;
+       ConnThread := TVDRX_ListenerConnThread.CreateTLS(Self, ClientSock,
+-        PeerStr, ntohs(ClientAddr.sin_port));
++        PeerStr, PeerPort);
+       ConnThread.LimitAddr := PeerStr;
+     finally
+       FCriticalSection.Release;
+diff --git a/src/vdrx_iplimit.pas b/src/vdrx_iplimit.pas
+index 8eb8ce6..2689bb1 100644
+--- a/src/vdrx_iplimit.pas
++++ b/src/vdrx_iplimit.pas
+@@ -33,18 +33,22 @@ type
+     LastTick: QWord;
+   end;
+ 
+-  TVDRX_IPExempt = record
+-    Net: Cardinal;     // host byte order
+-    Mask: Cardinal;
++  // An address in the one form everything here works with: 16 bytes, network order. IPv4 is held as its
++  // IPv4-mapped IPv6 form (::ffff:a.b.c.d), so one comparison serves both families.
++  TVDRX_IP16 = array[0..15] of Byte;
++
++  TVDRX_IPRange = record
++    Net: TVDRX_IP16;
++    Bits: Integer;     // prefix length, 0..128 (an IPv4 /n is stored as 96 + n)
+   end;
+ 
+   // A set of IPv4 addresses and ranges. Fill it while configuring; after that it is only read, so it
+   // needs no lock of its own.
+   TVDRX_IPMatcher = class
+   private
+-    FItems: array of TVDRX_IPExempt;
++    FItems: array of TVDRX_IPRange;
+   public
+-    // "a.b.c.d" or "a.b.c.d/n". False (and nothing added) if it does not parse.
++    // "a.b.c.d", "a.b.c.d/n", an IPv6 address or "ipv6/n". False (and nothing added) if it does not parse.
+     function Add(const ASpec: string): Boolean;
+     function Matches(const AAddr: string): Boolean;
+     function Count: Integer;
+@@ -94,6 +98,17 @@ type
+ // "1.2.3.4" -> host-order cardinal. False for anything that is not a strict dotted quad.
+ function VDRX_ParseIPv4(const S: string; out V: Cardinal): Boolean;
+ 
++// A strict IPv4 or IPv6 address (no zone id, no brackets, no port) -> 16 bytes. IPv4 becomes ::ffff:a.b.c.d.
++function VDRX_ParseIP(const S: string; out B: TVDRX_IP16): Boolean;
++// The text form vdrx uses everywhere (logs, REMOTE_ADDR, X-Forwarded-For): an IPv4 or IPv4-mapped address as a
++// dotted quad, anything else as lower-case RFC 5952 IPv6 text. So a dual-stack socket's ::ffff:1.2.3.4 peer
++// is reported, limited and matched as plain 1.2.3.4.
++function VDRX_FormatIP(const B: TVDRX_IP16): string;
++// What a client's limits and lock-outs are counted against. An IPv4 address counts as itself. An IPv6 address
++// counts as its /64, because whoever holds an IPv6 network usually holds the whole /64 (billions of
++// billions of addresses) and per-address limits would cost them nothing.
++function VDRX_LimitKey(const AAddr: string): string;
++
+ implementation
+ 
+ function VDRX_ParseIPv4(const S: string; out V: Cardinal): Boolean;
+@@ -167,41 +182,196 @@ begin
+   end;
+ end;
+ 
++function VDRX_ParseIP(const S: string; out B: TVDRX_IP16): Boolean;
++var
++  V4: Cardinal;
++  Head, Tail: array[0..8] of Word;
++  NHead, NTail, i, p, Start, Digits, Val, Dots: Integer;
++  Tok: string;
++  InTail, SeenGap: Boolean;
++
++  function AddGroup(AValue: Word): Boolean;
++  begin
++    if InTail then begin if NTail >= 8 then Exit(False); Tail[NTail] := AValue; Inc(NTail); end
++    else begin if NHead >= 8 then Exit(False); Head[NHead] := AValue; Inc(NHead); end;
++    Result := True;
++  end;
++
++begin
++  Result := False;
++  FillChar(B, SizeOf(B), 0);
++  if S = '' then Exit;
++  if Pos(':', S) = 0 then
++  begin
++    if not VDRX_ParseIPv4(S, V4) then Exit;
++    B[10] := $FF; B[11] := $FF;
++    B[12] := V4 shr 24; B[13] := (V4 shr 16) and $FF; B[14] := (V4 shr 8) and $FF; B[15] := V4 and $FF;
++    Exit(True);
++  end;
++  // IPv6: groups of 1-4 hex digits separated by ':', at most one '::', optionally ending in a dotted quad.
++  NHead := 0; NTail := 0; InTail := False; SeenGap := False;
++  p := 1;
++  if (S[1] = ':') then
++  begin
++    if (Length(S) < 2) or (S[2] <> ':') then Exit;      // a lone leading ':'
++    SeenGap := True; InTail := True; p := 3;
++    if p > Length(S) then begin Result := True; Exit; end;   // "::"
++  end;
++  while p <= Length(S) do
++  begin
++    Start := p;
++    while (p <= Length(S)) and (S[p] <> ':') do Inc(p);
++    Tok := Copy(S, Start, p - Start);
++    if Tok = '' then Exit;
++    if Pos('.', Tok) > 0 then
++    begin
++      if p <= Length(S) then Exit;                        // a dotted quad is only allowed last
++      if not VDRX_ParseIPv4(Tok, V4) then Exit;
++      if not AddGroup(V4 shr 16) then Exit;
++      if not AddGroup(V4 and $FFFF) then Exit;
++    end
++    else
++    begin
++      if Length(Tok) > 4 then Exit;
++      Val := 0;
++      for i := 1 to Length(Tok) do
++        case Tok[i] of
++          '0'..'9': Val := Val * 16 + Ord(Tok[i]) - 48;
++          'a'..'f': Val := Val * 16 + Ord(Tok[i]) - 87;
++          'A'..'F': Val := Val * 16 + Ord(Tok[i]) - 55;
++        else Exit;
++        end;
++      if not AddGroup(Val) then Exit;
++    end;
++    if p <= Length(S) then
++    begin
++      Inc(p);                                             // past a ':'
++      if p > Length(S) then Exit;                         // trailing single ':'
++      if S[p] = ':' then
++      begin
++        if SeenGap then Exit;                             // a second '::'
++        SeenGap := True; InTail := True; Inc(p);
++        if p > Length(S) then Break;                      // "1::"
++      end;
++    end;
++  end;
++  if SeenGap then
++  begin
++    if NHead + NTail > 7 then Exit;                       // '::' must stand for at least one group
++  end
++  else if NHead <> 8 then Exit;
++  for i := 0 to NHead - 1 do begin B[i * 2] := Head[i] shr 8; B[i * 2 + 1] := Head[i] and $FF; end;
++  for i := 0 to NTail - 1 do
++  begin
++    B[(8 - NTail + i) * 2] := Tail[i] shr 8;
++    B[(8 - NTail + i) * 2 + 1] := Tail[i] and $FF;
++  end;
++  Result := True;
++end;
++
++function VDRX_FormatIP(const B: TVDRX_IP16): string;
++var
++  i, BestStart, BestLen, RunStart, RunLen: Integer;
++  G: array[0..7] of Word;
++  Mapped: Boolean;
++begin
++  Mapped := True;
++  for i := 0 to 9 do if B[i] <> 0 then Mapped := False;
++  if Mapped and (B[10] = $FF) and (B[11] = $FF) then
++    Exit(IntToStr(B[12]) + '.' + IntToStr(B[13]) + '.' + IntToStr(B[14]) + '.' + IntToStr(B[15]));
++  for i := 0 to 7 do G[i] := (Word(B[i * 2]) shl 8) or B[i * 2 + 1];
++  BestStart := -1; BestLen := 0; RunStart := -1; RunLen := 0;
++  for i := 0 to 7 do
++  begin
++    if G[i] = 0 then
++    begin
++      if RunStart < 0 then begin RunStart := i; RunLen := 0; end;
++      Inc(RunLen);
++      if RunLen > BestLen then begin BestStart := RunStart; BestLen := RunLen; end;
++    end
++    else
++      RunStart := -1;
++  end;
++  if BestLen < 2 then BestStart := -1;                    // RFC 5952: never compress a single group
++  Result := '';
++  i := 0;
++  while i < 8 do
++  begin
++    if i = BestStart then
++    begin
++      Result := Result + '::';
++      Inc(i, BestLen);
++      Continue;
++    end;
++    if (Result <> '') and (Result[Length(Result)] <> ':') then Result := Result + ':';
++    Result := Result + LowerCase(IntToHex(G[i], 1));
++    Inc(i);
++  end;
++end;
++
++function VDRX_LimitKey(const AAddr: string): string;
++var
++  B: TVDRX_IP16;
++  i: Integer;
++  Mapped: Boolean;
++begin
++  if not VDRX_ParseIP(AAddr, B) then Exit(AAddr);
++  Mapped := True;
++  for i := 0 to 9 do if B[i] <> 0 then Mapped := False;
++  if Mapped and (B[10] = $FF) and (B[11] = $FF) then Exit(VDRX_FormatIP(B));
++  for i := 8 to 15 do B[i] := 0;
++  Result := VDRX_FormatIP(B) + '/64';
++end;
++
+ function TVDRX_IPMatcher.Add(const ASpec: string): Boolean;
+ var
+-  P, Bits: Integer;
++  P, Bits, MaxBits: Integer;
+   A: string;
+-  Net, Mask: Cardinal;
++  B: TVDRX_IP16;
+ begin
+   Result := False;
+   P := Pos('/', ASpec);
+-  Bits := 32;
++  Bits := -1;
+   if P > 0 then
+   begin
+     A := Trim(Copy(ASpec, 1, P - 1));
+     Bits := StrToIntDef(Trim(Copy(ASpec, P + 1, 10)), -1);
+-    if (Bits < 0) or (Bits > 32) then Exit;
++    if Bits < 0 then Exit;
+   end
+   else
+     A := Trim(ASpec);
+-  if not VDRX_ParseIPv4(A, Net) then Exit;
+-  if Bits = 0 then Mask := 0 else Mask := Cardinal($FFFFFFFF) shl (32 - Bits);
++  if not VDRX_ParseIP(A, B) then Exit;
++  // A bare address is a /32 (IPv4) or /128 (IPv6). A prefix length counts in the address's own family.
++  if Pos(':', A) > 0 then MaxBits := 128 else MaxBits := 32;
++  if Bits < 0 then Bits := MaxBits;
++  if Bits > MaxBits then Exit;
++  if MaxBits = 32 then Bits := Bits + 96;
+   SetLength(FItems, Length(FItems) + 1);
+-  FItems[High(FItems)].Net := Net and Mask;
+-  FItems[High(FItems)].Mask := Mask;
++  FItems[High(FItems)].Net := B;
++  FItems[High(FItems)].Bits := Bits;
+   Result := True;
+ end;
+ 
+ function TVDRX_IPMatcher.Matches(const AAddr: string): Boolean;
+ var
+-  V: Cardinal;
+-  i: Integer;
++  V: TVDRX_IP16;
++  i, k, Full, Rest: Integer;
++  Ok: Boolean;
+ begin
+   Result := False;
+   if Length(FItems) = 0 then Exit;
+-  if not VDRX_ParseIPv4(AAddr, V) then Exit;
++  if not VDRX_ParseIP(AAddr, V) then Exit;
+   for i := 0 to High(FItems) do
+-    if (V and FItems[i].Mask) = FItems[i].Net then Exit(True);
++  begin
++    Full := FItems[i].Bits div 8;
++    Rest := FItems[i].Bits mod 8;
++    Ok := True;
++    for k := 0 to Full - 1 do
++      if V[k] <> FItems[i].Net[k] then begin Ok := False; Break; end;
++    if Ok and (Rest > 0) then
++      Ok := ((V[Full] xor FItems[i].Net[Full]) and ($FF shl (8 - Rest)) and $FF) = 0;
++    if Ok then Exit(True);
++  end;
+ end;
+ 
+ function TVDRX_IPMatcher.Count: Integer;
+@@ -221,7 +391,7 @@ end;
+ 
+ function TVDRX_IPLimiter.FindEntry(const AAddr: string; out AIndex: Integer): Boolean;
+ begin
+-  Result := FTable.Find(AAddr, AIndex);
++  Result := FTable.Find(VDRX_LimitKey(AAddr), AIndex);   // IPv6 clients are counted per /64
+ end;
+ 
+ // Drops entries that hold no connection and have been quiet long enough for their bucket to refill.
+@@ -271,7 +441,7 @@ begin
+       E := TVDRX_IPEntry.Create;
+       E.Tokens := FBurst;
+       E.LastTick := T;
+-      FTable.AddObject(AAddr, E);
++      FTable.AddObject(VDRX_LimitKey(AAddr), E);
+     end
+     else
+       E := TVDRX_IPEntry(FTable.Objects[Idx]);
+@@ -337,7 +507,7 @@ begin
+       E := TVDRX_IPEntry.Create;
+       E.Tokens := FBurst;
+       E.LastTick := T;
+-      FTable.AddObject(AAddr, E);
++      FTable.AddObject(VDRX_LimitKey(AAddr), E);
+     end
+     else
+       E := TVDRX_IPEntry(FTable.Objects[Idx]);
+diff --git a/src/vdrx_websocket.pas b/src/vdrx_websocket.pas
+index fddcd12..4b2930c 100644
+--- a/src/vdrx_websocket.pas
++++ b/src/vdrx_websocket.pas
+@@ -8,7 +8,7 @@ unit vdrx_websocket;
+ interface
+ 
+ uses
+-  Classes, SysUtils, StrUtils, SyncObjs, Generics.Collections, openssl, {$IFDEF UNIX}BaseUnix, {$ENDIF} dynlibs, base64, sha1, fpjson, jsonparser, DateUtils, Types, vdrx_core, vdrx_config, vdrx_procutil, vdrx_transport, vdrx_connection, vdrx_httpparse;
++  Classes, SysUtils, StrUtils, SyncObjs, Generics.Collections, openssl, {$IFDEF UNIX}BaseUnix, {$ENDIF} dynlibs, base64, sha1, fpjson, jsonparser, DateUtils, Types, vdrx_core, vdrx_config, vdrx_procutil, vdrx_transport, vdrx_connection, vdrx_iplimit, vdrx_httpparse;
+ 
+ type
+ 
+@@ -961,11 +961,13 @@ end;
+ function TVDRX_WebSocketExecutive.AuthLocked(const AIP: string): Boolean;
+ var
+   T: TVDRX_AuthTrack;
++  Addr: string;
+ begin
+   Result := False;
++  Addr := VDRX_LimitKey(AIP);          // an IPv6 client is locked out as its whole /64
+   FAuthLock.Acquire;
+   try
+-    if FAuthTrack.TryGetValue(AIP, T) then
++    if FAuthTrack.TryGetValue(Addr, T) then
+       Result := T.LockedUntil > GetTickCount64;
+   finally
+     FAuthLock.Release;
+@@ -978,12 +980,14 @@ var
+   Now: QWord;
+   Key: string;
+   Stale: TStringList;
++  Addr: string;
+ begin
+   Result := False;
+   Now := GetTickCount64;
++  Addr := VDRX_LimitKey(AIP);          // an IPv6 client is locked out as its whole /64
+   FAuthLock.Acquire;
+   try
+-    if not FAuthTrack.TryGetValue(AIP, T) then
++    if not FAuthTrack.TryGetValue(Addr, T) then
+     begin
+       T.Fails := 0; T.WindowStart := Now; T.LockedUntil := 0;
+       if FAuthTrack.Count >= AUTH_TRACK_MAX then
+@@ -1013,7 +1017,7 @@ begin
+       T.WindowStart := Now;
+       Result := True;
+     end;
+-    FAuthTrack.AddOrSetValue(AIP, T);
++    FAuthTrack.AddOrSetValue(Addr, T);
+   finally
+     FAuthLock.Release;
+   end;
+@@ -1023,7 +1027,7 @@ procedure TVDRX_WebSocketExecutive.NoteAuthSuccess(const AIP: string);
+ begin
+   FAuthLock.Acquire;
+   try
+-    FAuthTrack.Remove(AIP);
++    FAuthTrack.Remove(VDRX_LimitKey(AIP));
+   finally
+     FAuthLock.Release;
+   end;
+diff --git a/tests/integration/edge-policy/cgi/env.py b/tests/integration/edge-policy/cgi/env.py
+new file mode 100644
+index 0000000..1b9901f
+--- /dev/null
++++ b/tests/integration/edge-policy/cgi/env.py
+@@ -0,0 +1,3 @@
++import os
++print("Content-Type: text/plain"); print()
++for k in sorted(os.environ): print("%s=%s" % (k, os.environ[k]))
+diff --git a/tests/integration/edge-policy/edge_policy_test.py b/tests/integration/edge-policy/edge_policy_test.py
+index be4bfb4..d5b7f11 100644
+--- a/tests/integration/edge-policy/edge_policy_test.py
++++ b/tests/integration/edge-policy/edge_policy_test.py
+@@ -61,6 +61,18 @@ check("X-Forwarded-Proto: http\r\n" in log and "X-Forwarded-Proto: https" not in
+ r = talk(18099, FORGED, src="127.0.0.2"); log2 = upstream_log()
+ check("X-Forwarded-For: 127.0.0.2\r\n" in log2, "a different client address is reported as that address", log2[-300:])
+ 
++print("-- what a CGI program sees")
++ENVREQ = (b"GET /cgi/env.py HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 6.6.6.6\r\nX-Real-IP: 7.7.7.7\r\nForwarded: for=8.8.8.8\r\nX-Other: kept\r\n\r\n")
++def cgi_env(port):
++    body = talk(port, ENVREQ).split(b"\r\n\r\n", 1)[-1].decode("latin1")
++    return dict(l.split("=", 1) for l in body.splitlines() if "=" in l)
++env = cgi_env(18099)
++check(env.get("HTTP_X_OTHER") == "kept", "an ordinary header still reaches the program", sorted(k for k in env if k.startswith("HTTP_")))
++check(not any(k in env for k in ("HTTP_X_FORWARDED_FOR", "HTTP_X_REAL_IP", "HTTP_FORWARDED")), "an untrusted client's forwarded headers are not in the program's environment", {k: v for k, v in env.items() if k.startswith("HTTP_")})
++check(env.get("REMOTE_ADDR") == "127.0.0.1", "REMOTE_ADDR is the real peer", env.get("REMOTE_ADDR"))
++env = cgi_env(18100)
++check(env.get("HTTP_X_FORWARDED_FOR") == "6.6.6.6" and env.get("HTTP_X_REAL_IP") == "7.7.7.7", "a trusted peer's headers are passed to the program", {k: v for k, v in env.items() if k.startswith("HTTP_")})
++
+ print("-- a trusted proxy is believed, and its chain is extended")
+ reset(); r = talk(18100, FORGED)
+ log = upstream_log()
+diff --git a/tests/integration/edge-policy/vdrx.conf b/tests/integration/edge-policy/vdrx.conf
+index 4658f1d..10b1a18 100644
+--- a/tests/integration/edge-policy/vdrx.conf
++++ b/tests/integration/edge-policy/vdrx.conf
+@@ -8,6 +8,8 @@
+     { "id": "trusted", "port": 18100,  "static_dir": "www", "trusted_proxies": "127.0.0.1, 10.0.0.0/8, bogus" },
+     { "id": "nosec",   "port": 18102,  "static_dir": "www", "security_headers": false }
+   ],
++  "variables": { "PYTHON_BIN_windows": "python", "PYTHON_BIN_linux": "python3", "PYTHON_BIN": "{PYTHON_BIN_{PLATFORM}}" },
++  "cgi": [ { "id": "py", "prefix": "/cgi/", "doc_root": "cgi", "command": "{PYTHON_BIN}", "args": ["%%script%%"], "extensions": [".py"], "timeout_ms": 3000 } ],
+   "processes": [
+     { "id": "upstream", "command": "python3 upstream.py 18101", "prefix": "/app/", "host": "127.0.0.1", "port": 18101 }
+   ]
+diff --git a/tests/integration/ipv6/ipv6_test.py b/tests/integration/ipv6/ipv6_test.py
+new file mode 100644
+index 0000000..5882c46
+--- /dev/null
++++ b/tests/integration/ipv6/ipv6_test.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python3
++"""IPv6 and dual-stack listeners. Run by tests/integration/run.sh (section ipv6) against the fixture in this folder.
++Hosts without IPv6 (some containers) can only run the first part: bad bind addresses are refused, a bind that cannot
++be honoured fails closed, and nothing else is taken down with it. The rest is reported as skipped."""
++import socket, sys, time, os
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++passed = failed = skipped = 0
++def check(cond, name, extra=""):
++    global passed, failed
++    if cond: passed += 1; print("  ok    " + name)
++    else:    failed += 1; print("  FAIL  " + name + ("  (" + str(extra)[:200] + ")" if extra else ""))
++def skip(name):
++    global skipped
++    skipped += 1; print("  skip  " + name)
++
++def have_ipv6():
++    try:
++        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM); s.bind(("::1", 0)); s.close(); return True
++    except OSError: return False
++V6 = have_ipv6()
++
++def talk(host, port, raw=b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", wait=1.5):
++    fam = socket.AF_INET6 if ":" in host else socket.AF_INET
++    s = socket.socket(fam); s.settimeout(0.4)
++    try: s.connect((host, port))
++    except OSError as e: return None
++    s.sendall(raw); out = b""; end = time.time() + wait
++    while time.time() < end:
++        try:
++            d = s.recv(65536)
++            if not d: break
++            out += d
++        except socket.timeout: pass
++    s.close(); return out
++
++def dial(host, port):
++    s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET); s.settimeout(2); s.connect((host, port)); return s
++def closed_by_server(s):
++    try: s.settimeout(1.5); return s.recv(1) == b""
++    except socket.timeout: return False
++    except ConnectionError: return True
++
++log = lambda: open(os.path.join(HERE, "vdrx_daemon.log"), errors="replace").read()
++
++print("-- the IPv4 control site is unaffected by the others")
++r = talk("127.0.0.1", 18103)
++check(r is not None and b"hello" in r, "an IPv4 site serves while neighbouring IPv6 sites are broken or absent")
++
++print("-- bad bind addresses are refused, loudly")
++check(talk("127.0.0.1", 18104) is None, "bind \"::zz\": nothing listens on that port")
++check(talk("127.0.0.1", 18105) is None, "bind \"::ffff:1.2.3.4\": nothing listens on that port")
++time.sleep(0.5); lg = log()
++check("invalid bind address" in lg and "::zz" in lg, "the invalid address is named in the log")
++check("IPv4-mapped" in lg, "the mapped address is refused with an explanation")
++
++if not V6:
++    print("-- this host has no IPv6")
++    check("cannot create an IPv6 socket" in lg or "fpBind failed" in lg, "bind \"::1\" without IPv6 fails closed with a clear error")
++    check(talk("127.0.0.1", 18106) is None and talk("127.0.0.1", 18107) is None, "...and nothing answers on those ports")
++    for n in ("IPv6 loopback site serves over ::1", "dual-stack site serves IPv4 and IPv6", "IPv4 clients of a dual-stack socket are reported and limited as plain IPv4",
++              "an IPv6 /64 shares one connection limit", "limit_exempt works with IPv6 ranges"):
++        skip(n)
++else:
++    print("-- IPv6 loopback")
++    r = talk("::1", 18106)
++    check(r is not None and b"hello" in r, "a site bound to ::1 serves over IPv6")
++    check(talk("127.0.0.1", 18106) is None, "...and is not reachable over IPv4")
++
++    print("-- dual stack (bind \"::\")")
++    r6 = talk("::1", 18107); r4 = talk("127.0.0.1", 18107)
++    check(r6 is not None and b"hello" in r6, "an IPv6 client is served")
++    check(r4 is not None and b"hello" in r4, "an IPv4 client is served by the same socket")
++
++    print("-- the IPv4 client of a dual-stack socket is an IPv4 client")
++    held = [dial("127.0.0.1", 18107) for _ in range(2)]; time.sleep(0.3)
++    third = dial("127.0.0.1", 18107)
++    check(closed_by_server(third), "max_connections_per_ip applies to it (3rd concurrent from 127.0.0.1 closed)")
++    for s in held: s.close()
++    time.sleep(0.3)
++    held6 = [dial("::1", 18107) for _ in range(2)]; time.sleep(0.3)
++    third6 = dial("::1", 18107)
++    check(closed_by_server(third6), "and to an IPv6 client (3rd concurrent from ::1 closed)")
++    for s in held6: s.close()
++
++    print("-- exempt ranges accept both families (limit 1, 127.0.0.1 and ::1 exempt)")
++    a = [dial("127.0.0.1", 18109) for _ in range(4)]; time.sleep(0.3)
++    check(not closed_by_server(a[-1]), "an exempt IPv4 client is never limited on a dual-stack socket")
++    for s in a: s.close()
++    b = [dial("::1", 18109) for _ in range(4)]; time.sleep(0.3)
++    check(not closed_by_server(b[-1]), "an exempt IPv6 client is never limited")
++    for s in b: s.close()
++
++    print("-- what an upstream is told")
++    for _ in range(40):
++        if talk("127.0.0.1", 18107, b"GET /app/ready HTTP/1.1\r\nHost: x\r\n\r\n", 1): break
++        time.sleep(.5)
++    open(os.path.join(HERE, "received18108.log"), "wb").close()
++    talk("127.0.0.1", 18109, b"GET /app/x HTTP/1.1\r\nHost: x\r\n\r\n")
++    up = open(os.path.join(HERE, "received18108.log"), "rb").read().decode("latin1")
++    check("X-Forwarded-For: 127.0.0.1\r\n" in up, "an IPv4 client arriving over the dual-stack socket is reported as 127.0.0.1, not ::ffff:127.0.0.1", up[:300])
++    open(os.path.join(HERE, "received18108.log"), "wb").close()
++    talk("::1", 18109, b"GET /app/x HTTP/1.1\r\nHost: x\r\n\r\n")
++    up = open(os.path.join(HERE, "received18108.log"), "rb").read().decode("latin1")
++    check("X-Forwarded-For: ::1\r\n" in up, "an IPv6 client is reported in IPv6 text", up[:300])
++    skip("an IPv6 /64 shares one connection limit (needs a second address in the same /64; covered by the unit tests)")
++
++print("\n%d passed, %d failed, %d skipped" % (passed, failed, skipped))
++print("all passed" if failed == 0 else "SOME FAILED")
++sys.exit(1 if failed else 0)
+diff --git a/tests/integration/ipv6/upstream.py b/tests/integration/ipv6/upstream.py
+new file mode 100644
+index 0000000..01eb7f9
+--- /dev/null
++++ b/tests/integration/ipv6/upstream.py
+@@ -0,0 +1,43 @@
++"""Fake HTTP upstream for proxy_test.py. Records every raw chunk it receives to received<port>.log, answers each request
++it can parse (a pipelined second request would be answered too, if its bytes ever arrived), and honours Connection: close.
++  /app/huge streams 70 MiB (more than vdrx's 64 MiB cap).  /app/silent never answers."""
++import socket, threading, os, sys, time
++PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 18091
++LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "received%d.log" % PORT)
++def handle(c):
++    buf = b""; c.settimeout(3)
++    try:
++        while True:
++            try: d = c.recv(65536)
++            except socket.timeout: break
++            if not d: break
++            buf += d
++            with open(LOG, "ab") as f: f.write(d + b"\n--END-CHUNK--\n")
++            while b"\r\n\r\n" in buf:
++                head, _, buf = buf.partition(b"\r\n\r\n")
++                parts = head.split(b" ")
++                path = parts[1].decode("latin1") if len(parts) > 1 else "?"
++                close = b"connection: close" in head.lower()
++                clm = [l for l in head.split(b"\r\n") if l.lower().startswith(b"content-length:")]
++                n = int(clm[0].split(b":")[1]) if clm else 0
++                while len(buf) < n:
++                    more = c.recv(65536)
++                    if not more: break
++                    buf += more
++                body_in, buf = buf[:n], buf[n:]
++                if path.endswith("/huge"):
++                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 73400320\r\n\r\n")
++                    chunk = b"x" * 1048576
++                    for _ in range(70):
++                        c.sendall(chunk)
++                    return
++                if path.endswith("/silent"):
++                    time.sleep(60); return
++                body = ("upstream saw: %s body=%s" % (path, body_in.decode("latin1"))).encode()
++                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
++                if close: return
++    except (BrokenPipeError, ConnectionResetError): pass
++    finally: c.close()
++s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", PORT)); s.listen(20)
++while True:
++    c, _ = s.accept(); threading.Thread(target=handle, args=(c,), daemon=True).start()
+diff --git a/tests/integration/ipv6/vdrx.conf b/tests/integration/ipv6/vdrx.conf
+new file mode 100644
+index 0000000..182a5ee
+--- /dev/null
++++ b/tests/integration/ipv6/vdrx.conf
+@@ -0,0 +1,17 @@
++{
++  "description": "Fixture for ipv6_test.py: IPv6 and dual-stack listeners next to an IPv4 control. The sites that need IPv6 only come up on hosts that have it.",
++  "stdin_admin_enabled": false,
++  "http_read_timeout_ms": 1500,
++  "http_request_timeout_ms": 3000,
++  "http_sites": [
++    { "id": "v4",     "port": 18103, "static_dir": "www" },
++    { "id": "bad1",   "port": 18104, "static_dir": "www", "bind": "::zz" },
++    { "id": "bad2",   "port": 18105, "static_dir": "www", "bind": "::ffff:1.2.3.4" },
++    { "id": "loop6",  "port": 18106, "static_dir": "www", "bind": "::1" },
++    { "id": "dual",   "port": 18107, "static_dir": "www", "bind": "::", "max_connections_per_ip": 2, "connection_rate_per_ip": 0 },
++    { "id": "dualx",  "port": 18109, "static_dir": "www", "bind": "::", "max_connections_per_ip": 1, "connection_rate_per_ip": 0, "limit_exempt": "127.0.0.1, ::1" }
++  ],
++  "processes": [
++    { "id": "upstream", "command": "python3 upstream.py 18108", "prefix": "/app/", "host": "127.0.0.1", "port": 18108 }
++  ]
++}
+diff --git a/tests/integration/ipv6/www/index.html b/tests/integration/ipv6/www/index.html
+new file mode 100644
+index 0000000..ce01362
+--- /dev/null
++++ b/tests/integration/ipv6/www/index.html
+@@ -0,0 +1 @@
++hello
+diff --git a/tests/integration/run.sh b/tests/integration/run.sh
+index f80f742..dd956b7 100755
+--- a/tests/integration/run.sh
++++ b/tests/integration/run.sh
+@@ -5,11 +5,11 @@
+ #   tests/integration/run.sh              run everything this machine can run
+ #   tests/integration/run.sh php-cgi ws   run only the named sections
+ #
+-# Sections: edge-policy tls-policy ip-limits static-site php-cgi python-cgi cli-api templates websocket-only
++# Sections: ipv6 edge-policy tls-policy ip-limits static-site php-cgi python-cgi cli-api templates websocket-only
+ #           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction limits regress tls-client proxy ws-shared spawn fuzz jobs line-limits cli-args
+ # Needs: bin/vdrx (./build.sh), curl, python3. php-cgi / php / sort,tr,wc,head,grep
+ # are only needed by the sections that use them; those sections skip if missing.
+-# Uses ports 8080, 8082, 18080-18102 (and 18701 for a fake server) - it refuses to run if one is already taken,
++# Uses ports 8080, 8082, 18080-18109 (and 18701 for a fake server) - it refuses to run if one is already taken,
+ # and only ever stops the daemon it started itself.
+ cd "$(dirname "$0")/../.." || exit 1
+ ROOT=$(pwd); BIN="$ROOT/bin/vdrx"; [ -x "$BIN" ] || BIN="$ROOT/bin/vdrx.exe"; PIDFILE=/tmp/vdrx_it.pid; OUT=/tmp/vdrx_it.out
+@@ -186,6 +186,13 @@ if want ws-lockout "$@"; then section "tests/integration/ws (failed-login lockou
+   fi
+ fi
+ 
++if want ipv6 "$@"; then section "tests/integration/ipv6 (IPv6 and dual-stack listeners)"
++  if need python3 && start tests/integration/ipv6 18103; then
++    out=$(cd tests/integration/ipv6 && python3 ipv6_test.py 2>&1); echo "$out" | sed 's/^/  /'
++    case "$out" in *"all passed"*) ok "ipv6 suite";; *) bad "ipv6 suite" "see output above";; esac
++  fi
++fi
++
+ if want edge-policy "$@"; then section "tests/integration/edge-policy (forwarded headers, security headers)"
+   if need python3 && start tests/integration/edge-policy 18099 18100 18102 18101; then
+     out=$(cd tests/integration/edge-policy && python3 edge_policy_test.py 2>&1); echo "$out" | sed 's/^/  /'
+diff --git a/tests/integration/spawn/spawn_test.py b/tests/integration/spawn/spawn_test.py
+index abbe045..d776b97 100644
+--- a/tests/integration/spawn/spawn_test.py
++++ b/tests/integration/spawn/spawn_test.py
+@@ -72,7 +72,7 @@ try:
+     check("no HOME / USER / SHELL leak either", not any(k in env for k in ("HOME", "USER", "SHELL", "LOGNAME")), [k for k in ("HOME", "USER", "SHELL") if k in env])
+ 
+     if mode == "default":
+-        print("-- request headers become HTTP_* variables")
++        print("-- request headers become HTTP_* variables (this fixture trusts 127.0.0.1 as a proxy, so X-Forwarded-For is passed on)")
+         env = envdict(raw_get("/cgi/env.py", ["X_Forwarded_For: 6.6.6.6", "X-Forwarded-For: 1.1.1.1", "x-forwarded-for: 2.2.2.2",
+                                                "x.weird: dotted", "Proxy: http://evil.example:8888", "X-Real: ok"]))
+         check("X-Forwarded-For: the first spelling wins, the underscore and lowercase copies are ignored", env.get("HTTP_X_FORWARDED_FOR") == "1.1.1.1", env.get("HTTP_X_FORWARDED_FOR"))
+diff --git a/tests/integration/spawn/vdrx.conf b/tests/integration/spawn/vdrx.conf
+index df3697f..2c9d4e9 100644
+--- a/tests/integration/spawn/vdrx.conf
++++ b/tests/integration/spawn/vdrx.conf
+@@ -3,6 +3,6 @@
+   "stdin_admin_enabled": false,
+   "max_child_output_bytes": 1000000,
+   "variables": { "PYTHON_BIN_windows": "python", "PYTHON_BIN_linux": "python3", "PYTHON_BIN": "{PYTHON_BIN_{PLATFORM}}" },
+-  "http_sites": [ { "id": "web", "port": 18080, "static_dir": "static" } ],
++  "http_sites": [ { "id": "web", "port": 18080, "static_dir": "static", "trusted_proxies": "127.0.0.1" } ],
+   "cgi": [ { "id": "py", "prefix": "/cgi/", "doc_root": "www", "command": "{PYTHON_BIN}", "args": ["%%script%%"], "extensions": [".py"], "timeout_ms": 2000 } ]
+ }
+diff --git a/tests/run.sh b/tests/run.sh
+index 02cea49..8c6e730 100755
+--- a/tests/run.sh
++++ b/tests/run.sh
+@@ -21,6 +21,8 @@ echo; echo "== unit: per-address connection limits"
+ out=$(bin/test_iplimit 2>/dev/null); rc=$?; echo "  $(echo "$out" | tail -1)"; [ $rc -eq 0 ] || { echo "$out" | grep -E "FAIL" | sed "s/^/  /"; fail=1; }
+ echo; echo "== unit: forwarded headers"
+ out=$(bin/test_httphdr 2>/dev/null); rc=$?; echo "  $(echo "$out" | tail -1)"; [ $rc -eq 0 ] || { echo "$out" | grep -E "FAIL" | sed "s/^/  /"; fail=1; }
++echo; echo "== unit: accepted-peer decoding (IPv4 / IPv6 socket layouts)"
++out=$(bin/test_peer 2>/dev/null); rc=$?; echo "  $(echo "$out" | tail -1)"; [ $rc -eq 0 ] || { echo "$out" | grep -E "FAIL" | sed "s/^/  /"; fail=1; }
+ echo; echo "== unit: topic coverage (ws_profiles allow rules are sound)"
+ out=$(bin/test_topiccover 2>/dev/null); rc=$?; echo "  $(echo "$out" | tail -1)"; [ $rc -eq 0 ] || { echo "$out" | grep -E "FAIL|UNSOUND" | sed "s/^/  /"; fail=1; }
+ echo; tests/integration/run.sh || fail=1
+diff --git a/tests/unit/test_iplimit.lpr b/tests/unit/test_iplimit.lpr
+index 4212479..c4961af 100644
+--- a/tests/unit/test_iplimit.lpr
++++ b/tests/unit/test_iplimit.lpr
+@@ -19,8 +19,16 @@ begin
+   else begin Inc(Failed); WriteLn('  FAIL  ', AName); end;
+ end;
+ 
++function RT(const S: string): string;      // parse then format; '' when it does not parse
++var
++  B: TVDRX_IP16;
++begin
++  if VDRX_ParseIP(S, B) then Result := VDRX_FormatIP(B) else Result := '';
++end;
++
+ var
+   L: TVDRX_IPLimiter;
++  M: TVDRX_IPMatcher;
+   V: Cardinal;
+   i: Integer;
+   Ok: Integer;
+@@ -38,6 +46,84 @@ begin
+   Check(not VDRX_ParseIPv4('', V), 'empty refused');
+   Check(not VDRX_ParseIPv4('0x7f.0.0.1', V), 'hex refused');
+ 
++  WriteLn('-- IPv4 / IPv6 parse and format');
++  Check(RT('1.2.3.4') = '1.2.3.4', 'IPv4 round trips as a dotted quad');
++  Check(RT('::ffff:1.2.3.4') = '1.2.3.4', 'IPv4-mapped IPv6 is reported as plain IPv4');
++  Check(RT('::ffff:0102:0304') = '1.2.3.4', '...also in hex form');
++  Check(RT('2001:db8::1') = '2001:db8::1', 'compressed IPv6 round trips');
++  Check(RT('2001:0DB8:0000:0000:0000:0000:0000:0001') = '2001:db8::1', 'long form, upper case -> canonical');
++  Check(RT('::1') = '::1', 'loopback');
++  Check(RT('::') = '::', 'unspecified');
++  Check(RT('1::') = '1::', 'trailing ::');
++  Check(RT('fe80::') = 'fe80::', 'fe80::');
++  Check(RT('2001:db8:0:0:1:0:0:1') = '2001:db8::1:0:0:1', 'the longest zero run is compressed (RFC 5952)');
++  Check(RT('2001:db8:0:1:1:1:1:1') = '2001:db8:0:1:1:1:1:1', 'a single zero group is not compressed');
++  Check(RT('1:2:3:4:5:6:7:8') = '1:2:3:4:5:6:7:8', 'eight groups');
++  Check(RT('64:ff9b::1.2.3.4') = '64:ff9b::102:304', 'embedded dotted quad');
++  Check(RT('1:2:3:4:5:6:7::') = '1:2:3:4:5:6:7:0', ':: standing for one group parses (and prints uncompressed, RFC 5952)');
++  Check(RT('1:2:3:4:5:6:7:8:9') = '', 'nine groups refused');
++  Check(RT('1:2:3:4:5:6:7') = '', 'seven groups without :: refused');
++  Check(RT('1::2::3') = '', 'two :: refused');
++  Check(RT(':1:2:3:4:5:6:7') = '', 'a lone leading colon refused');
++  Check(RT('1:2:3:4:5:6:7:') = '', 'a trailing colon refused');
++  Check(RT('12345::') = '', 'a group of five digits refused');
++  Check(RT('g::1') = '', 'a non-hex digit refused');
++  Check(RT('1:2:3:4:5:6:7:8::') = '', ':: after eight groups refused');
++  Check(RT('::1.2.3') = '', 'a bad embedded quad refused');
++  Check(RT('1.2.3.4::1') = '', 'a dotted quad that is not last refused');
++  Check(RT('fe80::1%eth0') = '', 'a zone id refused');
++  Check(RT('[::1]') = '', 'brackets refused');
++  Check(RT('') = '', 'empty refused');
++
++  WriteLn('-- limit key (what an address is counted against)');
++  Check(VDRX_LimitKey('203.0.113.9') = '203.0.113.9', 'IPv4 is its own key');
++  Check(VDRX_LimitKey('::ffff:203.0.113.9') = '203.0.113.9', 'mapped IPv4 is the IPv4 key');
++  Check(VDRX_LimitKey('2001:db8:1:2:aaaa:bbbb:cccc:dddd') = '2001:db8:1:2::/64', 'IPv6 is keyed by its /64');
++  Check(VDRX_LimitKey('2001:db8:1:2::1') = VDRX_LimitKey('2001:db8:1:2:ffff::7'), 'two hosts in one /64 share a key');
++  Check(VDRX_LimitKey('2001:db8:1:3::1') <> VDRX_LimitKey('2001:db8:1:2::1'), 'a neighbouring /64 is a different key');
++  Check(VDRX_LimitKey('not an address') = 'not an address', 'unparsable text is its own key');
++
++  WriteLn('-- IPv6 ranges in the matcher');
++  M := TVDRX_IPMatcher.Create;
++  Check(M.Add('2001:db8::/32'), 'IPv6 CIDR accepted');
++  Check(M.Add('::1'), 'bare IPv6 address accepted');
++  Check(M.Add('10.0.0.0/8'), 'IPv4 CIDR still accepted');
++  Check(not M.Add('2001:db8::/129'), '/129 refused');
++  Check(not M.Add('10.0.0.0/33'), 'IPv4 /33 refused');
++  Check(not M.Add('2001:db8::/x'), 'bad prefix refused');
++  Check(not M.Add('fe80::1%eth0'), 'zone id refused');
++  Check(M.Matches('2001:db8:ffff::1'), 'inside the /32');
++  Check(not M.Matches('2001:db9::1'), 'outside the /32');
++  Check(M.Matches('::1') and not M.Matches('::2'), 'single IPv6 address');
++  Check(M.Matches('10.9.8.7') and not M.Matches('11.0.0.1'), 'IPv4 range still works');
++  Check(M.Matches('::ffff:10.9.8.7'), 'a mapped IPv4 peer matches an IPv4 range');
++  M.Free;
++  M := TVDRX_IPMatcher.Create;
++  M.Add('2001:db8:0:0:8000::/65');
++  Check(M.Matches('2001:db8::8000:0:0:1') and not M.Matches('2001:db8::1'), 'a prefix that ends mid-byte (/65) is exact');
++  M.Free;
++  M := TVDRX_IPMatcher.Create;
++  M.Add('192.168.4.0/22');
++  Check(M.Matches('192.168.7.255') and not M.Matches('192.168.8.0'), 'an IPv4 prefix that ends mid-byte (/22) is exact');
++  M.Free;
++
++  WriteLn('-- per-/64 limiting');
++  L := TVDRX_IPLimiter.Create;
++  L.MaxPerIP := 2; L.RatePerSec := 0;
++  Check(L.TryAcquire('2001:db8:1:2::1') = lvOK, 'v6 first ok');
++  Check(L.TryAcquire('2001:db8:1:2:dead:beef::2') = lvOK, 'another host of the same /64: second ok');
++  Check(L.TryAcquire('2001:db8:1:2:1:2:3:4') = lvTooManyConns, 'a third host of the /64 is refused');
++  Check(L.TryAcquire('2001:db8:1:3::1') = lvOK, 'a different /64 is unaffected');
++  Check(L.TryAcquire('1.2.3.4') = lvOK, 'IPv4 unaffected');
++  L.Release('2001:db8:1:2::99');
++  Check(L.TryAcquire('2001:db8:1:2:5::5') = lvOK, 'release of any host in the /64 frees a slot');
++  L.AddExempt('2001:db8:ffff::/48');
++  Ok := 0;
++  for i := 1 to 10 do
++    if L.TryAcquire('2001:db8:ffff::' + IntToHex(i, 1)) = lvOK then Inc(Ok);
++  Check(Ok = 10, 'an exempt IPv6 range is never limited');
++  L.Free;
++
+   WriteLn('-- concurrent cap');
+   L := TVDRX_IPLimiter.Create;
+   L.MaxPerIP := 3; L.RatePerSec := 0;
+diff --git a/tests/unit/test_peer.lpr b/tests/unit/test_peer.lpr
+new file mode 100644
+index 0000000..8d905af
+--- /dev/null
++++ b/tests/unit/test_peer.lpr
+@@ -0,0 +1,86 @@
++program test_peer;
++
++{$mode objfpc}{$H+}
++
++// DecodePeer (vdrx_connection.pas): what accept() wrote into the address buffer, turned into the text vdrx
++// reports. The buffers are built byte by byte in the Linux x86-64 kernel ABI (struct sockaddr_in / sockaddr_in6),
++// NOT with FPC's records, so this also catches FPC's record layout disagreeing with the kernel's - the thing an
++// IPv6 listener silently depends on and that cannot be exercised on a host without IPv6.
++//
++//   fpc -Mobjfpc -Fu../../src test_peer.lpr ; ./test_peer        (exit code 0 = all passed)
++
++uses
++  SysUtils, vdrx_connection;
++
++var
++  Passed, Failed: Integer;
++
++procedure Check(ACond: Boolean; const AName: string);
++begin
++  if ACond then begin Inc(Passed); WriteLn('  ok    ', AName); end
++  else begin Inc(Failed); WriteLn('  FAIL  ', AName); end;
++end;
++
++type
++  TBytes16 = array[0..15] of Byte;
++
++procedure Put16LE(var S: TVDRX_SockStorage; AOfs: Integer; V: Word);
++begin
++  PByte(@S)[AOfs] := V and $FF; PByte(@S)[AOfs + 1] := V shr 8;
++end;
++procedure Put16BE(var S: TVDRX_SockStorage; AOfs: Integer; V: Word);
++begin
++  PByte(@S)[AOfs] := V shr 8; PByte(@S)[AOfs + 1] := V and $FF;
++end;
++
++procedure MakeV4(var S: TVDRX_SockStorage; A, B, C, D: Byte; APort: Word);
++begin
++  FillChar(S, SizeOf(S), 0);
++  Put16LE(S, 0, 2);                                   // AF_INET
++  Put16BE(S, 2, APort);
++  PByte(@S)[4] := A; PByte(@S)[5] := B; PByte(@S)[6] := C; PByte(@S)[7] := D;
++end;
++
++procedure MakeV6(var S: TVDRX_SockStorage; const AAddr: TBytes16; APort: Word);
++begin
++  FillChar(S, SizeOf(S), 0);
++  Put16LE(S, 0, 10);                                  // AF_INET6
++  Put16BE(S, 2, APort);                               // offset 2
++  PByte(@S)[4] := $DE; PByte(@S)[5] := $AD; PByte(@S)[6] := $BE; PByte(@S)[7] := $EF;   // flowinfo (offset 4), must be ignored
++  Move(AAddr, PByte(@S)[8], 16);                      // sin6_addr at offset 8
++  PByte(@S)[24] := 7;                                 // scope id (offset 24), must be ignored
++end;
++
++var
++  S: TVDRX_SockStorage;
++  A: string;
++  P: Word;
++  Loop6, Mapped, Glob: TBytes16;
++begin
++  Passed := 0; Failed := 0;
++
++  WriteLn('-- IPv4');
++  MakeV4(S, 203, 0, 113, 9, 8080);
++  Check(DecodePeer(S, A, P) and (A = '203.0.113.9') and (P = 8080), 'IPv4 address and port');
++
++  WriteLn('-- IPv6');
++  FillChar(Loop6, 16, 0); Loop6[15] := 1;
++  MakeV6(S, Loop6, 443);
++  Check(DecodePeer(S, A, P) and (A = '::1') and (P = 443), 'IPv6 loopback and port 443');
++  Glob[0] := $20; Glob[1] := $01; Glob[2] := $0d; Glob[3] := $b8; FillChar(Glob[4], 12, 0); Glob[7] := $42; Glob[15] := $99;
++  MakeV6(S, Glob, 54321);
++  Check(DecodePeer(S, A, P) and (A = '2001:db8:0:42::99') and (P = 54321), 'a global address, port above 32767');
++  FillChar(Mapped, 16, 0); Mapped[10] := $FF; Mapped[11] := $FF; Mapped[12] := 10; Mapped[13] := 1; Mapped[14] := 2; Mapped[15] := 3;
++  MakeV6(S, Mapped, 1234);
++  Check(DecodePeer(S, A, P) and (A = '10.1.2.3') and (P = 1234), 'an IPv4-mapped peer (dual-stack socket) is reported as plain IPv4');
++
++  WriteLn('-- anything else is refused');
++  FillChar(S, SizeOf(S), 0); Put16LE(S, 0, 1);       // AF_UNIX
++  Check(not DecodePeer(S, A, P) and (A = ''), 'an unknown address family is not decoded');
++  FillChar(S, SizeOf(S), 0);
++  Check(not DecodePeer(S, A, P), 'an all-zero buffer (family 0) is not decoded');
++
++  WriteLn;
++  WriteLn(Passed, ' passed, ', Failed, ' failed');
++  if Failed > 0 then Halt(1);
++end.
+-- 
+2.43.0
+

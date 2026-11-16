@@ -11,6 +11,9 @@ uses
   Classes, SysUtils, StrUtils, Sockets, SyncObjs, {$IFDEF UNIX}BaseUnix, {$ENDIF} dynlibs, vdrx_core, vdrx_procutil, vdrx_transport, vdrx_iplimit;
 
 type
+  // big enough (and aligned) for any socket address: what accept() fills in
+  TVDRX_SockStorage = array[0..15] of Int64;
+
 
   TVDRX_SocketListenerExecutive = class;
 
@@ -73,6 +76,7 @@ type
     function BindListenSocket(APort: Word): TSocket;
     function CompleteTLSHandshake(ASock: TSocket; const APeerAddr: string; APeerPort: Word): TVDRX_Transport;
     function TryReserve(const AAddr: string): Boolean;
+    function BindListenSocket6(APort: Word; const ABindStr: string): TSocket;
     procedure AcceptLoopPlain;
     procedure AcceptLoopTLS;
     function WaitConnGone(AThread: TVDRX_ListenerConnThread; ATimeoutMs: Integer): Boolean;
@@ -114,6 +118,10 @@ type
   public
     destructor Destroy; override;
   end;
+
+// The peer of an accepted connection as vdrx reports it everywhere (logs, REMOTE_ADDR, limits): a dotted
+// quad for IPv4 and for an IPv4-mapped IPv6 peer, RFC 5952 text for IPv6. False for any other address family.
+function DecodePeer(var AStore: TVDRX_SockStorage; out AAddr: string; out APort: Word): Boolean;
 
 implementation
 
@@ -232,6 +240,107 @@ begin
   FTLSPolicy := APolicy;
 end;
 
+// ---- address families -------------------------------------------------------------------------
+// An IPv4 listener is the original code path below, unchanged. An IPv6 bind address ("::" or "::1" or a
+// global address) takes the separate BindListenSocket6 path. "::" listens on IPv4 as well (dual stack);
+// an IPv4 client then arrives as ::ffff:a.b.c.d and DecodePeer reports it as plain a.b.c.d, so limits,
+// exempt ranges and trusted proxies treat it exactly as they would on an IPv4 socket.
+const
+  VDRX_IPPROTO_IPV6 = 41;
+  {$IFDEF LINUX}
+  VDRX_IPV6_V6ONLY = 26;
+  {$ELSE}
+  VDRX_IPV6_V6ONLY = 27;
+  {$ENDIF}
+
+function DecodePeer(var AStore: TVDRX_SockStorage; out AAddr: string; out APort: Word): Boolean;
+var
+  P4: PInetSockAddr;
+  P6: PInetSockAddr6;
+  B: TVDRX_IP16;
+begin
+  Result := True;
+  case PSockAddr(@AStore)^.sa_family of
+    AF_INET:
+      begin
+        P4 := PInetSockAddr(@AStore);
+        AAddr := NetAddrToStr(P4^.sin_addr);
+        APort := ntohs(P4^.sin_port);
+      end;
+    AF_INET6:
+      begin
+        P6 := PInetSockAddr6(@AStore);
+        Move(P6^.sin6_addr, B, SizeOf(B));
+        AAddr := VDRX_FormatIP(B);
+        APort := ntohs(P6^.sin6_port);
+      end;
+  else
+    AAddr := '';
+    APort := 0;
+    Result := False;
+  end;
+end;
+
+function TVDRX_SocketListenerExecutive.BindListenSocket6(APort: Word; const ABindStr: string): TSocket;
+var
+  Addr: TInetSockAddr6;
+  B: TVDRX_IP16;
+  OptVal: LongInt;
+  i: Integer;
+  AnyAddr, Mapped: Boolean;
+begin
+  if (not VDRX_ParseIP(ABindStr, B)) then
+  begin
+    Bus.Publish('log.error', ID + ': invalid bind address "' + FBindAddress +
+      '" (use an IPv4 address, an IPv6 address such as "::1" or "::", or "localhost") - not listening on port ' +
+      IntToStr(APort), ID);
+    Exit(-1);
+  end;
+  Mapped := True;
+  for i := 0 to 9 do if B[i] <> 0 then Mapped := False;
+  if Mapped and (B[10] = $FF) and (B[11] = $FF) then
+  begin
+    Bus.Publish('log.error', ID + ': bind address "' + FBindAddress + '" is an IPv4-mapped IPv6 address - ' +
+      'write it as a plain IPv4 address, or use "::" to listen on IPv4 and IPv6 - not listening on port ' +
+      IntToStr(APort), ID);
+    Exit(-1);
+  end;
+  AnyAddr := True;
+  for i := 0 to 15 do if B[i] <> 0 then AnyAddr := False;
+  Result := fpSocket(AF_INET6, SOCK_STREAM, 0);
+  if Result = -1 then
+  begin
+    Bus.Publish('log.error', ID + ': cannot create an IPv6 socket (errno ' + IntToStr(socketerror) +
+      ') - is IPv6 enabled on this host? Not listening on port ' + IntToStr(APort), ID);
+    Exit(-1);
+  end;
+  OptVal := 1;
+  fpSetSockOpt(Result, SOL_SOCKET, SO_REUSEADDR, @OptVal, SizeOf(OptVal));
+  // "::" = every interface, IPv4 and IPv6 (dual stack); any specific IPv6 address = IPv6 only
+  if AnyAddr then OptVal := 0 else OptVal := 1;
+  if (fpSetSockOpt(Result, VDRX_IPPROTO_IPV6, VDRX_IPV6_V6ONLY, @OptVal, SizeOf(OptVal)) <> 0) and AnyAddr then
+    Bus.Publish('log.warn', ID + ': could not make the "::" socket dual-stack (errno ' + IntToStr(socketerror) +
+      '); IPv4 clients may not be able to connect', ID);
+  FillChar(Addr, SizeOf(Addr), 0);
+  Addr.sin6_family := AF_INET6;
+  Addr.sin6_port := htons(APort);
+  Move(B, Addr.sin6_addr, SizeOf(B));
+  if fpBind(Result, @Addr, SizeOf(Addr)) <> 0 then
+  begin
+    Bus.Publish('log.error', ID + ': fpBind failed on [' + ABindStr + ']:' + IntToStr(APort) +
+      ' (errno ' + IntToStr(socketerror) + ') - port likely already in use', ID);
+    CloseSocket(Result);
+    Exit(-1);
+  end;
+  if fpListen(Result, FBacklog) <> 0 then
+  begin
+    Bus.Publish('log.error', ID + ': fpListen failed on port ' + IntToStr(APort) +
+      ' (errno ' + IntToStr(socketerror) + ')', ID);
+    CloseSocket(Result);
+    Exit(-1);
+  end;
+end;
+
 function TVDRX_SocketListenerExecutive.BindListenSocket(APort: Word): TSocket;
 var
   Addr: TInetSockAddr;
@@ -244,11 +353,12 @@ begin
   // by name and anything else that parses to 0 is refused.
   BindStr := Trim(FBindAddress);
   if SameText(BindStr, 'localhost') then BindStr := '127.0.0.1';
+  if Pos(':', BindStr) > 0 then Exit(BindListenSocket6(APort, BindStr));     // an IPv6 address
   NetAddr := StrToNetAddr(BindStr);
   if (NetAddr.s_addr = 0) and (BindStr <> '0.0.0.0') then
   begin
     Bus.Publish('log.error', ID + ': invalid bind address "' + FBindAddress +
-      '" (use an IPv4 address, "localhost" or "0.0.0.0") - not listening on port ' + IntToStr(APort), ID);
+      '" (use an IPv4 address, an IPv6 address, "localhost" or "0.0.0.0") - not listening on port ' + IntToStr(APort), ID);
     Exit(-1);
   end;
   Result := fpSocket(AF_INET, SOCK_STREAM, 0);
@@ -344,12 +454,13 @@ end;
 
 procedure TVDRX_SocketListenerExecutive.AcceptLoopPlain;
 var
-  ClientAddr: TInetSockAddr;
+  ClientAddr: TVDRX_SockStorage;
   AddrLen: TSockLen;
   ClientSock: TSocket;
   ConnThread: TVDRX_ListenerConnThread;
   PlainT: TVDRX_PlainTransport;
   PeerStr: string;
+  PeerPort: Word;
 begin
   FPlainSocket := BindListenSocket(FPort);
   if FPlainSocket = -1 then
@@ -359,6 +470,7 @@ begin
   end;
   while not FStopping do
   begin
+    FillChar(ClientAddr, SizeOf(ClientAddr), 0);
     AddrLen := SizeOf(ClientAddr);
     ClientSock := fpAccept(FPlainSocket, @ClientAddr, @AddrLen);
     if ClientSock = -1 then
@@ -368,7 +480,11 @@ begin
       Continue;
     end;
 
-    PeerStr := NetAddrToStr(ClientAddr.sin_addr);
+    if not DecodePeer(ClientAddr, PeerStr, PeerPort) then
+    begin
+      CloseSocket(ClientSock);
+      Continue;
+    end;
     if not TryReserve(PeerStr) then
     begin
       CloseSocket(ClientSock);
@@ -385,7 +501,7 @@ begin
       end;
       PlainT := TVDRX_PlainTransport.Create(ClientSock);
       PlainT.PeerAddr := PeerStr;
-      PlainT.PeerPort := ntohs(ClientAddr.sin_port);
+      PlainT.PeerPort := PeerPort;
       ConnThread := TVDRX_ListenerConnThread.Create(Self, PlainT);
       ConnThread.LimitAddr := PeerStr;
     finally
@@ -424,11 +540,12 @@ end;
 
 procedure TVDRX_SocketListenerExecutive.AcceptLoopTLS;
 var
-  ClientAddr: TInetSockAddr;
+  ClientAddr: TVDRX_SockStorage;
   AddrLen: TSockLen;
   ClientSock: TSocket;
   ConnThread: TVDRX_ListenerConnThread;
   PeerStr: string;
+  PeerPort: Word;
 begin
   FTLSSocket := BindListenSocket(FTLSPort);
   if FTLSSocket = -1 then
@@ -438,6 +555,7 @@ begin
   end;
   while not FStopping do
   begin
+    FillChar(ClientAddr, SizeOf(ClientAddr), 0);
     AddrLen := SizeOf(ClientAddr);
     ClientSock := fpAccept(FTLSSocket, @ClientAddr, @AddrLen);
     if ClientSock = -1 then
@@ -447,7 +565,11 @@ begin
       Continue;
     end;
 
-    PeerStr := NetAddrToStr(ClientAddr.sin_addr);
+    if not DecodePeer(ClientAddr, PeerStr, PeerPort) then
+    begin
+      CloseSocket(ClientSock);
+      Continue;
+    end;
     if not TryReserve(PeerStr) then
     begin
       CloseSocket(ClientSock);
@@ -465,7 +587,7 @@ begin
         Break;
       end;
       ConnThread := TVDRX_ListenerConnThread.CreateTLS(Self, ClientSock,
-        PeerStr, ntohs(ClientAddr.sin_port));
+        PeerStr, PeerPort);
       ConnThread.LimitAddr := PeerStr;
     finally
       FCriticalSection.Release;

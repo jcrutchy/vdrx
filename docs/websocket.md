@@ -8,7 +8,7 @@ on top:
 { "enabled": true, "port": 8082, "ping_interval_ms": 15000, "pong_timeout_ms": 10000 }
 ```
 
-`bind` works exactly as for `http_sites` (§4): loopback only by default.
+`bind` works exactly as for `http_sites` (§4), IPv6 and `"::"` included: loopback only by default. The failed-login lockout counts an IPv6 client as its whole /64.
 
 **`max_connections`** (default `256`) is the number of *live* WebSocket connections, counted across the
 WebSocket port and any HTTP site's shared port (below). A new connection over the limit is answered
