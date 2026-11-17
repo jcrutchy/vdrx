@@ -15,12 +15,13 @@ Include the version/commit, your configuration (with secrets removed) and steps 
 
 The assets, actors, controls and review status are laid out in [docs/threat-model.md](docs/threat-model.md); the list of
 known weaknesses is [docs/known-gaps.md](docs/known-gaps.md). Security-relevant items there include
-WebSocket authentication defaults, tokens stored in plain text in the config (they are compared in constant time), logging of request
+WebSocket authentication defaults, tokens (compared in constant time; store them hashed with `token_hash`, see docs/websocket.md), logging of request
 bodies, and the absence of per-topic access control beyond `ws_profiles`.
 
 ## Operating guidance
 
-- Define `ws_profiles` with long random tokens, and give every profile a token. With no profiles the
+- Define `ws_profiles` with long random tokens (`vdrx --new-token`), store only their `token_hash` in the config, optionally
+  set `token_expires`, and give every profile a token. With no profiles the
   WebSocket rejects all logins (`allow_open_access` exists for throwaway dev setups only).
 - Template names are plain file names and `reply_to` values in `sys.>` / `kernel.>` are refused, so a client that may publish
   to a template or runner topic cannot read files outside the template directory or reach `sys.quit` / `sys.kill*` through them,
@@ -40,6 +41,11 @@ bodies, and the absence of per-topic access control beyond `ws_profiles`.
 - WebSocket handshakes from a browser must come from the same host as the request (or an entry in
   `executives.ws.allowed_origins`); `max_connections` caps live WebSocket connections. Pages and WebSocket can
   share one port with an HTTP site's `websocket_path`.
+- The operator-control topics (`sys.quit`, `sys.restart`, `sys.reload`, `sys.kill`, `sys.killall`, `sys.list`,
+  `sys.history`) are obeyed only from the `stdin` console. Anything else that manages to publish on them (a process
+  whose `publish_allow` includes `sys.>`, a socket client whose `publish` is a `sys.*` topic) is logged and ignored.
+  To let another executive drive them on purpose, list its id: `"admin_sources": ["stdin", "scheduler"]`.
+  With `stdin_admin_enabled: false` and no `admin_sources`, nothing can.
 - Facing the internet: client-supplied `X-Forwarded-For` / `Forwarded` / `X-Real-IP` headers are deleted before routing
   (list a proxy you control in `trusted_proxies` to keep them), reverse-proxied upstreams are told the real client
   in `X-Forwarded-For`, and responses carry `nosniff` / `X-Frame-Options` / `Referrer-Policy`; add `hsts_max_age`

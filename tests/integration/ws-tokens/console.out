@@ -1,0 +1,126 @@
+  Edge token: generated (keeps non-HTTP bus publishers from impersonating the HTTP edge for cgi/bus routes).
+  WebSocket profile "hashed": subscribe=[demo.>] publish=[demo.>] (token required, stored as a hash)
+  Note: ws_profiles "plain": the token is stored in plain text. Anyone who can read the configuration can use it; store "token_hash" instead (vdrx --new-token).
+  WebSocket profile "plain": subscribe=[demo.>] publish=[demo.>] (token required, plain text in the config)
+  WARNING: ws_profiles "expired": token_expires is already in the past - nobody can log in to this profile.
+  WebSocket profile "expired": subscribe=[demo.>] publish=[demo.>] (token required, stored as a hash)
+  WebSocket profile "future": subscribe=[demo.>] publish=[demo.>] (token required, stored as a hash)
+  WARNING: ws_profiles "badhash": token_hash must be "sha256:" followed by 64 hex digits (vdrx --hash-token makes one) - this profile is UNUSABLE until fixed.
+  WebSocket profile "badhash": subscribe=[demo.>] publish=[demo.>] (UNUSABLE: see warning above)
+  WARNING: ws_profiles "both": both token and token_hash are set - set only one. This profile is UNUSABLE until fixed.
+  Note: ws_profiles "both": the token is stored in plain text. Anyone who can read the configuration can use it; store "token_hash" instead (vdrx --new-token).
+  WebSocket profile "both": subscribe=[demo.>] publish=[demo.>] (UNUSABLE: see warning above)
+  WARNING: ws_profiles "badexp": token_expires "next tuesday" is not YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ - this profile is UNUSABLE until fixed.
+  WebSocket profile "badexp": subscribe=[demo.>] publish=[demo.>] (UNUSABLE: see warning above)
+  WebSocket profile "open": subscribe=[demo.>] publish=[demo.>] (no token)
+VDRX daemon running.
+  WebSocket listening on 127.0.0.1:18110.
+  Logger writing to vdrx_daemon.log (console threshold: INFO).
+  Shutdown grace period: 5000ms before hung threads/processes are force-killed.
+  Ctrl+C for a clean shutdown - every supervised process gets its own graceful-then-forced teardown, same as[32m[17-11-26 17:36:47] [INFO ] [sys.ws.connected] {"id":"ws.conn.1"}[0m
+[32m[17-11-26 17:36:47] [INFO ] [log.info] ws: new connection ws.conn.1[0m
+[32m[17-11-26 17:36:47] [INFO ] [log.info] ws ws.conn.1: handshake OK[0m
+[32m[17-11-26 17:36:47] [INFO ] [ws.conn.1.rpc.in] {"method": "sys.auth", "token": "[REDACTED]"}[0m
+[32m[17-11-26 17:36:47] [INFO ] [log.info] ws ws.conn.1: authenticated as profile "hashed"[0m
+[32m[17-11-26 17:36:47] [INFO ] [ws.conn.1.rpc.out] {"event":"auth.ok","source":"ws.conn.1","profile":"hashed"}[0m
+[32m[17-11-26 17:36:48] [INFO ] [sys.ws.connected] {"id":"ws.conn.2"}[0m
+[32m[17-11-26 17:36:48] [INFO ] [log.info] ws: new connection ws.conn.2[0m
+[32m[17-11-26 17:36:48] [INFO ] [log.info] ws ws.conn.2: handshake OK[0m
+[32m[17-11-26 17:36:48] [INFO ] [ws.conn.2.rpc.in] {"method": "sys.auth", "token": "[REDACTED]", "profile": "hashed"}[0m
+[32m[17-11-26 17:36:48] [INFO ] [log.info] ws ws.conn.2: authenticated as profile "hashed"[0m
+[32m[17-11-26 17:36:48] [INFO ] [ws.conn.2.rpc.out] {"event":"auth.ok","source":"ws.conn.2","profile":"hashed"}[0m
+[32m[17-11-26 17:36:48] [INFO ] [log.info] ws ws.conn.1: disconnected[0m
+[32m[17-11-26 17:36:48] [INFO ] [sys.ws.disconnected] {"id":"ws.conn.1"}[0m
+[32m[17-11-26 17:36:49] [INFO ] [sys.ws.connected] {"id":"ws.conn.3"}[0m
+[32m[17-11-26 17:36:49] [INFO ] [log.info] ws: new connection ws.conn.3[0m
+[32m[17-11-26 17:36:49] [INFO ] [log.info] ws ws.conn.3: handshake OK[0m
+[32m[17-11-26 17:36:49] [INFO ] [ws.conn.3.rpc.in] {"method": "sys.auth", "token": "[REDACTED]", "profile": "hashed"}[0m
+[33m[17-11-26 17:36:49] [WARN ] [log.warn] ws ws.conn.3: sys.auth rejected (profile "hashed")[0m
+[32m[17-11-26 17:36:49] [INFO ] [ws.conn.3.rpc.out] {"event":"auth.fail"}[0m
+[32m[17-11-26 17:36:49] [INFO ] [log.info] ws ws.conn.2: disconnected[0m
+[32m[17-11-26 17:36:49] [INFO ] [sys.ws.disconnected] {"id":"ws.conn.2"}[0m
+[32m[17-11-26 17:36:50] [INFO ] [sys.ws.connected] {"id":"ws.conn.4"}[0m
+[32m[17-11-26 17:36:50] [INFO ] [log.info] ws: new connection ws.conn.4[0m
+[32m[17-11-26 17:36:50] [INFO ] [log.info] ws ws.conn.4: handshake OK[0m
+[32m[17-11-26 17:36:50] [INFO ] [ws.conn.4.rpc.in] {"method": "sys.auth", "token": "[REDACTED]", "profile": "hashed"}[0m
+[33m[17-11-26 17:36:50] [WARN ] [log.warn] ws ws.conn.4: sys.auth rejected (profile "hashed")[0m
+[32m[17-11-26 17:36:50] [INFO ] [ws.conn.4.rpc.out] {"event":"auth.fail"}[0m
+[32m[17-11-26 17:36:50] [INFO ] [log.info] ws ws.conn.3: disconnected[0m
+[32m[17-11-26 17:36:50] [INFO ] [sys.ws.disconnected] {"id":"ws.conn.3"}[0m
+[32m[17-11-26 17:36:51] [INFO ] [sys.ws.connected] {"id":"ws.conn.5"}[0m
+[32m[17-11-26 17:36:51] [INFO ] [log.info] ws: new connection ws.conn.5[0m
+[32m[17-11-26 17:36:51] [INFO ] [log.info] ws ws.conn.5: handshake OK[0m
+[32m[17-11-26 17:36:51] [INFO ] [ws.conn.5.rpc.in] {"method": "sys.auth", "token": "[REDACTED]"}[0m
+[32m[17-11-26 17:36:51] [INFO ] [log.info] ws ws.conn.5: authenticated as profile "plain"[0m
+[32m[17-11-26 17:36:51] [INFO ] [ws.conn.5.rpc.out] {"event":"auth.ok","source":"ws.conn.5","profile":"plain"}[0m
+[32m[17-11-26 17:36:51] [INFO ] [log.info] ws ws.conn.4: disconnected[0m
+[32m[17-11-26 17:36:51] [INFO ] [sys.ws.disconnected] {"id":"ws.conn.4"}[0m
+[32m[17-11-26 17:36:52] [INFO ] [sys.ws.connected] {"id":"ws.conn.6"}[0m
+[32m[17-11-26 17:36:52] [INFO ] [log.info] ws: new connection ws.conn.6[0m
+[32m[17-11-26 17:36:52] [INFO ] [log.info] ws ws.conn.6: handshake OK[0m
+[32m[17-11-26 17:36:52] [INFO ] [ws.conn.6.rpc.in] {"method": "sys.auth", "token": "[REDACTED]"}[0m
+[32m[17-11-26 17:36:52] [INFO ] [log.info] ws ws.conn.6: authenticated as profile "future"[0m
+[32m[17-11-26 17:36:52] [INFO ] [ws.conn.6.rpc.out] {"event":"auth.ok","source":"ws.conn.6","profile":"future"}[0m
+[32m[17-11-26 17:36:52] [INFO ] [log.info] ws ws.conn.5: disconnected[0m
+[32m[17-11-26 17:36:52] [INFO ] [sys.ws.disconnected] {"id":"ws.conn.5"}[0m
+[32m[17-11-26 17:36:53] [INFO ] [sys.ws.connected] {"id":"ws.conn.7"}[0m
+[32m[17-11-26 17:36:53] [INFO ] [log.info] ws: new connection ws.conn.7[0m
+[32m[17-11-26 17:36:53] [INFO ] [log.info] ws ws.conn.7: handshake OK[0m
+[32m[17-11-26 17:36:53] [INFO ] [ws.conn.7.rpc.in] {"method": "sys.auth", "token": "[REDACTED]"}[0m
+[33m[17-11-26 17:36:53] [WARN ] [log.warn] ws: profile "expired" refused - its token has expired (token_expires)[0m
+[33m[17-11-26 17:36:53] [WARN ] [log.warn] ws ws.conn.7: sys.auth rejected (profile "")[0m
+[32m[17-11-26 17:36:53] [INFO ] [ws.conn.7.rpc.out] {"event":"auth.fail"}[0m
+[32m[17-11-26 17:36:53] [INFO ] [log.info] ws ws.conn.6: disconnected[0m
+[32m[17-11-26 17:36:53] [INFO ] [sys.ws.disconnected] {"id":"ws.conn.6"}[0m
+[32m[17-11-26 17:36:54] [INFO ] [sys.ws.connected] {"id":"ws.conn.8"}[0m
+[32m[17-11-26 17:36:54] [INFO ] [log.info] ws: new connection ws.conn.8[0m
+[32m[17-11-26 17:36:54] [INFO ] [log.info] ws ws.conn.8: handshake OK[0m
+[32m[17-11-26 17:36:54] [INFO ] [ws.conn.8.rpc.in] {"method": "sys.auth", "token": "[REDACTED]", "profile": "expired"}[0m
+[33m[17-11-26 17:36:54] [WARN ] [log.warn] ws: profile "expired" refused - its token has expired (token_expires)[0m
+[33m[17-11-26 17:36:54] [WARN ] [log.warn] ws ws.conn.8: sys.auth rejected (profile "expired")[0m
+[32m[17-11-26 17:36:54] [INFO ] [ws.conn.8.rpc.out] {"event":"auth.fail"}[0m
+[32m[17-11-26 17:36:54] [INFO ] [log.info] ws ws.conn.7: disconnected[0m
+[32m[17-11-26 17:36:54] [INFO ] [sys.ws.disconnected] {"id":"ws.conn.7"}[0m
+[32m[17-11-26 17:36:55] [INFO ] [sys.ws.connected] {"id":"ws.conn.9"}[0m
+[32m[17-11-26 17:36:55] [INFO ] [log.info] ws: new connection ws.conn.9[0m
+[32m[17-11-26 17:36:55] [INFO ] [log.info] ws ws.conn.9: handshake OK[0m
+[32m[17-11-26 17:36:55] [INFO ] [ws.conn.9.rpc.in] {"method": "sys.auth", "profile": "badhash"}[0m
+[33m[17-11-26 17:36:55] [WARN ] [log.warn] ws ws.conn.9: sys.auth rejected (profile "badhash")[0m
+[32m[17-11-26 17:36:55] [INFO ] [ws.conn.9.rpc.out] {"event":"auth.fail"}[0m
+[32m[17-11-26 17:36:55] [INFO ] [log.info] ws ws.conn.8: disconnected[0m
+[32m[17-11-26 17:36:55] [INFO ] [sys.ws.disconnected] {"id":"ws.conn.8"}[0m
+[32m[17-11-26 17:36:56] [INFO ] [sys.ws.connected] {"id":"ws.conn.10"}[0m
+[32m[17-11-26 17:36:56] [INFO ] [log.info] ws: new connection ws.conn.10[0m
+[32m[17-11-26 17:36:56] [INFO ] [log.info] ws ws.conn.10: handshake OK[0m
+[32m[17-11-26 17:36:56] [INFO ] [ws.conn.10.rpc.in] {"method": "sys.auth", "profile": "badhash", "token": "[REDACTED]"}[0m
+[33m[17-11-26 17:36:56] [WARN ] [log.warn] ws ws.conn.10: sys.auth rejected (profile "badhash")[0m
+[32m[17-11-26 17:36:56] [INFO ] [ws.conn.10.rpc.out] {"event":"auth.fail"}[0m
+[32m[17-11-26 17:36:56] [INFO ] [log.info] ws ws.conn.9: disconnected[0m
+[32m[17-11-26 17:36:56] [INFO ] [sys.ws.disconnected] {"id":"ws.conn.9"}[0m
+[32m[17-11-26 17:36:57] [INFO ] [sys.ws.connected] {"id":"ws.conn.11"}[0m
+[32m[17-11-26 17:36:57] [INFO ] [log.info] ws: new connection ws.conn.11[0m
+[32m[17-11-26 17:36:57] [INFO ] [log.info] ws ws.conn.11: handshake OK[0m
+[32m[17-11-26 17:36:57] [INFO ] [ws.conn.11.rpc.in] {"method": "sys.auth", "profile": "both", "token": "[REDACTED]"}[0m
+[33m[17-11-26 17:36:57] [WARN ] [log.warn] ws ws.conn.11: sys.auth rejected (profile "both")[0m
+[32m[17-11-26 17:36:57] [INFO ] [ws.conn.11.rpc.out] {"event":"auth.fail"}[0m
+[32m[17-11-26 17:36:57] [INFO ] [log.info] ws ws.conn.10: disconnected[0m
+[32m[17-11-26 17:36:57] [INFO ] [sys.ws.disconnected] {"id":"ws.conn.10"}[0m
+[32m[17-11-26 17:36:58] [INFO ] [sys.ws.connected] {"id":"ws.conn.12"}[0m
+[32m[17-11-26 17:36:58] [INFO ] [log.info] ws: new connection ws.conn.12[0m
+[32m[17-11-26 17:36:58] [INFO ] [log.info] ws ws.conn.12: handshake OK[0m
+[32m[17-11-26 17:36:58] [INFO ] [ws.conn.12.rpc.in] {"method": "sys.auth", "profile": "badexp", "token": "[REDACTED]"}[0m
+[33m[17-11-26 17:36:58] [WARN ] [log.warn] ws ws.conn.12: sys.auth rejected (profile "badexp")[0m
+[32m[17-11-26 17:36:58] [INFO ] [ws.conn.12.rpc.out] {"event":"auth.fail"}[0m
+[32m[17-11-26 17:36:58] [INFO ] [log.info] ws ws.conn.11: disconnected[0m
+[32m[17-11-26 17:36:58] [INFO ] [sys.ws.disconnected] {"id":"ws.conn.11"}[0m
+[32m[17-11-26 17:36:59] [INFO ] [sys.ws.connected] {"id":"ws.conn.13"}[0m
+[32m[17-11-26 17:36:59] [INFO ] [log.info] ws: new connection ws.conn.13[0m
+[32m[17-11-26 17:36:59] [INFO ] [log.info] ws ws.conn.13: handshake OK[0m
+[32m[17-11-26 17:36:59] [INFO ] [ws.conn.13.rpc.in] {"method": "sys.auth", "profile": "open"}[0m
+[32m[17-11-26 17:36:59] [INFO ] [log.info] ws ws.conn.13: authenticated as profile "open"[0m
+[32m[17-11-26 17:36:59] [INFO ] [ws.conn.13.rpc.out] {"event":"auth.ok","source":"ws.conn.13","profile":"open"}[0m
+[32m[17-11-26 17:36:59] [INFO ] [log.info] ws ws.conn.12: disconnected[0m
+[32m[17-11-26 17:36:59] [INFO ] [sys.ws.disconnected] {"id":"ws.conn.12"}[0m
+Dispatcher: Shutdown signal processed.
+ typing quit.
+Daemon stopped.

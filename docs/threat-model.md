@@ -95,13 +95,13 @@ Status: **Mitigated** (a control exists and a test exercises it), **Partly** (a 
 
 | Threat | Control | Status | Test |
 |---|---|---|---|
-| Guessing a token | 8 failed `sys.auth` per address per minute, then a one-minute lockout; constant-time comparison; with no profiles all logins are refused unless `allow_open_access` is set | Partly: tokens are plain text in the config and never expire; behind a proxy all clients share one address | `ws`, `ws-open`, `ws-lockout` |
+| Guessing a token | 8 failed `sys.auth` per address per minute, then a one-minute lockout; constant-time comparison; with no profiles all logins are refused unless `allow_open_access` is set | Mitigated for the config file (tokens can be stored as `token_hash`, and can expire); still partly open: a long random token is the only credential, there are no per-client credentials, and behind a proxy all clients share one address | `ws`, `ws-open`, `ws-lockout`, `ws-tokens` |
 | A weaker profile keeps a stronger profile's access after re-authenticating, or after a failed attempt | A second `sys.auth` first drops the session and **all** subscriptions, then judges the new token (fail-closed) | Mitigated *(found and fixed in hardening 9)* | `regress` |
 | A client names a profile that has no token | Anyone may use it - by design | Open: give every profile that matters a token | - |
 | Publishing to topics a profile should not reach | `publish_allow` (deny by default) and `subscribe_allow` per profile; `sys.>` publishes are denied to clients | Mitigated | `ws` |
 | **Confused deputy:** a client makes a privileged executive publish for it (`reply_to: "sys.quit"` on a template request) | A request's `reply_to` is refused for `sys.>` / `kernel.>`, and, for a profile client, must match its own `publish_allow` (template, runner and CGI executives) | Mitigated for WebSocket requesters *(found and fixed in hardening 9)* | `regress` |
 | The same trick through an executive that is not yet checked | Only the template, runner and CGI executives take a caller-supplied reply topic today. **Any new executive that does must call `VDRX_ReplyAllowed`** | Partly (a rule for developers, not enforced by the compiler) | - |
-| The admin executive trusts any message on `sys.>` | It acts on the topic regardless of the message's source; the guard is that clients cannot publish there and executives refuse it as a reply target | Open: a source check in the admin executive would be defence in depth | - |
+| A message on `sys.>` from something that should not control the daemon (a process or socket peer granted `sys.>` publish rights, a future executive that forgets `VDRX_ReplyAllowed`) | The admin executive obeys quit/restart/reload/kill/killall/list/history only from `admin_sources` (default: the stdin console); anything else is dropped and logged. Clients still cannot publish there and executives still refuse it as a reply target | Mitigated | `admin-source` |
 | Cross-site WebSocket from a victim's browser | `Origin` must match `Host` (or be in `allowed_origins`) | Partly: **not** a defence against DNS rebinding - tokens are | `ws-shared` |
 | Subscribing to everything in dev mode | `allow_open_access` (dev only, off by default) | Open by design | `ws-open` |
 
@@ -189,8 +189,8 @@ Reviewed so far (code read plus tests; findings in the "found and fixed" rows ab
 ## 7. Recommended next steps, in order
 
 1. Finish the review list above, starting with the bucket recorder and the legacy `cli_bridges` protocols.
-2. Give the admin executive a source check, so `sys.>` is protected even if a future executive forgets `VDRX_ReplyAllowed`.
-3. Hash tokens at rest and add an optional expiry, or move to a per-client credential.
+2. ~~Give the admin executive a source check~~ (done: `admin_sources`).
+3. ~~Hash tokens at rest and add an optional expiry~~ (done: `token_hash`, `token_expires`); per-client credentials remain open.
 4. ~~Set a minimum TLS version and cipher policy explicitly~~ (done); test TLS on Windows; warn before certificate expiry.
 5. Offer an optional sandbox wrapper for child programs (a separate account, a job object on Windows, a container).
 6. Run the regression suite in CI on every commit, with the stress and stall tests nightly.

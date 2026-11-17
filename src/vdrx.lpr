@@ -3,7 +3,7 @@ program vdrx;
 {$mode objfpc}{$H+}
 
 uses
-  {$IFDEF UNIX}   cthreads, {$ENDIF}   Classes, StrUtils, SysUtils, Process, fpjson, jsonparser, RegExpr, vdrx_core, vdrx_config, vdrx_iplimit, vdrx_linebuf, vdrx_admin, vdrx_logger, vdrx_stdin, vdrx_bridge, vdrx_bucket, vdrx_transport, vdrx_httpparse, vdrx_connection, vdrx_websocket, vdrx_httproute, vdrx_http, vdrx_socketclient, vdrx_templates, vdrx_runner, vdrx_cgi, vdrx_jobs, vdrx_procutil   {$IFDEF UNIX}, BaseUnix{$ENDIF};
+  {$IFDEF UNIX}   cthreads, {$ENDIF}   Classes, StrUtils, SysUtils, DateUtils, Process, fpjson, jsonparser, RegExpr, vdrx_core, vdrx_config, vdrx_iplimit, vdrx_sha256, vdrx_linebuf, vdrx_admin, vdrx_logger, vdrx_stdin, vdrx_bridge, vdrx_bucket, vdrx_transport, vdrx_httpparse, vdrx_connection, vdrx_websocket, vdrx_httproute, vdrx_http, vdrx_socketclient, vdrx_templates, vdrx_runner, vdrx_cgi, vdrx_jobs, vdrx_procutil   {$IFDEF UNIX}, BaseUnix{$ENDIF};
 
 type
   // Polls GShutdownRequested (vdrx_procutil.pas) from ordinary thread
@@ -34,6 +34,7 @@ var
   Config: TVDRX_Config;
   ConfigFile: string;
   Admin: TVDRX_AdminExecutive;
+  AdminSrc: string;
   Logger: TVDRX_LoggerExecutive;
   Stdin: TVDRX_StdinExecutive;
   WS: TVDRX_WebSocketExecutive;
@@ -842,6 +843,55 @@ end;
 //   max_queue        frames held for a slow client before the oldest are dropped (5000)
 // With no ws_profiles every sys.auth is rejected, unless executives.ws.allow_open_access
 // is set (dev only): then any non-empty token is accepted.
+
+// token_hash ("sha256:<64 hex>", instead of token) and token_expires (see VDRX_ParseTokenExpiry) of one profile.
+// A credential that cannot be understood makes the profile UNUSABLE; it must never quietly become "no token".
+procedure ConfigureProfileCredential(var AProfile: TVDRX_WSProfile; const AHash, AExpires: string);
+var
+  H: string;
+  i: Integer;
+  Ok: Boolean;
+begin
+  AProfile.TokenHash := '';
+  AProfile.TokenInvalid := False;
+  AProfile.TokenExpires := 0;
+  if Trim(AHash) <> '' then
+  begin
+    H := LowerCase(Trim(AHash));
+    Ok := (Copy(H, 1, 7) = 'sha256:') and (Length(H) = 7 + 64);
+    if Ok then
+      for i := 8 to Length(H) do
+        if not (H[i] in ['0'..'9', 'a'..'f']) then Ok := False;
+    if not Ok then
+    begin
+      WriteLn('  WARNING: ws_profiles "', AProfile.ID, '": token_hash must be "sha256:" followed by 64 hex digits (vdrx --hash-token makes one) - this profile is UNUSABLE until fixed.');
+      AProfile.TokenInvalid := True;
+    end
+    else if AProfile.Token <> '' then
+    begin
+      WriteLn('  WARNING: ws_profiles "', AProfile.ID, '": both token and token_hash are set - set only one. This profile is UNUSABLE until fixed.');
+      AProfile.TokenInvalid := True;
+    end
+    else
+      AProfile.TokenHash := Copy(H, 8, 64);
+  end;
+  if Trim(AExpires) <> '' then
+  begin
+    if not VDRX_ParseTokenExpiry(Trim(AExpires), AProfile.TokenExpires) then
+    begin
+      WriteLn('  WARNING: ws_profiles "', AProfile.ID, '": token_expires "', AExpires, '" is not YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ - this profile is UNUSABLE until fixed.');
+      AProfile.TokenExpires := 0;
+      AProfile.TokenInvalid := True;
+    end
+    else if (AProfile.Token = '') and (AProfile.TokenHash = '') and (not AProfile.TokenInvalid) then
+      WriteLn('  WARNING: ws_profiles "', AProfile.ID, '": token_expires has no effect on a profile with no token.')
+    else if AProfile.TokenExpires < LocalTimeToUniversal(Now) then
+      WriteLn('  WARNING: ws_profiles "', AProfile.ID, '": token_expires is already in the past - nobody can log in to this profile.');
+  end;
+  if AProfile.Token <> '' then
+    WriteLn('  Note: ws_profiles "', AProfile.ID, '": the token is stored in plain text. Anyone who can read the configuration can use it; store "token_hash" instead (vdrx --new-token).');
+end;
+
 procedure SetupWSProfiles(AConfig: TVDRX_Config; AWS: TVDRX_WebSocketExecutive);
 var
   Rows: TVDRX_ConfigRows;
@@ -865,12 +915,16 @@ begin
       SetLength(Profiles, n + 1);
       Profiles[n].ID := Row.Values['id'];
       Profiles[n].Token := Row.Values['token'];
+      ConfigureProfileCredential(Profiles[n], Row.Values['token_hash'], Row.Values['token_expires']);
       Profiles[n].SubscribeAllow := Row.Values['subscribe_allow'];
       Profiles[n].PublishAllow := Row.Values['publish_allow'];
       Profiles[n].DefaultSubscribe := Row.Values['default_subscribe'];
       Profiles[n].MaxQueue := StrToIntDef(Row.Values['max_queue'], 5000);
       WriteLn('  WebSocket profile "', Profiles[n].ID, '": subscribe=[', Profiles[n].SubscribeAllow,
-        '] publish=[', Profiles[n].PublishAllow, ']', IfThen(Profiles[n].Token <> '', ' (token required)', ' (no token)'));
+        '] publish=[', Profiles[n].PublishAllow, ']',
+        IfThen(Profiles[n].TokenInvalid, ' (UNUSABLE: see warning above)',
+          IfThen(Profiles[n].TokenHash <> '', ' (token required, stored as a hash)',
+            IfThen(Profiles[n].Token <> '', ' (token required, plain text in the config)', ' (no token)'))));
     end;
   finally
     Rows.Free;
@@ -1287,10 +1341,45 @@ end;
 // Returns the configuration file to load: the --config argument, or 'vdrx.conf' in the
 // current directory. Anything else on the command line is a fatal usage error rather than
 // being ignored, so a typo cannot silently start the daemon on the wrong configuration.
+// 256 random bits as 64 hex digits, from the operating system's random source.
+function NewRandomToken: string;
+var
+  B: array[0..31] of Byte;
+  F: TFileStream;
+  G: TGUID;
+  i, n: Integer;
+begin
+  Result := '';
+  FillChar(B, SizeOf(B), 0);
+  n := 0;
+  {$IFDEF UNIX}
+  try
+    F := TFileStream.Create('/dev/urandom', fmOpenRead or fmShareDenyNone);
+    try
+      n := F.Read(B, SizeOf(B));
+    finally
+      F.Free;
+    end;
+  except
+    n := 0;
+  end;
+  {$ENDIF}
+  if n <> SizeOf(B) then
+  begin
+    // no /dev/urandom (Windows): GUIDs come from the OS cryptographic generator
+    for i := 0 to 1 do
+    begin
+      CreateGUID(G);
+      Move(G, B[i * 16], 16);
+    end;
+  end;
+  for i := 0 to High(B) do Result := Result + LowerCase(IntToHex(B[i], 2));
+end;
+
 function ParseCommandLine: string;
 var
   i: Integer;
-  Arg: string;
+  Arg, Tok: string;
 begin
   Result := 'vdrx.conf';
   i := 1;
@@ -1300,10 +1389,35 @@ begin
     if (Arg = '-h') or (Arg = '--help') or (Arg = '-?') then
     begin
       WriteLn('Usage: vdrx [-c|--config <file>]');
+      WriteLn('       vdrx --new-token | --hash-token');
       WriteLn('  -c, --config <file>   configuration file to load (default: vdrx.conf in the current directory)');
+      WriteLn('  --new-token           make a random WebSocket token and print it with its "token_hash" for ws_profiles, then exit');
+      WriteLn('  --hash-token          read a token from standard input and print its "token_hash", then exit');
       WriteLn('  -h, --help            show this help');
       WriteLn('Relative paths inside the configuration are resolved against the current directory,');
       WriteLn('not the configuration file''s directory; use {MAIN_CONF_DIR} to refer to the latter.');
+      Halt(0);
+    end
+    else if Arg = '--new-token' then
+    begin
+      Tok := NewRandomToken;
+      WriteLn('token:       ', Tok);
+      WriteLn('token_hash:  sha256:', VDRX_SHA256Hex(Tok));
+      WriteLn('Give the client the token and put only the token_hash in the configuration:');
+      WriteLn('  { "id": "...", "token_hash": "sha256:', VDRX_SHA256Hex(Tok), '", ... }');
+      Halt(0);
+    end
+    else if Arg = '--hash-token' then
+    begin
+      Tok := '';
+      if not EOF(Input) then ReadLn(Tok);
+      while (Tok <> '') and (Tok[Length(Tok)] in [#13, #10]) do SetLength(Tok, Length(Tok) - 1);
+      if Tok = '' then
+      begin
+        WriteLn(StdErr, 'FATAL: --hash-token reads the token from standard input and got nothing');
+        Halt(2);
+      end;
+      WriteLn('sha256:', VDRX_SHA256Hex(Tok));
       Halt(0);
     end
     else if (Arg = '-c') or (Arg = '--config') then
@@ -1386,6 +1500,14 @@ begin
 
     Admin := TVDRX_AdminExecutive.Create(Kernel.Queue, Config, Kernel.Registry, Kernel);
     Kernel.Registry.Register(Admin, 'admin', 'sys.>');
+    // Which sources may drive sys.quit / sys.reload / sys.kill ... ("stdin" unless the config says otherwise)
+    if Length(Config.GetStringArray('admin_sources')) > 0 then
+    begin
+      Admin.AllowedSources.Clear;
+      for AdminSrc in Config.GetStringArray('admin_sources') do
+        if Trim(AdminSrc) <> '' then Admin.AllowedSources.Add(Trim(AdminSrc));
+      WriteLn('  Admin: sys.> control accepted from: ', Admin.AllowedSources.CommaText, ' (admin_sources).');
+    end;
 
     if Config.GetBoolean('stdin_admin_enabled', True) then
     begin

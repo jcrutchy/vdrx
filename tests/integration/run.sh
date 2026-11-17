@@ -5,11 +5,11 @@
 #   tests/integration/run.sh              run everything this machine can run
 #   tests/integration/run.sh php-cgi ws   run only the named sections
 #
-# Sections: ipv6 edge-policy tls-policy ip-limits static-site php-cgi python-cgi cli-api templates websocket-only
+# Sections: ws-tokens admin-source ipv6 edge-policy tls-policy ip-limits static-site php-cgi python-cgi cli-api templates websocket-only
 #           web-and-websocket legacy-cli-bridges cgi ws ws-open ws-lockout log-redaction limits regress tls-client proxy ws-shared spawn fuzz jobs line-limits cli-args
 # Needs: bin/vdrx (./build.sh), curl, python3. php-cgi / php / sort,tr,wc,head,grep
 # are only needed by the sections that use them; those sections skip if missing.
-# Uses ports 8080, 8082, 18080-18109 (and 18701 for a fake server) - it refuses to run if one is already taken,
+# Uses ports 8080, 8082, 18080-18110 (and 18701 for a fake server) - it refuses to run if one is already taken,
 # and only ever stops the daemon it started itself.
 cd "$(dirname "$0")/../.." || exit 1
 ROOT=$(pwd); BIN="$ROOT/bin/vdrx"; [ -x "$BIN" ] || BIN="$ROOT/bin/vdrx.exe"; PIDFILE=/tmp/vdrx_it.pid; OUT=/tmp/vdrx_it.out
@@ -183,6 +183,20 @@ if want ws-lockout "$@"; then section "tests/integration/ws (failed-login lockou
   if need python3 && start tests/integration/ws 18082; then
     out=$(cd tests/integration/ws && python3 ws_lockout_test.py 2>&1); echo "$out" | sed 's/^/  /'
     case "$out" in *"all passed"*) ok "lockout suite";; *) bad "lockout suite" "see output above";; esac
+  fi
+fi
+
+if want ws-tokens "$@"; then section "tests/integration/ws-tokens (hashed and expiring WebSocket tokens)"
+  if need python3; then
+    out=$(cd tests/integration/ws-tokens && python3 ws_tokens_test.py 2>&1); echo "$out" | sed 's/^/  /'
+    case "$out" in *"all passed"*) ok "ws-tokens suite";; *) bad "ws-tokens suite" "see output above";; esac
+  fi
+fi
+
+if want admin-source "$@"; then section "tests/integration/admin-source (who may drive sys.>)"
+  if need python3; then
+    out=$(cd tests/integration/admin-source && python3 admin_source_test.py 2>&1); echo "$out" | sed 's/^/  /'
+    case "$out" in *"all passed"*) ok "admin-source suite";; *) bad "admin-source suite" "see output above";; esac
   fi
 fi
 

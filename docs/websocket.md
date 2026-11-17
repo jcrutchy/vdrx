@@ -96,9 +96,24 @@ client is allowed to subscribe to and publish:
 
 `sys.auth` picks the profile: `{"method":"sys.auth","token":"vt"}` selects
 the profile whose token matches, `{"method":"sys.auth","profile":"viewer","token":"vt"}`
-names it (a profile with no `token` is open to anyone who names it - real
-per-profile auth is a later step). A bad token gets `{"event":"auth.fail"}`;
-`auth.ok` now carries the `profile`. After that:
+names it (a profile with no token is open to anyone who names it). A bad token gets `{"event":"auth.fail"}`;
+`auth.ok` now carries the `profile`.
+
+**Keeping tokens out of the configuration.** Anyone who can read `vdrx.conf` can use a plain `token`. Store a hash
+instead: run `vdrx --new-token` (it prints a random 256-bit token and its hash) or `vdrx --hash-token` (reads a token
+from standard input), give the client the token, and put only the hash in the profile:
+
+```json
+{ "id": "dashboard", "token_hash": "sha256:9f86d0...", "token_expires": "2027-06-30", "subscribe_allow": ["demo.>"] }
+```
+
+`token_hash` is used *instead of* `token` (setting both makes the profile unusable). It is an unsalted SHA-256, which
+is right for the long random tokens `--new-token` makes and **wrong for a human-chosen password**: do not hash a
+guessable secret and call it safe. `token_expires` (`YYYY-MM-DD`, valid through the end of that day UTC, or
+`YYYY-MM-DDTHH:MM:SSZ`) makes the profile refuse its token afterwards, and the refusal is logged as an expiry rather
+than a bad guess. A credential vdrx cannot understand (a malformed hash, an unparsable date, both `token` and
+`token_hash`) makes the profile **unusable**, with a warning at startup; it never quietly turns into "no token, open to
+anyone". Credentials are read at startup (not on `sys.reload`). After authentication:
 
 - **subscribe** must be *covered* by `subscribe_allow`: `demo.>` allows
   `demo.x` and `demo.*` but not `>`; `demo.*` does not allow `demo.>`.

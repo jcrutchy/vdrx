@@ -1,0 +1,19 @@
+  Admin: sys.> control accepted from: stdin,rogue (admin_sources).
+  Edge token: generated (keeps non-HTTP bus publishers from impersonating the HTTP edge for cgi/bus routes).
+  Process "rogue" (python3 rogue.py, restart=never, graceful_timeout_ms=5000, subscribe=rogue.in, output -> rogue.out)
+VDRX daemon running.
+  Logger writing to vdrx_daemon.log (console threshold: INFO).
+  Type quit / restart / reload / kill <pid-or-id> / killall [type] and press Enter to control the daemon.
+  Shutdown grace period: 50[32m[17-11-26 17:37:09] [INFO ] [sys.list] [0m
+[32m[17-11-26 17:37:09] [INFO ] [log.info] admin: 4 executive(s) registered:[0m
+[32m[17-11-26 17:37:09] [INFO ] [log.info]   rogue (TVDRX_BridgeExecutive) - running, pid 1803, restart=never[0m
+[32m[17-11-26 17:37:09] [INFO ] [log.info]   stdin (TVDRX_StdinExecutive)[0m
+[32m[17-11-26 17:37:09] [INFO ] [log.info]   logger (TVDRX_LoggerExecutive)[0m
+[32m[17-11-26 17:37:09] [INFO ] [log.info]   admin (TVDRX_AdminExecutive)[0m
+[32m[17-11-26 17:37:10] [INFO ] [sys.reload] [0m
+[32m[17-11-26 17:37:10] [INFO ] [log.info] Configuration reloaded successfully.[0m
+[32m[17-11-26 17:37:10] [INFO ] [sys.quit] [0m
+Dispatcher: Exited loop cleanly.
+00ms before hung threads/processes are force-killed.
+  Ctrl+C for a clean shutdown - every supervised process gets its own graceful-then-forced teardown, same as typing quit.
+Daemon stopped.

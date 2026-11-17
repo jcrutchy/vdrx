@@ -39,14 +39,11 @@
 - **`reply_to` is bounded for WebSocket profiles only.** A request's `reply_to` is checked against the requester's own
   `publish_allow` when the requester is a WebSocket connection in profile mode, and `sys.>` / `kernel.>` are always refused.
   Requests from other sources (HTTP routes, processes, stdin) are unrestricted apart from those reserved namespaces, since
-  those sources are configured by the operator, not by a client. The admin executive also acts on `sys.>` whatever the
-  message source.
+  those sources are configured by the operator, not by a client. (The admin executive no longer trusts the source of
+  a `sys.>` control message: see `admin_sources` in SECURITY.md.)
 - **Symbolic links under a CGI `doc_root` are followed for scripts.** Static files are checked for symlinks (see
   `static_follow_symlinks`); a script reached through a link that points outside the doc root is still run. Doc roots are
   operator-controlled, so keep them free of links to places the web user should not reach.
-- **The reverse proxy passes the client's `X-Forwarded-*` / `X-Real-IP` / `Forwarded` headers through, and adds none.** An
-  upstream that trusts them (for the client address, or for "this came through the proxy") can be lied to by any client.
-  vdrx has no option to strip or rewrite them yet; until it does, do not let an upstream make decisions on those headers.
 - **Chunked request bodies are refused (`501`).** Clients that stream an upload without knowing its length cannot use vdrx's
   HTTP front end; they must send a `Content-Length`.
 - **Programs are not sandboxed.** A CGI program, `cli_bridges` command, job or process runs with the
@@ -70,9 +67,9 @@
   non-empty token is then accepted and may subscribe to everything, including
   `http.reply.*` request/response envelopes; publishing to `sys.>` is still
   denied). With profiles, a profile that has no `token` is open to anyone who
-  names it - give every profile that matters a long random token. Tokens are
-  held and compared in plain text (compared in constant time) and have no
-  expiry. Eight failed `sys.auth` attempts from one address within a minute
+  names it - give every profile that matters a long random token. A token may be stored as
+  an unsalted SHA-256 `token_hash` (only sound for long random tokens) and may carry a `token_expires`; plain-text
+  `token` still works. Comparison is constant time, and there are no per-client credentials. Eight failed `sys.auth` attempts from one address within a minute
   lock that address out for a minute; behind a reverse proxy every client
   shares the proxy's address. There is no per-topic access control beyond
   `ws_profiles`, so more things than before are reachable purely by knowing a

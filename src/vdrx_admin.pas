@@ -26,15 +26,20 @@ type
   //   sys.history  - payload is "<bucket name> [count]" (count defaults to
   //                  20). Prints the last <count> entries from that
   //                  bucket's history file - see vdrx_bucket.pas.
-  // Not authenticated - see vdrx_admin.pas for what feeds these topics
-  // (stdin today; written to be reusable by any future text-command
-  // source) and why that's deliberate for now.
+  // Obeys these topics only from the sources in AllowedSources (default: the
+  // stdin console) - see below. See also what feeds these topics (stdin
+  // today; written to be reusable by any future text-command source).
   TVDRX_AdminExecutive = class(TVDRX_Executive)
   private
     FConfig: TVDRX_Config;
     FRegistry: TVDRX_Registry;
     FKernel: TVDRX_Kernel;
+    FAllowedSources: TStringList;
+    FRefusedSinceLog: Integer;
+    FLastRefusalLog: QWord;
     function IsProtected(const AID: string): Boolean;
+    function IsControlTopic(const ATopic: string): Boolean;
+    procedure NoteRefused(const ATopic, ASource: string);
     procedure DoKill(const ATarget: string);
     procedure DoKillAll(const ATypeFilter: string);
     procedure DoList;
@@ -42,14 +47,21 @@ type
   public
     constructor Create(ABus: TVDRX_MessageQueue; AConfig: TVDRX_Config;
       ARegistry: TVDRX_Registry; AKernel: TVDRX_Kernel); reintroduce;
+    destructor Destroy; override;
     procedure HandlePacket(const AMsg: TVDRX_Message); override;
+    // Source IDs whose sys.> control messages (quit, restart, reload, kill, killall, list, history) are obeyed.
+    // Default: only "stdin", the operator's console. A message on a control topic from any other source is
+    // logged and dropped, so the namespace stays protected even if some other executive (a process allowed
+    // to publish sys.>, a socket client with a sys.* publish_topic, a future feature) lets one through.
+    property AllowedSources: TStringList read FAllowedSources;
   end;
 
 // Shared line-command parser used by anything that lets an operator type
 // admin commands at VDRX - stdin (vdrx_stdin.pas) today, written to be
-// reusable by any future text-command source. Not authenticated in any way
-// yet (deliberate, matches the rest of the daemon at this stage) - anything
-// that can reach this can quit/restart/kill the daemon.
+// reusable by any future text-command source. The CALLER decides who may type
+// here (stdin: whoever has the console). The admin executive then obeys the
+// resulting sys.* topics only from its AllowedSources (default: "stdin"), so a
+// message that reaches sys.> by any other route is dropped.
 //
 // Recognised commands (case-insensitive), one per line:
 //   quit                  - clean shutdown of the whole daemon
@@ -125,6 +137,42 @@ begin
   FConfig := AConfig;
   FRegistry := ARegistry;
   FKernel := AKernel;
+  FAllowedSources := TStringList.Create;
+  FAllowedSources.CaseSensitive := True;
+  FAllowedSources.Add('stdin');
+end;
+
+destructor TVDRX_AdminExecutive.Destroy;
+begin
+  FAllowedSources.Free;
+  inherited Destroy;
+end;
+
+function TVDRX_AdminExecutive.IsControlTopic(const ATopic: string): Boolean;
+begin
+  Result := (ATopic = 'sys.reload') or (ATopic = 'sys.quit') or (ATopic = 'sys.restart') or
+    (ATopic = 'sys.kill') or (ATopic = 'sys.killall') or (ATopic = 'sys.list') or (ATopic = 'sys.history');
+end;
+
+// Logs a refusal, at most once every 5 s with a count, so a source that spams sys.> cannot also flood the log.
+// The source ID is internal but is printed with anything unprintable removed.
+procedure TVDRX_AdminExecutive.NoteRefused(const ATopic, ASource: string);
+var
+  Safe: string;
+  i: Integer;
+  Now: QWord;
+begin
+  Inc(FRefusedSinceLog);
+  Now := GetTickCount64;
+  if (FLastRefusalLog <> 0) and (Now - FLastRefusalLog < 5000) then Exit;
+  Safe := '';
+  for i := 1 to Min(Length(ASource), 64) do
+    if ASource[i] in [#32..#126] then Safe := Safe + ASource[i] else Safe := Safe + '?';
+  Bus.Publish('log.warn', 'admin: refused ' + ATopic + ' from source "' + Safe + '" (' + IntToStr(FRefusedSinceLog) +
+    ' refused since the last report) - only these sources may use sys.>: ' + FAllowedSources.CommaText +
+    '; add a source to "admin_sources" in the configuration to allow it', ID);
+  FRefusedSinceLog := 0;
+  FLastRefusalLog := Now;
 end;
 
 // Executives that keep the daemon itself controllable - never touched by
@@ -309,6 +357,11 @@ var
   Errs: TStringList;
   ErrIdx: Integer;
 begin
+  if IsControlTopic(AMsg.Topic) and (FAllowedSources.IndexOf(AMsg.SourceID) < 0) then
+  begin
+    NoteRefused(AMsg.Topic, AMsg.SourceID);
+    Exit;
+  end;
   if AMsg.Topic = 'sys.reload' then
   begin
     if FConfig.Reload then

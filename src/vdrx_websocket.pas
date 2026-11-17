@@ -8,7 +8,7 @@ unit vdrx_websocket;
 interface
 
 uses
-  Classes, SysUtils, StrUtils, SyncObjs, Generics.Collections, openssl, {$IFDEF UNIX}BaseUnix, {$ENDIF} dynlibs, base64, sha1, fpjson, jsonparser, DateUtils, Types, vdrx_core, vdrx_config, vdrx_procutil, vdrx_transport, vdrx_connection, vdrx_iplimit, vdrx_httpparse;
+  Classes, SysUtils, StrUtils, SyncObjs, Generics.Collections, openssl, {$IFDEF UNIX}BaseUnix, {$ENDIF} dynlibs, base64, sha1, fpjson, jsonparser, DateUtils, Types, vdrx_core, vdrx_config, vdrx_procutil, vdrx_transport, vdrx_connection, vdrx_iplimit, vdrx_sha256, vdrx_httpparse;
 
 type
 
@@ -20,7 +20,11 @@ type
   // deny-by-default - the same semantics as a process's publish_allow).
   TVDRX_WSProfile = record
     ID: string;
-    Token: string;            // '' = anyone who names the profile may use it
+    Token: string;            // plain-text token. '' (and no TokenHash) = anyone who names the profile may use it
+    TokenHash: string;        // lower-case hex SHA-256 of the token ("token_hash"); used INSTEAD of Token
+    TokenInvalid: Boolean;    // the credential in the configuration could not be understood: NOBODY may use the
+                              // profile (it must never fall back to "no token = open")
+    TokenExpires: Double;     // UTC TDateTime after which the token is refused; 0 = never ("token_expires")
     SubscribeAllow: string;
     PublishAllow: string;
     DefaultSubscribe: string; // subscribed right after a successful sys.auth
@@ -160,6 +164,15 @@ const
 // True when every topic that matches AFilter also matches the allow-pattern AAllow: the test a
 // ws_profiles subscribe_allow/publish_allow entry has to pass. Exposed for tests/unit/test_topiccover.lpr.
 function TopicFilterCovers(const AAllow, AFilter: string): Boolean;
+
+// "2027-01-31" (valid through the end of that day, UTC) or "2027-01-31T12:30:00Z" (UTC). False for anything else.
+function VDRX_ParseTokenExpiry(const S: string; out AUTC: Double): Boolean;
+// True when the profile asks for a token (plain or hashed) - an invalid credential counts as asking for one.
+function VDRX_ProfileHasSecret(const P: TVDRX_WSProfile): Boolean;
+// Does AToken unlock the profile at ANowUTC? AExpired is set when the token was right but past token_expires
+// (so the caller can say why); an invalid credential never matches.
+function VDRX_ProfileSecretMatches(const P: TVDRX_WSProfile; const AToken: string; ANowUTC: Double;
+  out AExpired: Boolean): Boolean;
 
 implementation
 
@@ -1054,29 +1067,106 @@ begin
   Result := Diff = 0;
 end;
 
+function VDRX_ParseTokenExpiry(const S: string; out AUTC: Double): Boolean;
+var
+  Y, M, D, H, N, Sec: Word;
+  Dt, Tm: TDateTime;
+
+  function Num(AStart, ALen: Integer): Integer;
+  var
+    k: Integer;
+  begin
+    Result := 0;
+    for k := AStart to AStart + ALen - 1 do
+    begin
+      if not (S[k] in ['0'..'9']) then Exit(-1);
+      Result := Result * 10 + Ord(S[k]) - 48;
+    end;
+  end;
+
+begin
+  Result := False;
+  AUTC := 0;
+  if (Length(S) <> 10) and (Length(S) <> 20) then Exit;
+  if (S[5] <> '-') or (S[8] <> '-') then Exit;
+  if (Num(1, 4) < 0) or (Num(6, 2) < 0) or (Num(9, 2) < 0) then Exit;
+  Y := Num(1, 4); M := Num(6, 2); D := Num(9, 2);
+  if not TryEncodeDate(Y, M, D, Dt) then Exit;
+  if Length(S) = 10 then
+  begin
+    AUTC := Dt + EncodeTime(23, 59, 59, 999);          // a date alone means: through the end of that day
+    Exit(True);
+  end;
+  if (S[11] <> 'T') or (S[14] <> ':') or (S[17] <> ':') or (S[20] <> 'Z') then Exit;
+  if (Num(12, 2) < 0) or (Num(15, 2) < 0) or (Num(18, 2) < 0) then Exit;
+  H := Num(12, 2); N := Num(15, 2); Sec := Num(18, 2);
+  if not TryEncodeTime(H, N, Sec, 0, Tm) then Exit;
+  AUTC := Dt + Tm;
+  Result := True;
+end;
+
+function VDRX_ProfileHasSecret(const P: TVDRX_WSProfile): Boolean;
+begin
+  Result := (P.Token <> '') or (P.TokenHash <> '') or P.TokenInvalid;
+end;
+
+function VDRX_ProfileSecretMatches(const P: TVDRX_WSProfile; const AToken: string; ANowUTC: Double;
+  out AExpired: Boolean): Boolean;
+begin
+  AExpired := False;
+  Result := False;
+  if P.TokenInvalid then Exit;
+  if P.TokenHash <> '' then
+    Result := VDRX_TokensEqual(P.TokenHash, VDRX_SHA256Hex(AToken))
+  else if P.Token <> '' then
+    Result := VDRX_TokensEqual(P.Token, AToken)
+  else
+    Exit;
+  if Result and (P.TokenExpires <> 0) and (ANowUTC > P.TokenExpires) then
+  begin
+    AExpired := True;
+    Result := False;
+  end;
+end;
+
 // ResolveProfile: by name ("profile" in sys.auth): that profile, if its token
 // is empty or matches. Without a name: the first profile whose (non-empty)
 // token matches.
 function TVDRX_WebSocketExecutive.ResolveProfile(const AName, AToken: string; out AProfile: TVDRX_WSProfile): Boolean;
 var
   i: Integer;
+  Expired: Boolean;
+  NowUTC: Double;
 begin
   Result := False;
+  NowUTC := LocalTimeToUniversal(Now);
   for i := 0 to High(FProfiles) do
     if AName <> '' then
     begin
       if FProfiles[i].ID <> AName then Continue;
-      if (FProfiles[i].Token = '') or VDRX_TokensEqual(FProfiles[i].Token, AToken) then
+      if not VDRX_ProfileHasSecret(FProfiles[i]) then
+      begin
+        AProfile := FProfiles[i];                      // no token configured: open to anyone who names it
+        Exit(True);
+      end;
+      if VDRX_ProfileSecretMatches(FProfiles[i], AToken, NowUTC, Expired) then
       begin
         AProfile := FProfiles[i];
         Exit(True);
       end;
+      if Expired then
+        Bus.Publish('log.warn', 'ws: profile "' + FProfiles[i].ID + '" refused - its token has expired (token_expires)', ID);
       Exit(False);
     end
-    else if (FProfiles[i].Token <> '') and VDRX_TokensEqual(FProfiles[i].Token, AToken) then
+    else if VDRX_ProfileHasSecret(FProfiles[i]) then
     begin
-      AProfile := FProfiles[i];
-      Exit(True);
+      if VDRX_ProfileSecretMatches(FProfiles[i], AToken, NowUTC, Expired) then
+      begin
+        AProfile := FProfiles[i];
+        Exit(True);
+      end;
+      if Expired then
+        Bus.Publish('log.warn', 'ws: profile "' + FProfiles[i].ID + '" refused - its token has expired (token_expires)', ID);
     end;
 end;
 
